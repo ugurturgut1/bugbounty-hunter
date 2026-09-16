@@ -40,9 +40,23 @@ being right.
 - [x] Conservative policy-text -> rules heuristic (`rules_engine.py`)
 - [x] SQLite state store (`state.py`)
 - [x] HackerOne connector, built on HackerOne's official Hacker API
-      (`discovery/hackerone.py`) -- needs a free H1 account + API token
-- [ ] Bugcrowd / Intigriti / YesWeHack connectors -- stubbed, need
-      accounts + API tokens to build against their real API responses
+      (`discovery/hackerone.py`) -- needs a free H1 account + API token.
+      Not yet tested live (no H1 credentials obtained yet).
+- [x] Bugcrowd connector (`discovery/bugcrowd.py`), built against
+      Bugcrowd's real OpenAPI spec, live-tested and working. **Caveat**:
+      `GET /programs` only returns programs you've already followed/
+      engaged with on bugcrowd.com -- it is not a public catalog. Browse
+      bugcrowd.com/engagements in a browser and follow programs there
+      first; they'll then show up via `bbhunter sync`.
+- [x] Intigriti connector (`discovery/intigriti.py`), built against
+      Intigriti's real OpenAPI spec, live-tested and working -- returns
+      the full public program catalog directly, no following required.
+      Uses Intigriti's own structured `safeHarbour` boolean and
+      `rulesOfEngagement.description` text directly; their
+      `testingRequirements.automatedTooling` integer field is recorded
+      but deliberately never used to unlock active testing since its
+      enum meaning isn't documented anywhere findable.
+- [ ] YesWeHack connector -- skipped for now per user request
 - [ ] Phase 2: passive recon (subdomain enum, tech fingerprinting,
       known-CVE version matching) gated per-program by `rules.permits()`
 - [ ] Phase 3: active testing for programs where `confidence == "high"`
@@ -55,13 +69,17 @@ being right.
 ## Why HackerOne/Bugcrowd/Intigriti/YesWeHack connectors use official APIs, not scraping
 
 Every one of these platforms' public directory pages is a client-rendered
-SPA (confirmed for HackerOne by fetching `/directory/programs` -- it
-returns an empty app shell, all data loads via API calls the browser
-makes after JS executes). There's no stable unauthenticated JSON
-endpoint to scrape. Each platform does offer an official API for
-researchers with a free account, which is more robust, ToS-compliant,
-and won't silently break. You'll need to create free accounts and API
-tokens for the platforms you want beyond HackerOne.
+SPA (confirmed for HackerOne and Bugcrowd by fetching their program-listing
+pages directly -- both return an app shell with the actual listing loaded
+by a separate client-side call after JS executes; Bugcrowd's is a
+session-authenticated internal endpoint, not something meant for
+programmatic use). There's no stable unauthenticated JSON endpoint to
+scrape on any of them. Each platform does offer an official API for
+researchers with a free account, which is more robust, ToS-compliant, and
+won't silently break. Bugcrowd and Intigriti's connectors were built by
+fetching their real OpenAPI specs directly (`docs.bugcrowd.com` /
+`api.intigriti.com`) rather than guessing endpoints, and both were
+live-tested against real accounts.
 
 ## Setup
 
@@ -69,8 +87,9 @@ tokens for the platforms you want beyond HackerOne.
 cd ~/bugbounty-hunter
 uv sync
 cp .env.example .env
-# fill in H1_API_USERNAME / H1_API_TOKEN in .env
+# fill in whichever platform credentials you have -- see .env.example
+# for what each platform needs and where to get it
 uv run bbhunter sync
 uv run bbhunter list
-uv run bbhunter show hackerone:<handle>
+uv run bbhunter show hackerone:<handle>   # or bugcrowd:<code>, intigriti:<handle>
 ```

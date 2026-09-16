@@ -25,11 +25,19 @@ class HackerOneCreds:
 
 @dataclass(frozen=True)
 class BugcrowdCreds:
-    token: str | None = os.environ.get("BUGCROWD_API_TOKEN")
+    # Bugcrowd's API uses "Authorization: Token <username>:<password>",
+    # a username/secret pair generated per-token in account settings --
+    # not a single bearer token. See docs.bugcrowd.com/api/getting-started/.
+    username: str | None = os.environ.get("BUGCROWD_API_USERNAME")
+    password: str | None = os.environ.get("BUGCROWD_API_PASSWORD")
 
     @property
     def configured(self) -> bool:
-        return bool(self.token)
+        return bool(self.username and self.password)
+
+    @property
+    def auth_header(self) -> str:
+        return f"Token {self.username}:{self.password}"
 
 
 @dataclass(frozen=True)
