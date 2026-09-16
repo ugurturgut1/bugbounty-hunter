@@ -72,10 +72,23 @@ passive recon -> gated active testing -> PoC drafting -> report drafting
       max 25 discovered subdomains per seed asset, self-identifying
       User-Agent, honors a program's required User-Agent/header if the
       connector captured one) -> NVD keyword CVE search, but **only**
-      when a banner has an actual version number. Live-tested: an
-      unversioned "Server: Apache" banner was initially keyword-matched
-      against meaningless 1999-era CVEs by NVD's search -- fixed to
-      require a `Product/x.y.z`-shaped banner before searching at all.
+      when a banner has an actual version number. Live-tested against
+      real programs twice now, both times catching real false-positive
+      classes: an unversioned "Server: Apache" banner was initially
+      keyword-matched against meaningless 1999-era CVEs, and a bare
+      major-version banner like "Undertow/1" (no dot at all) slipped
+      past that first fix and still matched years of unrelated CVEs --
+      the version regex now requires an actual "x.y" shape. Separately,
+      a host running Apache 2.4.62 (the exact release that *fixes*
+      CVE-2024-40725/40898) was still surfacing as a candidate for both,
+      since NVD keyword search has no notion of version ranges --
+      `_cve_applies_to_version` now checks the fingerprinted version
+      against each CVE's own published affected-version data (exact
+      versions or start/end range bounds) and suppresses a candidate
+      only when every determinable entry rules it out; ambiguous or
+      missing version data always stays permissive. `crtsh_subdomains`
+      also now distinguishes "found nothing" from "the query itself
+      failed" (`ReconResult.crtsh_failures`), surfaced as a CLI warning.
       Findings land as `Finding(status=CANDIDATE)`, explicitly labeled
       as coarse keyword matches needing manual verification, not
       confirmed vulnerabilities.
@@ -98,7 +111,13 @@ passive recon -> gated active testing -> PoC drafting -> report drafting
       actuator endpoints, etc.) plus a missing-security-headers check --
       no injection payloads, no state-changing requests -- gated behind
       a soft-404 baseline probe so noisy "200 for everything" hosts
-      don't produce false candidates.
+      don't produce false candidates. Host selection was originally
+      just the exact seed hostnames from `program.in_scope`, silently
+      ignoring everything `bbhunter recon` had already discovered --
+      fixed so a `WILDCARD`-type seed asset also tests (a capped slice
+      of) the subdomains recon found under it, since a plain `URL`-type
+      entry doesn't license testing an unrelated sibling subdomain just
+      because recon happened to find one.
 - [x] Phase 4: PoC drafting -> approval gate -> report drafting ->
       approval gate -> submission (`reporting/poc.py`,
       `reporting/report.py`, `reporting/submission.py`). `draft-poc`
