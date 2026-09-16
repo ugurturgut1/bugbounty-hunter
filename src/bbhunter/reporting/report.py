@@ -39,10 +39,14 @@ def _extract_section(markdown: str, heading: str) -> str:
 
 
 def draft_report(finding: Finding, program: Program, *, severity: str | None = None) -> Finding:
-    if finding.status != FindingStatus.POC_APPROVED:
+    # REPORT_REJECTED is a valid re-entry point, not a dead end: it only
+    # ever follows a PoC that was already approved (POC_APPROVED ->
+    # REPORT_DRAFTED -> REPORT_REJECTED), so re-drafting here iterates on
+    # the report text without re-opening or bypassing the PoC gate.
+    if finding.status not in (FindingStatus.POC_APPROVED, FindingStatus.REPORT_REJECTED):
         raise RuntimeError(
-            f"{finding.id}: can only draft a report from status=poc_approved (currently {finding.status.value}). "
-            "Run `bbhunter draft-poc` and `bbhunter approve-poc` first."
+            f"{finding.id}: can only draft a report from status=poc_approved or report_rejected "
+            f"(currently {finding.status.value}). Run `bbhunter draft-poc` and `bbhunter approve-poc` first."
         )
     if not finding.poc_path or not Path(finding.poc_path).exists():
         raise RuntimeError(f"{finding.id}: no PoC file on record at {finding.poc_path!r}")

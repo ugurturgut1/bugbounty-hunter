@@ -100,6 +100,22 @@ def test_mark_submitted_manually_requires_report_approved(candidate_finding):
     assert "pasted by hand" in result.notes
 
 
+def test_report_can_be_redrafted_after_rejection(candidate_finding, program):
+    # Regression test: REPORT_REJECTED must not be a dead end -- the PoC
+    # behind it was already approved, so the human should be able to fix
+    # the report text and send it through approval again.
+    draft_poc(candidate_finding, program)
+    _approve_poc_file(candidate_finding)
+    candidate_finding.status = FindingStatus.POC_APPROVED
+
+    draft_report(candidate_finding, program, severity="medium")
+    candidate_finding.status = FindingStatus.REPORT_REJECTED  # simulate reject-report
+
+    draft_report(candidate_finding, program, severity="high")
+    assert candidate_finding.status == FindingStatus.REPORT_DRAFTED
+    assert candidate_finding.severity == "high"
+
+
 def test_submit_report_non_hackerone_platform_is_always_manual(candidate_finding, program):
     from bbhunter.models import Platform
 
