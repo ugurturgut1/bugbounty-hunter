@@ -89,9 +89,19 @@ class HackerOneConnector(PlatformConnector):
         in_scope: list[ScopeAsset] = []
         out_of_scope: list[ScopeAsset] = []
         try:
-            scope_resp = client.get(f"/hackers/programs/{handle}/structured_scopes", params={"page[size]": 100})
-            if scope_resp.status_code == 200:
-                for scope_item in scope_resp.json().get("data", []):
+            page_num = 1
+            while True:
+                scope_resp = client.get(
+                    f"/hackers/programs/{handle}/structured_scopes",
+                    params={"page[size]": 100, "page[number]": page_num},
+                )
+                if scope_resp.status_code != 200:
+                    break
+                scope_body = scope_resp.json()
+                scope_data = scope_body.get("data", [])
+                if not scope_data:
+                    break
+                for scope_item in scope_data:
                     sattrs = scope_item.get("attributes", {})
                     asset = ScopeAsset(
                         identifier=sattrs.get("asset_identifier", "unknown"),
@@ -102,6 +112,12 @@ class HackerOneConnector(PlatformConnector):
                         instruction=sattrs.get("instruction"),
                     )
                     (in_scope if asset.in_scope else out_of_scope).append(asset)
+                # Same pagination contract as fetch_programs -- without this,
+                # any program with more than 100 scope entries silently lost
+                # everything past the first page.
+                if not scope_body.get("links", {}).get("next"):
+                    break
+                page_num += 1
         except httpx.HTTPError:
             pass  # scope fetch is best-effort; program still catalogued with policy text only
 
