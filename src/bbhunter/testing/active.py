@@ -12,6 +12,12 @@ be pure noise. We fetch one random nonexistent path first and only flag
 a candidate if its response is both 200, meaningfully different in size
 from that baseline, AND its body matches a signature specific to the
 file we're checking for.
+
+If a ReconResult is passed in, subdomains recon already discovered under
+a WILDCARD-scoped seed asset are tested too, since a wildcard entry
+covers them by definition -- a plain URL-type seed asset only ever
+tests that exact host, since a sibling subdomain found by recon is not
+automatically in scope just because it resolves under the same domain.
 """
 from __future__ import annotations
 
@@ -20,11 +26,12 @@ import time
 
 import httpx
 
-from bbhunter.models import AssetType, Finding, FindingStatus, Program, TestType
+from bbhunter.models import AssetType, Finding, FindingStatus, Program, ReconResult, TestType
 from bbhunter.recon.passive import _extract_host, _request_headers
 
 REQUEST_DELAY_SECONDS = 1.5
-MAX_HOSTS_PER_PROGRAM = 15
+MAX_HOSTS_PER_PROGRAM = 40
+MAX_SUBDOMAINS_PER_WILDCARD_SEED = 5  # keeps one large wildcard seed from eating the whole per-program budget
 
 # path -> (title, signature substrings that must appear in the body for a real hit, severity)
 _CHECKS: dict[str, tuple[str, tuple[str, ...], str]] = {
@@ -112,7 +119,33 @@ def _check_host(client: httpx.Client, host: str) -> list[dict]:
     return hits
 
 
-def run_active_checks(program: Program) -> list[Finding]:
+def _select_hosts(program: Program, recon_result: ReconResult | None) -> list[str]:
+    """Exact hosts from in-scope URL/WILDCARD assets, plus -- only for
+    WILDCARD-type assets -- a capped slice of subdomains a prior recon
+    run discovered under that seed. A plain URL entry only ever
+    contributes its exact host: a sibling subdomain recon happened to
+    find is not in scope just because it resolves under the same parent
+    domain. The per-seed subdomain cap keeps one large wildcard from
+    consuming the whole per-program host budget and starving every other
+    seed asset of coverage."""
+    hosts: list[str] = []
+    for asset in program.in_scope:
+        if asset.asset_type not in (AssetType.URL, AssetType.WILDCARD):
+            continue
+        host = _extract_host(asset.identifier)
+        if not host:
+            continue
+        if host not in hosts:
+            hosts.append(host)
+        if asset.asset_type == AssetType.WILDCARD and recon_result:
+            subdomains = recon_result.subdomains.get(host, [])[:MAX_SUBDOMAINS_PER_WILDCARD_SEED]
+            for subdomain in subdomains:
+                if subdomain not in hosts:
+                    hosts.append(subdomain)
+    return hosts[:MAX_HOSTS_PER_PROGRAM]
+
+
+def run_active_checks(program: Program, recon_result: ReconResult | None = None) -> list[Finding]:
     if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
         raise RuntimeError(
             f"{program.key}: active testing blocked by rules.permits() -- run `bbhunter review-rules` "
@@ -120,15 +153,7 @@ def run_active_checks(program: Program) -> list[Finding]:
         )
 
     headers = _request_headers(program.rules)
-
-    hosts: list[str] = []
-    for asset in program.in_scope:
-        if asset.asset_type not in (AssetType.URL, AssetType.WILDCARD):
-            continue
-        host = _extract_host(asset.identifier)
-        if host and host not in hosts:
-            hosts.append(host)
-    hosts = hosts[:MAX_HOSTS_PER_PROGRAM]
+    hosts = _select_hosts(program, recon_result)
 
     findings: list[Finding] = []
     with httpx.Client(headers=headers) as client:

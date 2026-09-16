@@ -180,13 +180,20 @@ def recon(key: str):
     if findings:
         console.print("[yellow]note[/yellow]: these are coarse keyword matches, not confirmed vulnerabilities -- "
                        "review with `bbhunter findings` before doing anything else with them")
+    if result.crtsh_failures:
+        console.print(
+            f"[yellow]warning[/yellow]: crt.sh query failed for {len(result.crtsh_failures)} seed host(s) "
+            f"({', '.join(result.crtsh_failures)}) -- subdomain results for those are incomplete, not confirmed-empty"
+        )
 
 
 @app.command(name="test-active")
 def test_active_cmd(key: str):
     """Run Phase 3 active checks (exposed-file/misconfig scan, read-only)
     against a program -- refuses unless `approve-active` has already
-    recorded a human decision permitting it."""
+    recorded a human decision permitting it. Also tests subdomains a
+    prior `bbhunter recon` run discovered under any WILDCARD-scoped
+    seed asset, not just the exact seed hostnames."""
     program = get_program(key)
     if not program:
         console.print(f"[red]not found[/red]: {key}")
@@ -199,8 +206,9 @@ def test_active_cmd(key: str):
         )
         raise typer.Exit(1)
 
+    recon_result = get_recon_result(key)
     console.print(f"[cyan]running active checks[/cyan] on {key}...")
-    new_findings = run_active_checks(program)
+    new_findings = run_active_checks(program, recon_result)
     for finding in new_findings:
         upsert_finding(finding)
     console.print(f"[green]done[/green] -- {len(new_findings)} candidate(s) found")
