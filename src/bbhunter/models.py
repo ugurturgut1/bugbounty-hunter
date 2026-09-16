@@ -63,12 +63,29 @@ class RulesOfEngagement(BaseModel):
     required_user_agent: str | None = None
     required_request_header: str | None = None
     requires_authorization_request: bool = False
-    confidence: str = "low"  # low | medium | high
+    confidence: str = "low"  # low | medium | high -- the derive_rules() heuristic can only ever
+                             # produce "low"/"medium"; "high" is set exclusively by review_rules()
+                             # after an actual human decision, never by automation. See permits().
     raw_notes: str | None = None
 
+    # Set only by the explicit human review step (cli.py `review-rules` / `approve-active`),
+    # never by rules_engine.derive_rules(). This is the third approval gate: a program's rules
+    # can look permissive to the heuristic, but nothing beyond the passive floor runs until a
+    # human has actually read the policy and recorded that decision here.
+    human_reviewed: bool = False
+    reviewed_at: datetime | None = None
+    review_notes: str | None = None
+
     def permits(self, test_type: TestType) -> bool:
-        if self.confidence != "high":
-            return test_type == TestType.PASSIVE_RECON
+        # The floor: never touches the target beyond a single already-made fingerprint request
+        # (subdomain enum and CVE keyword search both just query third-party databases), so this
+        # never requires review.
+        if test_type in (TestType.PASSIVE_RECON, TestType.VERSION_CVE_MATCH):
+            return True
+        if not self.human_reviewed or self.confidence != "high":
+            return False
+        if self.automated_scanners_allowed is False:
+            return False  # hard interlock: an explicit "no automated tools" always wins
         return test_type in self.allowed_test_types
 
 

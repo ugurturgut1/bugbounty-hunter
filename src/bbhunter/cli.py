@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from bbhunter.discovery import ALL_CONNECTORS
-from bbhunter.models import AssetType
+from bbhunter.models import AssetType, TestType
 from bbhunter.recon import run_passive_recon
+from bbhunter.testing import run_active_checks
 from bbhunter.state import (
     get_program,
     get_recon_result,
@@ -53,6 +56,7 @@ def list_cmd():
     table.add_column("Bounties?")
     table.add_column("In-scope assets")
     table.add_column("Rules confidence")
+    table.add_column("Human-reviewed?")
     table.add_column("Active testing allowed?")
     for p in programs:
         table.add_row(
@@ -61,9 +65,73 @@ def list_cmd():
             "yes" if p.offers_bounties else "no",
             str(len(p.in_scope)),
             p.rules.confidence,
-            "yes" if p.rules.confidence == "high" and p.rules.automated_scanners_allowed else "no",
+            "yes" if p.rules.human_reviewed else "no",
+            "yes" if p.rules.permits(TestType.ACTIVE_LOW_IMPACT) else "no",
         )
     console.print(table)
+
+
+@app.command(name="review-rules")
+def review_rules_cmd(key: str):
+    """Print everything needed to make a human decision about active
+    testing on a program: the raw policy text and the heuristic's read
+    of it. Doesn't change any state -- pair with `approve-active`."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+
+    r = program.rules
+    console.print(f"[bold]{program.name}[/bold] ({key})")
+    console.print(f"Policy URL: {program.policy_url or program.url}")
+    console.print()
+    console.print("[bold]Raw policy text:[/bold]")
+    console.print(program.raw_policy_text or "[dim](none captured)[/dim]")
+    console.print()
+    console.print("[bold]Heuristic read:[/bold]")
+    console.print(f"  confidence: {r.confidence}")
+    console.print(f"  automated_scanners_allowed: {r.automated_scanners_allowed}")
+    console.print(f"  safe_harbor: {r.safe_harbor}")
+    console.print(f"  requires_authorization_request: {r.requires_authorization_request}")
+    console.print(f"  explicitly_disallowed_techniques: {r.explicitly_disallowed_techniques}")
+    console.print(f"  required_user_agent: {r.required_user_agent}")
+    console.print(f"  required_request_header: {r.required_request_header}")
+    console.print(f"  raw_notes: {r.raw_notes}")
+    console.print()
+    if r.human_reviewed:
+        console.print(f"[green]Already human-reviewed[/green] at {r.reviewed_at}: {r.review_notes}")
+    else:
+        console.print("[yellow]Not yet human-reviewed.[/yellow] Use `bbhunter approve-active` to record a decision.")
+
+
+@app.command(name="approve-active")
+def approve_active_cmd(
+    key: str,
+    test_types: list[str] = typer.Option(..., "--test-type", help="TestType(s) to allow, e.g. active_low_impact"),
+    note: str = typer.Option(..., "--note", help="Why -- cite the specific policy language that justifies this"),
+):
+    """Record an explicit human decision that a program's policy allows
+    active testing. This is the only way RulesOfEngagement.confidence
+    ever becomes "high" -- the heuristic in rules_engine.py cannot do
+    this on its own. Run `review-rules` first."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+
+    try:
+        parsed_types = {TestType(t) for t in test_types}
+    except ValueError as e:
+        console.print(f"[red]invalid test type[/red]: {e}. Valid: {[t.value for t in TestType]}")
+        raise typer.Exit(1)
+
+    program.rules.human_reviewed = True
+    program.rules.confidence = "high"
+    program.rules.reviewed_at = datetime.utcnow()
+    program.rules.review_notes = note
+    program.rules.allowed_test_types = program.rules.allowed_test_types | parsed_types
+    upsert_program(program)
+    console.print(f"[green]recorded[/green]: {key} now permits {sorted(t.value for t in parsed_types)}")
 
 
 @app.command()
@@ -104,6 +172,33 @@ def recon(key: str):
     if findings:
         console.print("[yellow]note[/yellow]: these are coarse keyword matches, not confirmed vulnerabilities -- "
                        "review with `bbhunter findings` before doing anything else with them")
+
+
+@app.command(name="test-active")
+def test_active_cmd(key: str):
+    """Run Phase 3 active checks (exposed-file/misconfig scan, read-only)
+    against a program -- refuses unless `approve-active` has already
+    recorded a human decision permitting it."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+
+    if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
+        console.print(
+            f"[red]blocked[/red]: {key} does not permit active testing. "
+            "Run `bbhunter review-rules` then `bbhunter approve-active` if the policy actually allows it."
+        )
+        raise typer.Exit(1)
+
+    console.print(f"[cyan]running active checks[/cyan] on {key}...")
+    new_findings = run_active_checks(program)
+    for finding in new_findings:
+        upsert_finding(finding)
+    console.print(f"[green]done[/green] -- {len(new_findings)} candidate(s) found")
+    if new_findings:
+        console.print("[yellow]note[/yellow]: verify each manually before drafting a PoC -- "
+                       "see `bbhunter findings`")
 
 
 @app.command()

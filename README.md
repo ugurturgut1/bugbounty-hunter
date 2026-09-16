@@ -15,7 +15,10 @@ submit.
    `"high"` before any active test type is permitted, and even then only
    the specific `TestType`s the policy actually allows
    (`RulesOfEngagement.permits()`). Silence in a policy is not
-   permission. See `rules_engine.py`.
+   permission. See `rules_engine.py`. `confidence="high"` is not
+   something the heuristic can produce on its own -- it is set exclusively
+   by a human running `bbhunter review-rules` + `bbhunter approve-active`
+   (see `cli.py`), a third approval gate in front of any active testing.
 3. **Two human approval gates, always**: PoC review, and separately,
    final-report-before-submission review. Nothing calls a platform's
    "submit report" endpoint without an explicit approved status on the
@@ -78,8 +81,23 @@ being right.
       Not yet built: Wayback/URL-history passive source, a broader
       fingerprint signature set (currently just Server/X-Powered-By
       headers).
-- [ ] Phase 3: active testing for programs where `confidence == "high"`
-      and the specific technique is in `allowed_test_types`
+- [x] Phase 3: gated active testing (`testing/active.py`,
+      `bbhunter test-active`). A third, explicit approval gate sits in
+      front of this: `RulesOfEngagement.confidence` can now only reach
+      `"high"` via a human running `bbhunter review-rules` (prints the
+      raw policy text + heuristic read, changes nothing) followed by
+      `bbhunter approve-active --test-type ... --note "..."` (records
+      the decision with a timestamp and the policy language that
+      justified it). The heuristic in `rules_engine.py` is structurally
+      incapable of setting `confidence="high"` itself. Even once
+      approved, `automated_scanners_allowed is False` is a hard
+      interlock that overrides everything else. The checks themselves
+      are deliberately narrow: single rate-limited GETs for known
+      exposed-file/misconfig paths (`.git/config`, `.env`, backups,
+      actuator endpoints, etc.) plus a missing-security-headers check --
+      no injection payloads, no state-changing requests -- gated behind
+      a soft-404 baseline probe so noisy "200 for everything" hosts
+      don't produce false candidates.
 - [ ] Phase 4: PoC drafting -> approval gate -> report drafting ->
       approval gate -> submission
 - [ ] Later: package as a Claude Code skill for hands-off running with
@@ -111,4 +129,12 @@ cp .env.example .env
 uv run bbhunter sync
 uv run bbhunter list
 uv run bbhunter show hackerone:<handle>   # or bugcrowd:<code>, intigriti:<handle>
+uv run bbhunter recon <program-key>       # passive only, always allowed
+
+# active testing requires an explicit human decision recorded first:
+uv run bbhunter review-rules <program-key>
+uv run bbhunter approve-active <program-key> --test-type active_low_impact --note "policy explicitly allows automated scanners, see section 3"
+uv run bbhunter test-active <program-key>
+
+uv run bbhunter findings
 ```
