@@ -40,14 +40,19 @@ being right.
 - [x] Conservative policy-text -> rules heuristic (`rules_engine.py`)
 - [x] SQLite state store (`state.py`)
 - [x] HackerOne connector, built on HackerOne's official Hacker API
-      (`discovery/hackerone.py`) -- needs a free H1 account + API token.
-      Not yet tested live (no H1 credentials obtained yet).
+      (`discovery/hackerone.py`) -- live-tested and working.
 - [x] Bugcrowd connector (`discovery/bugcrowd.py`), built against
-      Bugcrowd's real OpenAPI spec, live-tested and working. **Caveat**:
-      `GET /programs` only returns programs you've already followed/
-      engaged with on bugcrowd.com -- it is not a public catalog. Browse
-      bugcrowd.com/engagements in a browser and follow programs there
-      first; they'll then show up via `bbhunter sync`.
+      Bugcrowd's real OpenAPI spec, auth confirmed working. **Deprioritized**:
+      the credential that worked turned out to be from a customer/org
+      account (returns 0 programs -- wrong account type for discovery).
+      A hacker/researcher account was created afterwards, but "API
+      Credentials" generation in account settings appears to only be
+      exposed to customer/org accounts, not individual researchers --
+      the researcher account only has a username, no way to generate a
+      password/token. Following programs on bugcrowd.com/engagements as
+      a researcher doesn't help without an API credential to read them
+      back with. The connector code is kept in case Bugcrowd changes
+      this, but isn't expected to be usable for now.
 - [x] Intigriti connector (`discovery/intigriti.py`), built against
       Intigriti's real OpenAPI spec, live-tested and working -- returns
       the full public program catalog directly, no following required.
