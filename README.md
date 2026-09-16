@@ -34,10 +34,10 @@ submit.
 
 ## Status
 
-**Phase 1 (this commit): program discovery + scope/rules normalization.**
-No recon, testing, PoC generation, or reporting yet -- those come after
-Phase 1 is solid, since everything downstream depends on scope/rules
-being right.
+**All four phases + skill packaging are built:** program discovery ->
+passive recon -> gated active testing -> PoC drafting -> report drafting
+-> gated submission, driveable directly via `bbhunter` or through the
+`/bbhunter` Claude Code skill.
 
 - [x] Data models (`models.py`): `Program`, `ScopeAsset`,
       `RulesOfEngagement`, `Finding`
@@ -120,8 +120,12 @@ being right.
       against their specs 2026-09-16) -- every other platform requires
       `bbhunter submit --manual --note "..."` after you paste the report
       into that platform's own web UI yourself.
-- [ ] Later: package as a Claude Code skill for hands-off running with
-      the two approval gates surfaced as prompts
+- [x] Packaged as a Claude Code skill (`.claude/skills/bbhunter/SKILL.md`)
+      that drives the whole pipeline above, with the instruction that
+      every approval gate (active-testing approval, PoC approval, report
+      approval, submission) must be an explicit decision obtained from
+      the user in that conversation -- the skill is not permitted to
+      approve its own findings.
 
 ## Why HackerOne/Bugcrowd/Intigriti/YesWeHack connectors use official APIs, not scraping
 
