@@ -145,4 +145,5 @@ class ReconResult(BaseModel):
     program_key: str
     subdomains: dict[str, list[str]] = Field(default_factory=dict)   # seed host -> discovered subdomains
     fingerprints: dict[str, dict] = Field(default_factory=dict)      # host -> {status_code, server, powered_by, final_url}
+    crtsh_failures: list[str] = Field(default_factory=list)          # seed hosts whose crt.sh query errored (not: found nothing)
     last_run: datetime = Field(default_factory=datetime.utcnow)
