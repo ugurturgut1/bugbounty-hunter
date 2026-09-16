@@ -304,8 +304,9 @@ def draft_report_cmd(
     severity: str = typer.Option(..., "--severity", help="none|low|medium|high|critical"),
 ):
     """Phase 4 step 2: draft a disclosure report from an approved PoC.
-    Only runs after `approve-poc` -- pulls reproduction steps and impact
-    straight from the approved PoC file."""
+    Runs after `approve-poc`, or again after `reject-report` to redraft --
+    pulls reproduction steps and impact straight from the approved PoC
+    file."""
     finding = get_finding(finding_id)
     if not finding:
         console.print(f"[red]not found[/red]: {finding_id}")
