@@ -55,6 +55,13 @@ class RulesOfEngagement(BaseModel):
     rate_limit_notes: str | None = None
     testing_hours_notes: str | None = None
     safe_harbor: bool | None = None
+    # Some programs mandate a specific User-Agent or extra request header so
+    # they can identify (and not block/alert on) legitimate researcher
+    # traffic. When set, any live request to this program's assets MUST use
+    # it. Currently only populated by the Intigriti connector, which
+    # exposes these as structured fields.
+    required_user_agent: str | None = None
+    required_request_header: str | None = None
     requires_authorization_request: bool = False
     confidence: str = "low"  # low | medium | high
     raw_notes: str | None = None
@@ -109,3 +116,14 @@ class Finding(BaseModel):
     status: FindingStatus = FindingStatus.CANDIDATE
     created_at: datetime = Field(default_factory=datetime.utcnow)
     notes: str | None = None
+
+
+class ReconResult(BaseModel):
+    """Raw passive-recon output for one program. Not a Finding -- just
+    what was observed. CVE-keyword matches derived from it become
+    separate Finding(test_type=VERSION_CVE_MATCH) rows for review."""
+
+    program_key: str
+    subdomains: dict[str, list[str]] = Field(default_factory=dict)   # seed host -> discovered subdomains
+    fingerprints: dict[str, dict] = Field(default_factory=dict)      # host -> {status_code, server, powered_by, final_url}
+    last_run: datetime = Field(default_factory=datetime.utcnow)

@@ -130,6 +130,8 @@ class IntigritiConnector(PlatformConnector):
                 + f" | Intigriti testingRequirements.automatedTooling={automated_tooling_raw}"
                   " (undocumented enum, verify meaning on the program page before trusting it)"
             )
+        rules.required_user_agent = testing_requirements.get("userAgent") or None
+        rules.required_request_header = testing_requirements.get("requestHeader") or None
 
         web_link = (detail.get("webLinks") or {}).get("detail") or f"https://app.intigriti.com/programs/{handle}"
 

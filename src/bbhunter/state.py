@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from bbhunter.config import DB_PATH
-from bbhunter.models import Finding, Program
+from bbhunter.models import Finding, Program, ReconResult
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS programs (
@@ -21,6 +21,13 @@ CREATE TABLE IF NOT EXISTS findings (
     program_key TEXT NOT NULL,
     status TEXT NOT NULL,
     data TEXT NOT NULL,
+    FOREIGN KEY (program_key) REFERENCES programs(key)
+);
+
+CREATE TABLE IF NOT EXISTS recon_results (
+    program_key TEXT PRIMARY KEY,
+    data TEXT NOT NULL,
+    last_run TEXT NOT NULL,
     FOREIGN KEY (program_key) REFERENCES programs(key)
 );
 """
@@ -74,3 +81,18 @@ def list_findings(status: str | None = None, db_path: Path = DB_PATH) -> list[Fi
         else:
             rows = conn.execute("SELECT data FROM findings ORDER BY id").fetchall()
     return [Finding.model_validate_json(row[0]) for row in rows]
+
+
+def upsert_recon_result(result: ReconResult, db_path: Path = DB_PATH) -> None:
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO recon_results (program_key, data, last_run) VALUES (?, ?, ?) "
+            "ON CONFLICT(program_key) DO UPDATE SET data=excluded.data, last_run=excluded.last_run",
+            (result.program_key, result.model_dump_json(), result.last_run.isoformat()),
+        )
+
+
+def get_recon_result(program_key: str, db_path: Path = DB_PATH) -> ReconResult | None:
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT data FROM recon_results WHERE program_key = ?", (program_key,)).fetchone()
+    return ReconResult.model_validate_json(row[0]) if row else None

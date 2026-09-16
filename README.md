@@ -62,8 +62,22 @@ being right.
       but deliberately never used to unlock active testing since its
       enum meaning isn't documented anywhere findable.
 - [ ] YesWeHack connector -- skipped for now per user request
-- [ ] Phase 2: passive recon (subdomain enum, tech fingerprinting,
-      known-CVE version matching) gated per-program by `rules.permits()`
+- [x] Phase 2 MVP: passive recon (`recon/passive.py`, `bbhunter recon <key>`).
+      Certificate-transparency subdomain enum (crt.sh, never touches the
+      target) -> capped/rate-limited fingerprinting (one GET per host,
+      max 25 discovered subdomains per seed asset, self-identifying
+      User-Agent, honors a program's required User-Agent/header if the
+      connector captured one) -> NVD keyword CVE search, but **only**
+      when a banner has an actual version number. Live-tested: an
+      unversioned "Server: Apache" banner was initially keyword-matched
+      against meaningless 1999-era CVEs by NVD's search -- fixed to
+      require a `Product/x.y.z`-shaped banner before searching at all.
+      Findings land as `Finding(status=CANDIDATE)`, explicitly labeled
+      as coarse keyword matches needing manual verification, not
+      confirmed vulnerabilities.
+      Not yet built: Wayback/URL-history passive source, a broader
+      fingerprint signature set (currently just Server/X-Powered-By
+      headers).
 - [ ] Phase 3: active testing for programs where `confidence == "high"`
       and the specific technique is in `allowed_test_types`
 - [ ] Phase 4: PoC drafting -> approval gate -> report drafting ->
