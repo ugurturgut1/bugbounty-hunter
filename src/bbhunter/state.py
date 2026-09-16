@@ -74,6 +74,12 @@ def upsert_finding(finding: Finding, db_path: Path = DB_PATH) -> None:
         )
 
 
+def get_finding(finding_id: str, db_path: Path = DB_PATH) -> Finding | None:
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT data FROM findings WHERE id = ?", (finding_id,)).fetchone()
+    return Finding.model_validate_json(row[0]) if row else None
+
+
 def list_findings(status: str | None = None, db_path: Path = DB_PATH) -> list[Finding]:
     with connect(db_path) as conn:
         if status:

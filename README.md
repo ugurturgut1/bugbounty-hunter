@@ -22,9 +22,10 @@ submit.
 3. **Two human approval gates, always**: PoC review, and separately,
    final-report-before-submission review. Nothing calls a platform's
    "submit report" endpoint without an explicit approved status on the
-   `Finding`. This is enforced by workflow state (`FindingStatus`), not
-   just convention -- when the submission phase is built, it must refuse
-   to submit anything not in `REPORT_APPROVED` state.
+   `Finding`. This is enforced by workflow state (`FindingStatus`) in
+   `reporting/submission.py`, not just convention -- `submit_report()` and
+   `mark_submitted_manually()` both hard-refuse anything not in
+   `REPORT_APPROVED` state.
 4. **Rate limits and testing-hours notes from a policy are hard
    constraints** on the recon/testing phase, not suggestions.
 5. Never automate against a program that requires prior written
@@ -98,8 +99,27 @@ being right.
       no injection payloads, no state-changing requests -- gated behind
       a soft-404 baseline probe so noisy "200 for everything" hosts
       don't produce false candidates.
-- [ ] Phase 4: PoC drafting -> approval gate -> report drafting ->
-      approval gate -> submission
+- [x] Phase 4: PoC drafting -> approval gate -> report drafting ->
+      approval gate -> submission (`reporting/poc.py`,
+      `reporting/report.py`, `reporting/submission.py`). `draft-poc`
+      scaffolds a markdown template with the automation's evidence and
+      explicit TODOs for reproduction steps/impact -- it never
+      fabricates a reproduction narrative. `approve-poc` is the human
+      gate confirming you personally reproduced it. `draft-report` then
+      refuses to run unless status is `poc_approved`, and copies the
+      Steps-to-reproduce/Impact sections verbatim out of the *approved*
+      PoC file (rechecking they're not still TODO placeholders) so a
+      report can never claim something the PoC review didn't already
+      cover. `approve-report` is the second, separate human gate.
+      `submit` then hard-refuses unless status is `report_approved`
+      (guardrail #3, enforced in code, not just workflow convention).
+      Only HackerOne has a submission endpoint automation can safely use
+      (`POST /hackers/reports`, confirmed against api.hackerone.com);
+      Bugcrowd's API is customer/org-only and Intigriti's researcher API
+      is read-only with no submission endpoint (both checked directly
+      against their specs 2026-09-16) -- every other platform requires
+      `bbhunter submit --manual --note "..."` after you paste the report
+      into that platform's own web UI yourself.
 - [ ] Later: package as a Claude Code skill for hands-off running with
       the two approval gates surfaced as prompts
 
@@ -130,11 +150,34 @@ uv run bbhunter sync
 uv run bbhunter list
 uv run bbhunter show hackerone:<handle>   # or bugcrowd:<code>, intigriti:<handle>
 uv run bbhunter recon <program-key>       # passive only, always allowed
+uv run bbhunter findings
+```
 
-# active testing requires an explicit human decision recorded first:
+## Full pipeline, one finding at a time
+
+```bash
+# 1. passive recon (always allowed) -> candidate findings
+uv run bbhunter recon <program-key>
+
+# 2. (only if you want active checks too) read the actual policy yourself,
+#    then record your own decision -- nothing here is automatic
 uv run bbhunter review-rules <program-key>
 uv run bbhunter approve-active <program-key> --test-type active_low_impact --note "policy explicitly allows automated scanners, see section 3"
 uv run bbhunter test-active <program-key>
 
-uv run bbhunter findings
+uv run bbhunter findings --status candidate
+
+# 3. PoC: scaffold -> you fill in + personally verify -> approve
+uv run bbhunter draft-poc <finding-id>
+# edit the markdown file it prints, then:
+uv run bbhunter approve-poc <finding-id> --note "reproduced locally on <date>"
+
+# 4. report: drafted from the approved PoC -> you review -> approve
+uv run bbhunter draft-report <finding-id> --severity medium
+# edit the remediation section, then:
+uv run bbhunter approve-report <finding-id> --note "ready to send"
+
+# 5. submit -- automated for HackerOne, manual everywhere else
+uv run bbhunter submit <finding-id>
+uv run bbhunter submit <finding-id> --manual --note "pasted into Intigriti UI by hand"
 ```

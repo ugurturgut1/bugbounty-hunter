@@ -7,10 +7,18 @@ from rich.console import Console
 from rich.table import Table
 
 from bbhunter.discovery import ALL_CONNECTORS
-from bbhunter.models import AssetType, TestType
+from bbhunter.models import AssetType, FindingStatus, TestType
 from bbhunter.recon import run_passive_recon
+from bbhunter.reporting import (
+    ManualSubmissionRequired,
+    draft_poc,
+    draft_report,
+    mark_submitted_manually,
+    submit_report,
+)
 from bbhunter.testing import run_active_checks
 from bbhunter.state import (
+    get_finding,
     get_program,
     get_recon_result,
     list_findings,
@@ -213,6 +221,177 @@ def findings(status: str | None = typer.Option(None, help="Filter by status, e.g
     for f in rows:
         table.add_row(f.id, f.program_key, f.title, f.status.value)
     console.print(table)
+
+
+@app.command(name="show-finding")
+def show_finding_cmd(finding_id: str):
+    """Show full detail for one finding, including PoC/report file paths."""
+    finding = get_finding(finding_id)
+    if not finding:
+        console.print(f"[red]not found[/red]: {finding_id}")
+        raise typer.Exit(1)
+    console.print(finding.model_dump_json(indent=2))
+
+
+@app.command(name="draft-poc")
+def draft_poc_cmd(finding_id: str):
+    """Phase 4 step 1: scaffold a PoC markdown file for a candidate
+    finding. Writes TODOs for reproduction steps and impact -- you must
+    fill those in and verify the finding yourself before approving it."""
+    finding = get_finding(finding_id)
+    if not finding:
+        console.print(f"[red]not found[/red]: {finding_id}")
+        raise typer.Exit(1)
+    program = get_program(finding.program_key)
+    if not program:
+        console.print(f"[red]program not found[/red]: {finding.program_key}")
+        raise typer.Exit(1)
+
+    try:
+        finding = draft_poc(finding, program)
+    except RuntimeError as e:
+        console.print(f"[red]blocked[/red]: {e}")
+        raise typer.Exit(1)
+    upsert_finding(finding)
+    console.print(f"[green]drafted[/green]: {finding.poc_path}")
+    console.print("[yellow]note[/yellow]: fill in Reproduction steps and Impact yourself, "
+                   "then `bbhunter approve-poc` once you've personally verified it")
+
+
+@app.command(name="approve-poc")
+def approve_poc_cmd(finding_id: str, note: str = typer.Option(..., "--note", help="What you verified")):
+    """Record that you personally reproduced and verified this finding."""
+    finding = get_finding(finding_id)
+    if not finding:
+        console.print(f"[red]not found[/red]: {finding_id}")
+        raise typer.Exit(1)
+    if finding.status != FindingStatus.POC_DRAFTED:
+        console.print(f"[red]blocked[/red]: status is {finding.status.value}, not poc_drafted")
+        raise typer.Exit(1)
+    finding.status = FindingStatus.POC_APPROVED
+    finding.notes = f"{finding.notes} | PoC approved: {note}" if finding.notes else f"PoC approved: {note}"
+    upsert_finding(finding)
+    console.print(f"[green]approved[/green]: {finding_id}")
+
+
+@app.command(name="reject-poc")
+def reject_poc_cmd(finding_id: str, note: str = typer.Option(..., "--note", help="Why this isn't real")):
+    """Record that this candidate didn't hold up under manual verification."""
+    finding = get_finding(finding_id)
+    if not finding:
+        console.print(f"[red]not found[/red]: {finding_id}")
+        raise typer.Exit(1)
+    if finding.status != FindingStatus.POC_DRAFTED:
+        console.print(f"[red]blocked[/red]: status is {finding.status.value}, not poc_drafted")
+        raise typer.Exit(1)
+    finding.status = FindingStatus.POC_REJECTED
+    finding.notes = f"{finding.notes} | PoC rejected: {note}" if finding.notes else f"PoC rejected: {note}"
+    upsert_finding(finding)
+    console.print(f"[green]recorded[/green]: {finding_id} marked poc_rejected")
+
+
+@app.command(name="draft-report")
+def draft_report_cmd(
+    finding_id: str,
+    severity: str = typer.Option(..., "--severity", help="none|low|medium|high|critical"),
+):
+    """Phase 4 step 2: draft a disclosure report from an approved PoC.
+    Only runs after `approve-poc` -- pulls reproduction steps and impact
+    straight from the approved PoC file."""
+    finding = get_finding(finding_id)
+    if not finding:
+        console.print(f"[red]not found[/red]: {finding_id}")
+        raise typer.Exit(1)
+    program = get_program(finding.program_key)
+    if not program:
+        console.print(f"[red]program not found[/red]: {finding.program_key}")
+        raise typer.Exit(1)
+
+    try:
+        finding = draft_report(finding, program, severity=severity)
+    except (RuntimeError, ValueError) as e:
+        console.print(f"[red]blocked[/red]: {e}")
+        raise typer.Exit(1)
+    upsert_finding(finding)
+    console.print(f"[green]drafted[/green]: {finding.report_path}")
+    console.print("[yellow]note[/yellow]: fill in Suggested remediation, then review the whole report "
+                   "before `bbhunter approve-report`")
+
+
+@app.command(name="approve-report")
+def approve_report_cmd(finding_id: str, note: str = typer.Option(..., "--note", help="Confirmation note")):
+    """Record that you reviewed the drafted report and it's ready to submit."""
+    finding = get_finding(finding_id)
+    if not finding:
+        console.print(f"[red]not found[/red]: {finding_id}")
+        raise typer.Exit(1)
+    if finding.status != FindingStatus.REPORT_DRAFTED:
+        console.print(f"[red]blocked[/red]: status is {finding.status.value}, not report_drafted")
+        raise typer.Exit(1)
+    finding.status = FindingStatus.REPORT_APPROVED
+    finding.notes = f"{finding.notes} | Report approved: {note}" if finding.notes else f"Report approved: {note}"
+    upsert_finding(finding)
+    console.print(f"[green]approved[/green]: {finding_id} -- ready for `bbhunter submit`")
+
+
+@app.command(name="reject-report")
+def reject_report_cmd(finding_id: str, note: str = typer.Option(..., "--note", help="What needs to change")):
+    """Send a drafted report back -- record why it's not ready to submit."""
+    finding = get_finding(finding_id)
+    if not finding:
+        console.print(f"[red]not found[/red]: {finding_id}")
+        raise typer.Exit(1)
+    if finding.status != FindingStatus.REPORT_DRAFTED:
+        console.print(f"[red]blocked[/red]: status is {finding.status.value}, not report_drafted")
+        raise typer.Exit(1)
+    finding.status = FindingStatus.REPORT_REJECTED
+    finding.notes = f"{finding.notes} | Report rejected: {note}" if finding.notes else f"Report rejected: {note}"
+    upsert_finding(finding)
+    console.print(f"[green]recorded[/green]: {finding_id} marked report_rejected")
+
+
+@app.command()
+def submit(
+    finding_id: str,
+    manual: bool = typer.Option(False, "--manual", help="Skip the API call; record a manual submission instead"),
+    note: str = typer.Option(None, "--note", help="Required with --manual: how/where you submitted it"),
+):
+    """Phase 4 step 3, the last gate: submit an approved report. Refuses
+    unless status is report_approved. Automated only for HackerOne
+    (POST /hackers/reports) -- every other platform requires pasting the
+    drafted report into that platform's own UI, then `--manual`."""
+    finding = get_finding(finding_id)
+    if not finding:
+        console.print(f"[red]not found[/red]: {finding_id}")
+        raise typer.Exit(1)
+    program = get_program(finding.program_key)
+    if not program:
+        console.print(f"[red]program not found[/red]: {finding.program_key}")
+        raise typer.Exit(1)
+
+    if manual:
+        if not note:
+            console.print("[red]blocked[/red]: --manual requires --note describing how/where you submitted it")
+            raise typer.Exit(1)
+        try:
+            finding = mark_submitted_manually(finding, note=note)
+        except RuntimeError as e:
+            console.print(f"[red]blocked[/red]: {e}")
+            raise typer.Exit(1)
+        upsert_finding(finding)
+        console.print(f"[green]recorded[/green]: {finding_id} marked submitted")
+        return
+
+    try:
+        finding = submit_report(finding, program)
+    except ManualSubmissionRequired as e:
+        console.print(f"[yellow]manual submission required[/yellow]: {e}")
+        raise typer.Exit(1)
+    except RuntimeError as e:
+        console.print(f"[red]blocked[/red]: {e}")
+        raise typer.Exit(1)
+    upsert_finding(finding)
+    console.print(f"[green]submitted[/green]: {finding_id}")
 
 
 if __name__ == "__main__":

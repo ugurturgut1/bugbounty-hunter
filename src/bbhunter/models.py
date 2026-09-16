@@ -114,6 +114,7 @@ class FindingStatus(StrEnum):
     POC_REJECTED = "poc_rejected"
     REPORT_DRAFTED = "report_drafted"       # report written, awaiting human review
     REPORT_APPROVED = "report_approved"     # you approved submission
+    REPORT_REJECTED = "report_rejected"
     SUBMITTED = "submitted"
     RESOLVED = "resolved"
     DUPLICATE = "duplicate"
@@ -128,6 +129,7 @@ class Finding(BaseModel):
     vuln_class: str
     test_type: TestType
     evidence: str
+    severity: str | None = None  # none|low|medium|high|critical -- set by you at draft-report time
     poc_path: str | None = None
     report_path: str | None = None
     status: FindingStatus = FindingStatus.CANDIDATE
