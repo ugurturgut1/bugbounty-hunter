@@ -12,6 +12,11 @@ dependencies = [
     "beautifulsoup4>=4.12",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
 [project.scripts]
 bbhunter = "bbhunter.cli:app"
 
