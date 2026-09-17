@@ -229,62 +229,75 @@ def run_passive_recon(program: Program) -> tuple[ReconResult, list[Finding]]:
     nvd_cache: dict[str, list[dict]] = {}
 
     recon_assets = [a for a in program.in_scope if a.asset_type in (AssetType.URL, AssetType.WILDCARD)]
+    seeds_processed = 0
 
-    for asset in recon_assets:
-        host = _extract_host(asset.identifier)
-        if not host:
-            continue
-
-        discovered, crtsh_ok = crtsh_subdomains(host)
-        time.sleep(CRTSH_DELAY_SECONDS)
-        subdomains_by_seed[host] = sorted(discovered)
-        if not crtsh_ok:
-            crtsh_failures.append(host)
-
-        hosts_to_fingerprint = [host] + sorted(discovered)[:MAX_SUBDOMAINS_PER_SEED]
-        for target_host in hosts_to_fingerprint:
-            if target_host in fingerprints:
+    try:
+        for asset in recon_assets:
+            host = _extract_host(asset.identifier)
+            if not host:
+                seeds_processed += 1
                 continue
-            fp = fingerprint_host(target_host, program.rules)
-            time.sleep(FINGERPRINT_DELAY_SECONDS)
-            if not fp:
-                continue
-            fingerprints[target_host] = fp
 
-            banner = _versioned_banner(fp.get("server"), fp.get("powered_by"))
-            if not banner:
-                continue  # no version number to search on -- bare product names produce useless noise
-            if banner not in nvd_cache:
-                nvd_cache[banner] = nvd_search(banner)
-                time.sleep(NVD_DELAY_SECONDS)
+            discovered, crtsh_ok = crtsh_subdomains(host)
+            time.sleep(CRTSH_DELAY_SECONDS)
+            subdomains_by_seed[host] = sorted(discovered)
+            if not crtsh_ok:
+                crtsh_failures.append(host)
 
-            detected_version = _parse_version_tuple(banner.rsplit(" ", 1)[-1])
-            for cve in nvd_cache[banner]:
-                if not _cve_applies_to_version(cve.get("configurations", []), detected_version):
-                    continue  # NVD's own published version range rules this exact version out
-                findings.append(
-                    Finding(
-                        id=f"{program.key}:{target_host}:{cve['id']}",
-                        program_key=program.key,
-                        asset=target_host,
-                        title=f"Keyword CVE match: {cve['id']} against banner '{banner}'",
-                        vuln_class="version-cve-keyword-match",
-                        test_type=TestType.VERSION_CVE_MATCH,
-                        evidence=(
-                            f"Host {target_host} returned a banner identifying '{banner}'. "
-                            f"NVD keyword search for that string surfaced {cve['id']}: {cve['summary'][:400]}. "
-                            "This is a coarse keyword match, not a confirmed vulnerable version -- verify the "
-                            "actual product/version before treating as a real finding."
-                        ),
-                        status=FindingStatus.CANDIDATE,
+            hosts_to_fingerprint = [host] + sorted(discovered)[:MAX_SUBDOMAINS_PER_SEED]
+            for target_host in hosts_to_fingerprint:
+                if target_host in fingerprints:
+                    continue
+                fp = fingerprint_host(target_host, program.rules)
+                time.sleep(FINGERPRINT_DELAY_SECONDS)
+                if not fp:
+                    continue
+                fingerprints[target_host] = fp
+
+                banner = _versioned_banner(fp.get("server"), fp.get("powered_by"))
+                if not banner:
+                    continue  # no version number to search on -- bare product names produce useless noise
+                if banner not in nvd_cache:
+                    nvd_cache[banner] = nvd_search(banner)
+                    time.sleep(NVD_DELAY_SECONDS)
+
+                detected_version = _parse_version_tuple(banner.rsplit(" ", 1)[-1])
+                for cve in nvd_cache[banner]:
+                    if not _cve_applies_to_version(cve.get("configurations", []), detected_version):
+                        continue  # NVD's own published version range rules this exact version out
+                    findings.append(
+                        Finding(
+                            id=f"{program.key}:{target_host}:{cve['id']}",
+                            program_key=program.key,
+                            asset=target_host,
+                            title=f"Keyword CVE match: {cve['id']} against banner '{banner}'",
+                            vuln_class="version-cve-keyword-match",
+                            test_type=TestType.VERSION_CVE_MATCH,
+                            evidence=(
+                                f"Host {target_host} returned a banner identifying '{banner}'. "
+                                f"NVD keyword search for that string surfaced {cve['id']}: {cve['summary'][:400]}. "
+                                "This is a coarse keyword match, not a confirmed vulnerable version -- verify the "
+                                "actual product/version before treating as a real finding."
+                            ),
+                            status=FindingStatus.CANDIDATE,
+                        )
                     )
-                )
+            seeds_processed += 1
+    except KeyboardInterrupt:
+        # Stopping mid-run (Ctrl-C, or `kill -INT`/`pkill -INT` against a
+        # backgrounded run) should save everything gathered so far rather
+        # than discard it -- the caller still gets a normal ReconResult
+        # back, just with seeds_processed < len(recon_assets) so it knows
+        # this program wasn't fully covered and may be worth re-running.
+        pass
 
     result = ReconResult(
         program_key=program.key,
         subdomains=subdomains_by_seed,
         fingerprints=fingerprints,
         crtsh_failures=crtsh_failures,
+        seeds_total=len(recon_assets),
+        seeds_processed=seeds_processed,
         last_run=datetime.utcnow(),
     )
     return result, findings

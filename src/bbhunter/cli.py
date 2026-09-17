@@ -87,17 +87,37 @@ def prioritize_cmd(
     show_reconned: bool = typer.Option(
         False, "--show-reconned", help="Include programs already reconned once (default: hide them)"
     ),
+    search: str = typer.Option(
+        None, "--search", help="Case-insensitive substring filter on program key/name, e.g. --search bank"
+    ),
+    sort_by: str = typer.Option(
+        "score", "--sort", help="score (default, effort-vs-payoff) | time (fastest first) | seeds (largest scope first)"
+    ),
 ):
-    """Rank synced programs by a rough recon-effort-vs-payoff score, e.g.
+    """Browse synced programs with an estimated recon time for each, e.g.
     to decide which of several newly-uncovered large scopes is actually
-    worth the time. See prioritize.py for exactly what the score is (and
-    isn't) -- it's a heuristic to shortlist candidates for a human to
-    sanity-check, not a real EV model."""
+    worth the time before running `bbhunter recon`. Default sort is a
+    rough recon-effort-vs-payoff score -- see prioritize.py for exactly
+    what it is (and isn't); it's a heuristic to shortlist candidates for
+    a human to sanity-check, not a real EV model. `--sort time`/`--sort
+    seeds` drop the scoring entirely if you'd rather just browse by
+    those numbers directly."""
     programs = list_programs()
     reconned = list_reconned_program_keys()
     ranked = prioritize(programs, reconned)
     if not show_reconned:
         ranked = [r for r in ranked if not r.already_reconned]
+    if search:
+        needle = search.lower()
+        ranked = [r for r in ranked if needle in r.program_key.lower() or needle in r.name.lower()]
+
+    if sort_by == "time":
+        ranked.sort(key=lambda r: r.est_recon_minutes)
+    elif sort_by == "seeds":
+        ranked.sort(key=lambda r: r.eligible_seeds, reverse=True)
+    elif sort_by != "score":
+        console.print(f"[red]invalid --sort[/red]: {sort_by!r}. Valid: score | time | seeds")
+        raise typer.Exit(1)
 
     table = Table(width=200)
     table.add_column("Program", no_wrap=True)
@@ -211,13 +231,23 @@ def recon(key: str):
         raise typer.Exit(0)
 
     console.print(f"[cyan]running passive recon[/cyan] on {key} ({recon_asset_count} seed asset(s))...")
+    console.print("[dim]Ctrl-C (or `kill -INT`/`pkill -INT -f` on this process) stops cleanly and saves "
+                   "whatever's been gathered so far -- nothing is lost.[/dim]")
     result, findings = run_passive_recon(program)
     upsert_recon_result(result)
     for finding in findings:
         upsert_finding(finding)
 
     total_hosts = len(result.fingerprints)
-    console.print(f"[green]done[/green] -- {total_hosts} host(s) fingerprinted, {len(findings)} CVE-keyword candidate(s)")
+    if result.complete:
+        console.print(f"[green]done[/green] -- {total_hosts} host(s) fingerprinted, {len(findings)} CVE-keyword candidate(s)")
+    else:
+        console.print(
+            f"[yellow]stopped early[/yellow] -- covered {result.seeds_processed}/{result.seeds_total} seed asset(s) "
+            f"before being interrupted, {total_hosts} host(s) fingerprinted, {len(findings)} CVE-keyword candidate(s) "
+            f"so far. Re-run `bbhunter recon {key}` to pick up where a fresh full pass would start (it doesn't "
+            "resume mid-scope, it restarts, but nothing gathered this run is lost)."
+        )
     if findings:
         console.print("[yellow]note[/yellow]: these are coarse keyword matches, not confirmed vulnerabilities -- "
                        "review with `bbhunter findings` before doing anything else with them")

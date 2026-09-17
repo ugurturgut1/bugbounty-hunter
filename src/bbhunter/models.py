@@ -146,4 +146,14 @@ class ReconResult(BaseModel):
     subdomains: dict[str, list[str]] = Field(default_factory=dict)   # seed host -> discovered subdomains
     fingerprints: dict[str, dict] = Field(default_factory=dict)      # host -> {status_code, server, powered_by, final_url}
     crtsh_failures: list[str] = Field(default_factory=list)          # seed hosts whose crt.sh query errored (not: found nothing)
+    seeds_total: int = 0                                             # how many seed assets this run was scoped to cover
+    seeds_processed: int = 0                                         # how many it actually got through before finishing/stopping
     last_run: datetime = Field(default_factory=datetime.utcnow)
+
+    @property
+    def complete(self) -> bool:
+        """False means a run was interrupted (Ctrl-C / SIGINT) partway
+        through -- seeds_processed < seeds_total. Old rows from before
+        this field existed default both to 0, which reads as complete
+        (0/0) since there's no way to tell for them either way."""
+        return self.seeds_processed >= self.seeds_total
