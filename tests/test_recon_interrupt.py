@@ -32,7 +32,10 @@ def test_interrupt_mid_loop_returns_partial_result_not_nothing():
         return set(), True
 
     with patch("bbhunter.recon.passive.crtsh_subdomains", side_effect=fake_crtsh), \
-         patch("bbhunter.recon.passive.fingerprint_host", return_value=None), \
+         patch("bbhunter.recon.passive.subfinder_subdomains", return_value=(set(), False)), \
+         patch("bbhunter.recon.passive.wayback_subdomains", return_value=(set(), True)), \
+         patch("bbhunter.recon.passive.wayback_param_urls", return_value=[]), \
+         patch("bbhunter.recon.passive.fingerprint", return_value=None), \
          patch("bbhunter.recon.passive.time.sleep"):
         result, findings = run_passive_recon(program)
 
@@ -53,7 +56,10 @@ def test_max_subdomains_per_seed_zero_skips_subdomain_expansion():
         return None
 
     with patch("bbhunter.recon.passive.crtsh_subdomains", return_value=({"sub.seed.example.com"}, True)), \
-         patch("bbhunter.recon.passive.fingerprint_host", side_effect=fake_fingerprint), \
+         patch("bbhunter.recon.passive.subfinder_subdomains", return_value=(set(), False)), \
+         patch("bbhunter.recon.passive.wayback_subdomains", return_value=(set(), True)), \
+         patch("bbhunter.recon.passive.wayback_param_urls", return_value=[]), \
+         patch("bbhunter.recon.passive.fingerprint", side_effect=fake_fingerprint), \
          patch("bbhunter.recon.passive.time.sleep"):
         run_passive_recon(program, max_subdomains_per_seed=0)
 
@@ -64,7 +70,10 @@ def test_full_run_reports_complete():
     program = _program_with_seeds("only.example.com")
 
     with patch("bbhunter.recon.passive.crtsh_subdomains", return_value=(set(), True)), \
-         patch("bbhunter.recon.passive.fingerprint_host", return_value=None), \
+         patch("bbhunter.recon.passive.subfinder_subdomains", return_value=(set(), False)), \
+         patch("bbhunter.recon.passive.wayback_subdomains", return_value=(set(), True)), \
+         patch("bbhunter.recon.passive.wayback_param_urls", return_value=[]), \
+         patch("bbhunter.recon.passive.fingerprint", return_value=None), \
          patch("bbhunter.recon.passive.time.sleep"):
         result, _ = run_passive_recon(program)
 

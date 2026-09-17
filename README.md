@@ -31,6 +31,21 @@ submit.
 5. Never automate against a program that requires prior written
    authorization (`requires_authorization_request`) until that
    authorization has actually been granted and recorded.
+6. **The `--injection` and `--nuclei` flags on `test-active` are not a
+   separate or higher permission tier.** Both still require
+   `RulesOfEngagement.permits(TestType.ACTIVE_LOW_IMPACT)`, i.e. the same
+   human-recorded `approve-active` decision as every other active check
+   -- `--injection`/`--nuclei` only choose whether to *include* that
+   request shape, they grant no new access on their own. Both stay
+   within the "safe XSS/SQLi probes... no data modification" scope
+   `TestType.ACTIVE_LOW_IMPACT` already defines in `models.py`:
+   `--injection` sends at most one canary/signature per query parameter
+   (no boolean/time-based blind techniques, no extraction, no follow-
+   through past detection) and `--nuclei` runs only
+   misconfig/exposure/tech/cve-tagged templates with
+   dos/intrusive/fuzz/bruteforce/hijack tags explicitly excluded, rate-
+   limited to 1 req/s. Neither is ever turned on by the `/bbhunter`
+   skill on its own judgment -- see its SKILL.md.
 
 ## Status
 
@@ -92,9 +107,19 @@ passive recon -> gated active testing -> PoC drafting -> report drafting
       Findings land as `Finding(status=CANDIDATE)`, explicitly labeled
       as coarse keyword matches needing manual verification, not
       confirmed vulnerabilities.
-      Not yet built: Wayback/URL-history passive source, a broader
-      fingerprint signature set (currently just Server/X-Powered-By
-      headers).
+      Subdomain enum now merges three sources -- crt.sh, archive.org's
+      Wayback CDX API (`wayback_subdomains`, also never touches the
+      target), and the optional `subfinder` binary (`subfinder_subdomains`,
+      itself just a fan-out over ~30 further passive OSINT sources) --
+      silently skipping whichever of these isn't installed/reachable
+      rather than failing the whole run. Wayback also surfaces historic
+      URLs with query strings (`ReconResult.param_urls`), the input set
+      for `test-active --injection` (see Phase 3). Fingerprinting now
+      prefers the optional `httpx` binary's tech-detect signature
+      database over the built-in Server/X-Powered-By-only check when
+      it's installed (`fingerprint()` in `recon/passive.py`), falling
+      back to the plain-GET check otherwise -- still exactly one request
+      per host either way.
 - [x] Phase 3: gated active testing (`testing/active.py`,
       `bbhunter test-active`). A third, explicit approval gate sits in
       front of this: `RulesOfEngagement.confidence` can now only reach
@@ -118,6 +143,24 @@ passive recon -> gated active testing -> PoC drafting -> report drafting
       of) the subdomains recon found under it, since a plain `URL`-type
       entry doesn't license testing an unrelated sibling subdomain just
       because recon happened to find one.
+      Two opt-in check classes were added on top, both still behind the
+      exact same `permits(ACTIVE_LOW_IMPACT)` gate (see Guardrails #6):
+      `--injection` (`_check_injection_signals`) sends one baseline
+      request plus, per query parameter on a Wayback-discovered param
+      URL, one reflected-XSS canary probe (an HTML-special-char marker,
+      flagged only if it comes back unescaped) and one SQL-error-
+      signature probe (a single trailing quote, flagged only if a DB
+      error signature appears in the mutated response but not the
+      baseline) -- never a boolean/time-based blind technique, never
+      more than one marker per request. `--nuclei` (`run_nuclei_scan`)
+      shells out to the optional `nuclei` binary restricted to
+      misconfig/exposure/tech/cve-tagged templates with
+      dos/intrusive/fuzz/bruteforce/hijack tags explicitly excluded via
+      `-etags`, rate-limited to 1 req/s with a single connection
+      (`-rate-limit 1 -bulk-size 1 -c 1`) -- well below nuclei's own
+      defaults, matching this module's existing pacing. Both are
+      skipped/no-ops with a clear note if their prerequisites (param
+      URLs from a prior `recon` run; the `nuclei` binary) aren't there.
 - [x] Phase 4: PoC drafting -> approval gate -> report drafting ->
       approval gate -> submission (`reporting/poc.py`,
       `reporting/report.py`, `reporting/submission.py`). `draft-poc`
@@ -176,6 +219,24 @@ uv run bbhunter recon <program-key>       # passive only, always allowed
 uv run bbhunter findings
 ```
 
+### Optional external recon tooling
+
+`bbhunter recon` and `bbhunter test-active` work fully without any of
+this -- crt.sh, archive.org, NVD, and the plain-GET checks are pure
+Python/HTTP and always on. Installing these three
+[projectdiscovery](https://github.com/projectdiscovery) Go binaries
+widens coverage; every integration point checks for the binary first
+and silently falls back (or skips that source/flag) if it's missing:
+
+```bash
+go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest  # extra passive subdomain source, merged with crt.sh + Wayback
+go install github.com/projectdiscovery/httpx/cmd/httpx@latest             # richer tech-stack fingerprinting than the built-in Server/X-Powered-By check
+go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest        # curated template scan, see Guardrails -- opt-in via `test-active --nuclei`
+nuclei -update-templates
+# go install puts binaries in `go env GOPATH`/bin (~/go/bin by default) --
+# make sure that's on PATH (`export PATH="$HOME/go/bin:$PATH"`)
+```
+
 ## Full pipeline, one finding at a time
 
 ```bash
@@ -187,6 +248,10 @@ uv run bbhunter recon <program-key>
 uv run bbhunter review-rules <program-key>
 uv run bbhunter approve-active <program-key> --test-type active_low_impact --note "policy explicitly allows automated scanners, see section 3"
 uv run bbhunter test-active <program-key>
+# add --injection for single-request reflected-XSS/SQL-error-signature probes against
+# Wayback-discovered param URLs, and/or --nuclei for a curated safe-tag nuclei scan --
+# both still gated by the exact same approve-active decision above, see Guardrails
+uv run bbhunter test-active <program-key> --injection --nuclei
 
 uv run bbhunter findings --status candidate
 

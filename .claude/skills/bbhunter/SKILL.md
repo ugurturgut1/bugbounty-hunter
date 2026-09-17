@@ -68,6 +68,15 @@ this skill must not make that decision:
 If the user is ambiguous, unsure, or the policy is silent: do not
 approve. Passive-only is always a safe default to fall back to.
 
+`test-active` has two opt-in flags, `--injection` (single-request
+reflected-XSS/SQL-error-signature probes) and `--nuclei` (curated
+misconfig/exposure/tech/cve nuclei templates, dos/intrusive/fuzz/
+bruteforce/hijack tags excluded). Both still run only under the same
+`ACTIVE_LOW_IMPACT` approval from step 3.2 above -- they are not a
+separate gate to skip. Only pass them when the user has said so in this
+conversation (e.g. "yes, include the injection checks too"); never add
+them on your own initiative just because they're available.
+
 ## 4. PoC -- GATE 2
 
 ```bash

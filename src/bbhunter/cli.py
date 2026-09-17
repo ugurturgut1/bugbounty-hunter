@@ -10,6 +10,7 @@ from bbhunter.discovery import ALL_CONNECTORS
 from bbhunter.models import AssetType, FindingStatus, TestType
 from bbhunter.prioritize import prioritize
 from bbhunter.recon import run_passive_recon
+from bbhunter.recon.passive import _tool_path
 from bbhunter.reporting import (
     ManualSubmissionRequired,
     draft_poc,
@@ -264,10 +265,45 @@ def recon(
             f"[yellow]warning[/yellow]: crt.sh query failed for {len(result.crtsh_failures)} seed host(s) "
             f"({', '.join(result.crtsh_failures)}) -- subdomain results for those are incomplete, not confirmed-empty"
         )
+    if result.wayback_failures:
+        console.print(
+            f"[yellow]warning[/yellow]: archive.org CDX query failed for {len(result.wayback_failures)} seed host(s) "
+            f"({', '.join(result.wayback_failures)}) -- subdomain/param-URL results for those are incomplete"
+        )
+    if result.subfinder_failures and not _tool_path("subfinder"):
+        console.print(
+            "[yellow]note[/yellow]: `subfinder` isn't installed -- subdomain coverage is crt.sh + archive.org only. "
+            "See README.md Setup for `go install ...subfinder@latest`."
+        )
+    elif result.subfinder_failures:
+        console.print(
+            f"[yellow]warning[/yellow]: subfinder run failed for {len(result.subfinder_failures)} seed host(s) "
+            f"({', '.join(result.subfinder_failures)})"
+        )
+    if result.param_urls:
+        total_param_urls = sum(len(v) for v in result.param_urls.values())
+        console.print(
+            f"[dim]{total_param_urls} historic URL(s) with query strings found via Wayback -- input set for "
+            f"`bbhunter test-active --injection` (still gated the same as every other active check).[/dim]"
+        )
 
 
 @app.command(name="test-active")
-def test_active_cmd(key: str):
+def test_active_cmd(
+    key: str,
+    injection: bool = typer.Option(
+        False, "--injection",
+        help="Also run single-request, signature-based reflected-XSS and SQL-error probes against "
+             "Wayback-discovered param URLs. Same permits(ACTIVE_LOW_IMPACT) gate as everything else "
+             "here -- this flag only decides whether to include that check class, it grants no new access.",
+    ),
+    nuclei: bool = typer.Option(
+        False, "--nuclei",
+        help="Also run the `nuclei` binary with a curated misconfig/exposure/tech/cve template set "
+             "(dos/intrusive/fuzz/bruteforce/hijack tags excluded), rate-limited to 1 req/s. Requires "
+             "`nuclei` installed (see README) and is skipped silently otherwise. Same gate as --injection.",
+    ),
+):
     """Run Phase 3 active checks (exposed-file/misconfig scan, read-only)
     against a program -- refuses unless `approve-active` has already
     recorded a human decision permitting it. Also tests subdomains a
@@ -286,8 +322,19 @@ def test_active_cmd(key: str):
         raise typer.Exit(1)
 
     recon_result = get_recon_result(key)
-    console.print(f"[cyan]running active checks[/cyan] on {key}...")
-    new_findings = run_active_checks(program, recon_result)
+    if injection and (not recon_result or not recon_result.param_urls):
+        console.print(
+            "[yellow]note[/yellow]: --injection requested but no Wayback param URLs are on file for this "
+            "program -- run `bbhunter recon` first. Continuing with the exposed-file/misconfig checks only."
+        )
+    if nuclei and not _tool_path("nuclei"):
+        console.print(
+            "[yellow]note[/yellow]: --nuclei requested but the `nuclei` binary isn't installed -- skipping "
+            "that check class. See README.md Setup for `go install ...nuclei/v3/cmd/nuclei@latest`."
+        )
+    extras = ", ".join(name for name, flag in (("injection", injection), ("nuclei", nuclei)) if flag)
+    console.print(f"[cyan]running active checks[/cyan] on {key}{f' (incl. {extras})' if extras else ''}...")
+    new_findings = run_active_checks(program, recon_result, injection=injection, nuclei=nuclei)
     for finding in new_findings:
         upsert_finding(finding)
     console.print(f"[green]done[/green] -- {len(new_findings)} candidate(s) found")

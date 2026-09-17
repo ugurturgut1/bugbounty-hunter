@@ -143,9 +143,13 @@ class ReconResult(BaseModel):
     separate Finding(test_type=VERSION_CVE_MATCH) rows for review."""
 
     program_key: str
-    subdomains: dict[str, list[str]] = Field(default_factory=dict)   # seed host -> discovered subdomains
-    fingerprints: dict[str, dict] = Field(default_factory=dict)      # host -> {status_code, server, powered_by, final_url}
+    subdomains: dict[str, list[str]] = Field(default_factory=dict)   # seed host -> discovered subdomains (merged crt.sh + subfinder + wayback)
+    fingerprints: dict[str, dict] = Field(default_factory=dict)      # host -> {status_code, server, powered_by, final_url, tech (optional, from projectdiscovery httpx)}
     crtsh_failures: list[str] = Field(default_factory=list)          # seed hosts whose crt.sh query errored (not: found nothing)
+    subfinder_failures: list[str] = Field(default_factory=list)      # seed hosts where the subfinder binary was missing or errored
+    wayback_failures: list[str] = Field(default_factory=list)        # seed hosts whose archive.org CDX query errored
+    param_urls: dict[str, list[str]] = Field(default_factory=dict)   # seed host -> historic URLs (with query strings) found via Wayback CDX,
+                                                                      # the input set for testing/active.py's opt-in injection-signature checks
     seeds_total: int = 0                                             # how many seed assets this run was scoped to cover
     seeds_processed: int = 0                                         # how many it actually got through before finishing/stopping
     last_run: datetime = Field(default_factory=datetime.utcnow)
