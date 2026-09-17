@@ -22,7 +22,7 @@ from bbhunter.reporting import (
 )
 from bbhunter.testing import run_active_checks
 from bbhunter.testing.ai_safety import run_ai_safety_probes
-from bbhunter.testing.idor import run_idor_check
+from bbhunter.testing.idor import run_bfla_check, run_idor_check
 from bbhunter.state import (
     get_ai_endpoint,
     get_finding,
@@ -528,6 +528,55 @@ def test_idor_cmd(
     else:
         console.print("[green]no candidate[/green] -- either properly denied, or the baseline request as the "
                        "owner identity itself didn't succeed (check --owner-header/the URL)")
+
+
+@app.command(name="test-bfla")
+def test_bfla_cmd(
+    key: str,
+    url: str = typer.Option(..., "--url", help="An administrative/privileged function or endpoint URL, e.g. https://target/admin/users"),
+    authorized_header: list[str] = typer.Option(
+        ..., "--authorized-header", help="'Key: Value' auth header for an identity authorized to use this function, repeatable"
+    ),
+    other_header: list[str] = typer.Option(
+        ..., "--other-header", help="'Key: Value' auth header for a lower-privileged/unrelated identity, repeatable"
+    ),
+    authorized_note: str | None = typer.Option(
+        None, "--authorized-note", help="How you know this identity is authorized for this function, e.g. \"test account A has the admin role\""
+    ),
+):
+    """Check one administrative/privileged function or endpoint for
+    Broken Function Level Authorization (OWASP API5:2023) by fetching it
+    once as an authorized identity and once as a lower-privileged one --
+    exactly two requests, same mechanism as `test-idor` pointed at a
+    function instead of a data object. Refuses unless `approve-active`
+    has already recorded a human decision permitting active testing.
+    Both identities' credentials must be real sessions you (or the user
+    directing this) actually control -- never invented, guessed, or
+    brute-forced."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+
+    if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
+        console.print(
+            f"[red]blocked[/red]: {key} does not permit active testing. "
+            "Run `bbhunter review-rules` then `bbhunter approve-active` if the policy actually allows it."
+        )
+        raise typer.Exit(1)
+
+    authorized_headers = _parse_headers(authorized_header)
+    other_headers = _parse_headers(other_header)
+
+    console.print(f"[cyan]checking BFLA[/cyan] on {url} for {key} (2 requests)...")
+    new_findings = run_bfla_check(program, url, authorized_headers, other_headers, authorized_note=authorized_note)
+    for finding in new_findings:
+        upsert_finding(finding)
+    if new_findings:
+        console.print("[red]candidate found[/red] -- see `bbhunter findings`, verify manually before drafting a PoC")
+    else:
+        console.print("[green]no candidate[/green] -- either properly denied, or the baseline request as the "
+                       "authorized identity itself didn't succeed (check --authorized-header/the URL)")
 
 
 @app.command()

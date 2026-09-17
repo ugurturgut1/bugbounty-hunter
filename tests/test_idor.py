@@ -1,11 +1,11 @@
-"""Tests for the IDOR two-identity session-diffing check
+"""Tests for the BOLA/IDOR and BFLA two-identity session-diffing checks
 (testing/idor.py). All HTTP calls are mocked -- never a real request."""
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from bbhunter.models import AssetType, FindingStatus, Platform, Program, RulesOfEngagement, ScopeAsset, TestType
-from bbhunter.testing.idor import check_idor, run_idor_check
+from bbhunter.testing.idor import check_bfla, check_idor, run_bfla_check, run_idor_check
 
 
 def _program(*, approved: bool = True) -> Program:
@@ -115,3 +115,51 @@ def test_run_idor_check_returns_empty_list_when_no_hit():
     with patch("bbhunter.testing.idor.httpx.get", return_value=owner_resp):
         findings = run_idor_check(program, "https://x/orders/12345", {"Authorization": "A"}, {"Authorization": "B"})
     assert findings == []
+
+
+# --- BFLA (same mechanism, different target shape) --------------------------
+
+
+def test_bfla_flags_when_lower_privileged_identity_also_gets_clean_200():
+    authorized_resp = _resp(text="admin panel: 42 users listed")
+    other_resp = _resp(text="admin panel: 43 users listed")
+    with patch("bbhunter.testing.idor.httpx.get", side_effect=[authorized_resp, other_resp]):
+        hit = check_bfla("https://x/admin/users", {"Authorization": "Admin"}, {"Authorization": "Regular"})
+    assert hit is not None
+    assert hit["kind"] == "bfla-candidate"
+
+
+def test_bfla_no_hit_when_lower_privileged_identity_properly_denied():
+    authorized_resp = _resp(text="admin panel: 42 users listed")
+    other_resp = _resp(status_code=403, text="forbidden")
+    with patch("bbhunter.testing.idor.httpx.get", side_effect=[authorized_resp, other_resp]):
+        hit = check_bfla("https://x/admin/users", {"Authorization": "Admin"}, {"Authorization": "Regular"})
+    assert hit is None
+
+
+def test_bfla_no_hit_when_authorized_baseline_itself_fails():
+    authorized_resp = _resp(status_code=403, text="forbidden")
+    with patch("bbhunter.testing.idor.httpx.get", return_value=authorized_resp):
+        hit = check_bfla("https://x/admin/users", {"Authorization": "Admin"}, {"Authorization": "Regular"})
+    assert hit is None
+
+
+def test_run_bfla_check_refuses_without_approval():
+    program = _program(approved=False)
+    with pytest.raises(RuntimeError):
+        run_bfla_check(program, "https://x/admin/users", {"Authorization": "Admin"}, {"Authorization": "Regular"})
+
+
+def test_run_bfla_check_maps_hit_to_finding_with_authorized_note():
+    program = _program()
+    authorized_resp = _resp(text="admin panel: 42 users listed")
+    other_resp = _resp(text="admin panel: 43 users listed")
+    with patch("bbhunter.testing.idor.httpx.get", side_effect=[authorized_resp, other_resp]):
+        findings = run_bfla_check(
+            program, "https://x/admin/users", {"Authorization": "Admin"}, {"Authorization": "Regular"},
+            authorized_note="test account A has the admin role",
+        )
+    assert len(findings) == 1
+    assert findings[0].test_type == TestType.ACTIVE_LOW_IMPACT
+    assert "admin role" in findings[0].evidence
+    assert "BFLA" in findings[0].title

@@ -101,15 +101,18 @@ its API key -- never invent or guess these, and never put a real API key
 directly in a command or file yourself; only reference an env var name
 the user tells you is already set.
 
-### IDOR testing (`bbhunter test-idor`)
+### IDOR / BFLA testing (`bbhunter test-idor`, `bbhunter test-bfla`)
 
-Same `ACTIVE_LOW_IMPACT` approval as step 3 -- not a separate gate. But
-unlike everything else in this pipeline, it needs the user to supply two
-real identities' auth headers (`--owner-header`/`--other-header`) and a
-resource URL they know belongs to the owner identity. Never invent,
-guess, or attempt to obtain these credentials yourself -- if the user
-doesn't have two test accounts/sessions to give you, this check simply
-isn't runnable, and that's fine, don't improvise a substitute.
+Same `ACTIVE_LOW_IMPACT` approval as step 3 -- not a separate gate for
+either. But unlike everything else in this pipeline, both need the user
+to supply two real identities' auth headers and a URL: `test-idor` needs
+a resource URL the user knows belongs to the "owner" identity
+(`--owner-header`/`--other-header`); `test-bfla` needs an admin/
+privileged function or endpoint URL and an identity the user knows is
+authorized for it (`--authorized-header`/`--other-header`). Never
+invent, guess, or attempt to obtain these credentials yourself -- if the
+user doesn't have two test accounts/sessions to give you, these checks
+simply aren't runnable, and that's fine, don't improvise a substitute.
 
 ## 4. PoC -- GATE 2
 

@@ -234,6 +234,15 @@ what it covers.
 | A01 Broken Access Control (IDOR) | Partial (manual-input-driven) | `testing/idor.py`, `bbhunter test-idor` -- needs a human-supplied resource URL + two real identities' credentials, see below |
 | A07 Auth Failures | **Missing by design** | guardrails exclude credential brute-forcing/default-login entirely |
 | Business logic / race conditions | **Missing** | not generically automatable |
+| API1:2023 Broken Object Level Authorization (BOLA) | Partial (manual-input-driven) | same mechanism as A01/IDOR above -- `bbhunter test-idor` |
+| API5:2023 Broken Function Level Authorization (BFLA) | Partial (manual-input-driven) | `testing/idor.py`'s `check_bfla`, `bbhunter test-bfla` -- same mechanism pointed at an admin/privileged endpoint instead of a data object |
+| API3:2023 Broken Object Property Level Auth -- excessive data exposure half | Good (heuristic) | `_scan_json_for_sensitive_fields` in `testing/active.py`, piggybacks on the existing `/` request, no extra cost |
+| API3:2023 -- mass assignment half | Manual-input-driven, gated separately | `testing/mass_assignment.py`, `bbhunter test-mass-assignment` -- the one write-capable check in this project, see below |
+| API4:2023 Unrestricted Resource Consumption | Thin (weak signal) | missing rate-limit-header check -- absence isn't proof of no rate limiting, reported at info severity only |
+| API7:2023 SSRF | same as A10 SSRF above | nuclei `ssrf` tag |
+| API8:2023 Security Misconfiguration | same as A05 above | |
+| API9:2023 Improper Inventory Management | Good | `_API_INVENTORY_CHECKS` in `testing/active.py` -- exposed Swagger/OpenAPI specs, shadow v1/v2 version detection |
+| API2 Broken Auth, API6 Unrestricted Sensitive Business Flows, API10 Unsafe Consumption of APIs | **Missing** | API2 excluded by design (same as A07); API6/API10 aren't generically automatable |
 | LLM01 Prompt Injection, LLM02 Sensitive Info Disclosure, LLM06 Excessive Agency, LLM07 System Prompt Leakage (OWASP LLM Top 10 2025) | Good (heuristic) | `testing/ai_safety.py`, `bbhunter test-ai` -- see below |
 | LLM03 Supply Chain, LLM04 Data/Model Poisoning, LLM08 Embedding Weaknesses, LLM09 Misinformation | **Missing** | not meaningfully blackbox-probable with a single HTTP request |
 | LLM10 Unbounded Consumption | **Missing by design** | would mean deliberately running up cost/resource usage against a real endpoint -- the AI-endpoint equivalent of the DoS testing excluded everywhere else in this project |
@@ -291,11 +300,26 @@ what it covers.
    brute-forced. 10 new tests, plus a real end-to-end smoke test against a local mock server with a
    deliberately IDOR-vulnerable endpoint, confirming the CLI correctly flags it.
 
-**All four roadmap phases above are now done as of 2026-09-17.** Longer-term ideas not yet
-scoped into a phase: broader business-logic/race-condition testing (not generically automatable, would
-need per-program custom logic), a richer LLM probe set (e.g. multi-turn escalation -- deliberately out
-of scope so far, since every probe here is single-request by design), and TLS/certificate weakness
-checks for A02.
+**All four roadmap phases above were done as of 2026-09-17.** A second round, same day, is adding
+OWASP API Security Top 10 2023 coverage and multi-turn LLM jailbreak-chain testing:
+
+5. *(in progress 2026-09-17)* OWASP API Top 10 2023. Done so far: BFLA (`check_bfla`/`test-bfla`,
+   reusing the BOLA/IDOR access-diffing mechanism against admin/privileged endpoints instead of data
+   objects), excessive data exposure (`_scan_json_for_sensitive_fields` in `testing/active.py` --
+   signature-only key-name match against a curated sensitive-field list, piggybacks on the `/` request
+   every host already gets, so this adds zero extra requests), API inventory/shadow-version discovery
+   (`_API_INVENTORY_CHECKS` -- exposed Swagger/OpenAPI specs, only strong-signature paths included, no
+   bare version-guess paths with a weak signature), and a weak/info-only rate-limit-header signal.
+   Still to come: mass assignment (the write-capable half of API3) -- the one check in this whole
+   project that would send a real state-changing request, so it needs its own gated command and its
+   own guardrails conversation before it's built, not a silent addition to the read-only checks above.
+6. *(not started)* Multi-turn LLM jailbreak chains: scripted multi-turn conversations testing whether a
+   model resists escalation across turns even when it would refuse the same request single-shot -- a
+   materially more realistic red-team technique than the single-turn probes alone.
+
+Longer-term ideas not yet scoped into a phase: broader business-logic/race-condition testing (not
+generically automatable, would need per-program custom logic), and TLS/certificate weakness checks
+for A02.
 
 ## Why HackerOne/Bugcrowd/Intigriti/YesWeHack connectors use official APIs, not scraping
 

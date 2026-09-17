@@ -186,6 +186,91 @@ _SECURITY_HEADERS = [
     "x-content-type-options",
 ]
 
+# Header names that suggest a program actually surfaces rate-limit state
+# to clients. Absence is a genuinely weak signal (plenty of real rate
+# limiters never expose it via headers), so this is always reported at
+# "info" severity with an explicit caveat -- OWASP API4:2023 Unrestricted
+# Resource Consumption, but this is nowhere near a confirmation of it.
+_RATE_LIMIT_HEADERS = {"x-ratelimit-limit", "ratelimit-limit", "retry-after"}
+
+# OWASP API9:2023 Improper Inventory Management: shadow/deprecated API
+# versions and exposed API documentation. Only paths with a strong,
+# specific content signature are included (an OpenAPI/Swagger document
+# has a very recognizable shape) -- no bare "/api/v1"-style guesses with
+# a weak signature, which would just flag every JSON response ever.
+_API_INVENTORY_CHECKS: dict[str, tuple[str, tuple[str, ...], str]] = {
+    "/swagger.json": ("Exposed Swagger/OpenAPI spec", ('"swagger"', '"openapi"', '"paths"'), "info"),
+    "/openapi.json": ("Exposed OpenAPI spec", ('"openapi"', '"paths"'), "info"),
+    "/.well-known/openapi.json": ("Exposed OpenAPI spec (well-known)", ('"openapi"', '"paths"'), "info"),
+    "/api-docs": ("Exposed API docs endpoint", ('"swagger"', '"openapi"', '"paths"'), "info"),
+    "/v1/swagger.json": (
+        "Exposed v1 API spec -- verify whether v1 is still meant to be reachable, or is a shadow/deprecated version",
+        ('"swagger"', '"openapi"'),
+        "low",
+    ),
+    "/v2/swagger.json": (
+        "Exposed v2 API spec -- verify this matches the currently documented/intended version",
+        ('"swagger"', '"openapi"'),
+        "low",
+    ),
+}
+
+# OWASP API3:2023 Broken Object Property Level Authorization (the
+# excessive-data-exposure half; the write-capable mass-assignment half
+# lives in testing/mass_assignment.py, gated separately). Signature-only,
+# key-name match -- never inspects values, so this can't itself leak a
+# real secret into a Finding's evidence.
+_SENSITIVE_FIELD_NAMES = (
+    "password",
+    "passwd",
+    "password_hash",
+    "passwordhash",
+    "hashed_password",
+    "secret",
+    "api_key",
+    "apikey",
+    "access_token",
+    "accesstoken",
+    "refresh_token",
+    "refreshtoken",
+    "private_key",
+    "privatekey",
+    "client_secret",
+    "clientsecret",
+    "ssn",
+    "social_security_number",
+    "credit_card",
+    "creditcard",
+    "card_number",
+    "cvv",
+    "cvv2",
+    "is_admin",
+    "isadmin",
+    "internal_notes",
+    "internal_only",
+)
+
+
+def _scan_json_for_sensitive_fields(data, *, _depth: int = 0) -> list[str]:
+    """Recursively walks a parsed JSON value looking for dict keys that
+    match `_SENSITIVE_FIELD_NAMES` -- signature-only on the KEY name,
+    never inspects or returns the value itself. Depth-capped at 6 and
+    breadth-capped at 20 items per list, both far beyond any normal API
+    response shape, to keep this from pathologically walking a huge or
+    deeply-nested payload."""
+    if _depth > 6:
+        return []
+    found: list[str] = []
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if any(name in str(key).lower() for name in _SENSITIVE_FIELD_NAMES):
+                found.append(str(key))
+            found.extend(_scan_json_for_sensitive_fields(value, _depth=_depth + 1))
+    elif isinstance(data, list):
+        for item in data[:20]:
+            found.extend(_scan_json_for_sensitive_fields(item, _depth=_depth + 1))
+    return found
+
 
 def _baseline(client: httpx.Client, host: str) -> tuple[int, int] | None:
     probe_path = f"/bbhunter-baseline-{secrets.token_hex(8)}"
@@ -204,6 +289,7 @@ def _check_host(client: httpx.Client, host: str, fingerprint: dict | None = None
     fingerprint = fingerprint or {}
     stacks = _detected_stacks(fingerprint.get("tech") or [], fingerprint.get("server"), fingerprint.get("powered_by"))
     checks = dict(_GENERIC_CHECKS)
+    checks.update(_API_INVENTORY_CHECKS)
     for stack in stacks:
         checks.update(_STACK_CHECKS[stack])
 
@@ -247,6 +333,38 @@ def _check_host(client: httpx.Client, host: str, fingerprint: dict | None = None
                     "url": str(resp.url),
                 }
             )
+
+        if not (present & _RATE_LIMIT_HEADERS):
+            hits.append(
+                {
+                    "path": "/",
+                    "title": "No rate-limit headers observed on the root response",
+                    "severity": "info",
+                    "status_code": resp.status_code,
+                    "url": str(resp.url),
+                }
+            )
+
+        if "json" in resp.headers.get("content-type", "").lower():
+            try:
+                data = resp.json()
+            except ValueError:
+                data = None
+            if data is not None:
+                sensitive_fields = sorted(set(_scan_json_for_sensitive_fields(data)))
+                if sensitive_fields:
+                    hits.append(
+                        {
+                            "path": "/",
+                            "title": (
+                                "Possible excessive data exposure: sensitive-looking field name(s) in "
+                                f"JSON response: {', '.join(sensitive_fields[:10])}"
+                            ),
+                            "severity": "medium",
+                            "status_code": resp.status_code,
+                            "url": str(resp.url),
+                        }
+                    )
     except httpx.HTTPError:
         pass
     time.sleep(REQUEST_DELAY_SECONDS)
@@ -445,9 +563,14 @@ def run_active_checks(
     with httpx.Client(headers=headers) as client:
         for host in hosts:
             for hit in _check_host(client, host, fingerprints.get(host)):
+                # A single path (most often "/", for the header/rate-limit/data-exposure
+                # checks) can now produce more than one distinct hit, so the title is
+                # folded into the id too -- otherwise two hits sharing a path would
+                # collide and upsert_finding would silently overwrite one with the other.
+                title_digest = hashlib.sha256(hit["title"].encode()).hexdigest()[:8]
                 findings.append(
                     Finding(
-                        id=f"{program.key}:{host}:{hit['path']}",
+                        id=f"{program.key}:{host}:{hit['path']}:{title_digest}",
                         program_key=program.key,
                         asset=host,
                         title=hit["title"],
