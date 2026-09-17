@@ -6,9 +6,16 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# load_dotenv() with no path searches upward from the *caller's* location,
+# not the process cwd -- fine when running `uv run bbhunter` from inside
+# the project, but silently finds nothing (empty creds, no error) once
+# `bbhunter` is installed as a standalone tool (`uv tool install`) and
+# run from an arbitrary directory. Pointing it at the same project home
+# DATA_DIR resolves against keeps credentials working regardless of cwd.
+PROJECT_HOME = Path(os.environ.get("BBHUNTER_HOME", Path.home() / "bugbounty-hunter"))
+load_dotenv(PROJECT_HOME / ".env")
 
-DATA_DIR = Path(os.environ.get("BBHUNTER_DATA_DIR", Path.home() / "bugbounty-hunter" / "state"))
+DATA_DIR = Path(os.environ.get("BBHUNTER_DATA_DIR", PROJECT_HOME / "state"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "bbhunter.db"
 
