@@ -70,12 +70,36 @@ approve. Passive-only is always a safe default to fall back to.
 
 `test-active` has two opt-in flags, `--injection` (single-request
 reflected-XSS/SQL-error-signature probes) and `--nuclei` (curated
-misconfig/exposure/tech/cve nuclei templates, dos/intrusive/fuzz/
-bruteforce/hijack tags excluded). Both still run only under the same
-`ACTIVE_LOW_IMPACT` approval from step 3.2 above -- they are not a
-separate gate to skip. Only pass them when the user has said so in this
-conversation (e.g. "yes, include the injection checks too"); never add
-them on your own initiative just because they're available.
+misconfig/exposure/tech/cve/cors/ssrf/jwt/graphql/takeover/ssti/xxe/
+host-header/prototype-pollution/redirect nuclei templates, rce/sqli/dos/
+intrusive/fuzz/bruteforce/hijack/default-login/authentication-bypass tags
+excluded). Both still run only under the same `ACTIVE_LOW_IMPACT`
+approval from step 3.2 above -- they are not a separate gate to skip.
+Only pass them when the user has said so in this conversation (e.g. "yes,
+include the injection checks too"); never add them on your own
+initiative just because they're available.
+
+### AI/LLM endpoint testing (`bbhunter test-ai`) -- its own approval, not covered by step 3
+
+If a program's scope explicitly includes an AI/LLM product endpoint
+(check the actual policy text -- don't assume), this is a *separate*
+`TestType` (`ai_safety_probe`) from `active_low_impact`, so it needs its
+own `approve-active --test-type ai_safety_probe --note "..."` citing the
+policy language, following the same review-rules-first, user's-own-words
+process as step 3 above -- never approve this yourself either.
+
+Before configuring or running it, tell the user explicitly: each
+`test-ai` run sends exactly 4 prompts to the real model endpoint, which
+may cost real money per request if it's a paid API (unlike the free HTTP
+checks elsewhere in this pipeline). Get their go-ahead on that before
+running `uv run bbhunter test-ai <program-key>`, even after the
+approval gate above is satisfied.
+
+`bbhunter ai-endpoint-set` needs the user to supply (or confirm) the
+actual endpoint URL, request/response shape, and which env var holds
+its API key -- never invent or guess these, and never put a real API key
+directly in a command or file yourself; only reference an env var name
+the user tells you is already set.
 
 ## 4. PoC -- GATE 2
 

@@ -50,6 +50,16 @@ submit.
    judgment -- see its SKILL.md. See "Vulnerability class coverage"
    below for what this does and doesn't cover against OWASP Top 10 and
    common bug bounty vuln classes.
+7. **AI/LLM safety probes (`bbhunter test-ai`) have no passive-floor
+   exception.** Every other TestType has some request-free/always-allowed
+   path (passive recon) or a low-cost fallback; a call to an AI model
+   endpoint is inherently an active request and may cost the program real
+   money per call, so `TestType.AI_SAFETY_PROBE` requires the same
+   `approve-active` decision as any other active check with no exception
+   at all. Each probe sends exactly one prompt and never asks the model
+   to do anything with real-world impact -- see `testing/ai_safety.py`'s
+   module docstring for what each of the 4 probes actually checks and why
+   LLM10 (unbounded consumption) is deliberately never probed.
 
 ## Status
 
@@ -224,7 +234,9 @@ what it covers.
 | A01 Broken Access Control (IDOR) | **Missing** | inherently app-specific, not generically templatable -- would need a authenticated-session-diffing feature (planned, not built) |
 | A07 Auth Failures | **Missing by design** | guardrails exclude credential brute-forcing/default-login entirely |
 | Business logic / race conditions | **Missing** | not generically automatable |
-| LLM/AI-specific vulns (OWASP Top 10 for LLM Apps 2025: prompt injection, system prompt leakage, excessive agency, sensitive info disclosure, insecure output handling, unbounded consumption) | **Missing entirely** | no AI/LLM-target asset type or check class exists yet -- planned |
+| LLM01 Prompt Injection, LLM02 Sensitive Info Disclosure, LLM06 Excessive Agency, LLM07 System Prompt Leakage (OWASP LLM Top 10 2025) | Good (heuristic) | `testing/ai_safety.py`, `bbhunter test-ai` -- see below |
+| LLM03 Supply Chain, LLM04 Data/Model Poisoning, LLM08 Embedding Weaknesses, LLM09 Misinformation | **Missing** | not meaningfully blackbox-probable with a single HTTP request |
+| LLM10 Unbounded Consumption | **Missing by design** | would mean deliberately running up cost/resource usage against a real endpoint -- the AI-endpoint equivalent of the DoS testing excluded everywhere else in this project |
 
 **Roadmap (phased, tracked here so it survives across sessions):**
 1. *(done 2026-09-17)* Web gap-fill via curated nuclei tag expansion -- see table above.
@@ -241,11 +253,27 @@ what it covers.
    tag set wasn't narrowed the same way -- its templates already condition on the actual response
    content before matching, so per-host tag routing wouldn't reduce anything nuclei doesn't already
    skip internally.
-3. *(not started)* LLM/AI red-team module: a new check class for AI-product bug bounty scope
-   (prompt injection, system-prompt-leakage, excessive-agency/tool-misuse, sensitive-info-disclosure
-   probes), modeled on OWASP's LLM Top 10 2025. Needs its own design pass -- likely a new `AssetType`
-   and `TestType`, and its own guardrails conversation (what "detection-only" even means against a
-   model endpoint is a different question than against a web server).
+3. *(done 2026-09-17)* LLM/AI red-team module (`testing/ai_safety.py`, `models.AIEndpointConfig`,
+   `TestType.AI_SAFETY_PROBE`): for programs whose bounty scope explicitly covers an AI/LLM product
+   endpoint. `bbhunter ai-endpoint-set <key> --url ... --request-template-file ... --response-path
+   ...` configures how to send a prompt to that specific provider's API shape (deliberately generic
+   -- a `{{PROMPT}}`-templated JSON request body plus a dot-path into the JSON response -- rather than
+   hardcoded to one provider, so it works against OpenAI/Anthropic/Google/a custom chatbot alike; a
+   real API key is read from an env var named via `--auth-env-var` at request time only, never
+   persisted). `bbhunter test-ai <key>` then runs exactly 4 single-prompt probes: prompt-injection
+   canary compliance (does the model echo a marker after being told to ignore its instructions?),
+   system-prompt-leakage (does asking it to repeat its instructions produce something that reads like
+   real system-prompt content?), sensitive-info-disclosure (does asking it to print any credentials
+   in its context match a real secret-shaped pattern -- not just phrasing?), and excessive-agency
+   (does asking it to execute an out-of-scope shell command produce something other than a refusal?).
+   Gated by `permits(TestType.AI_SAFETY_PROBE)` -- same `approve-active` mechanism as every other
+   active check, no new approval machinery, but this is the one TestType with no passive-floor
+   exception at all, since a model API call is inherently active (and may cost real money per
+   request, unlike a free HTTP request -- `test-ai` tells you this and runs exactly 4 requests, no
+   more). 18 new tests, plus a real end-to-end smoke test against a local mock chat-completions
+   server (never a real/paid API) confirming all 4 probes fire correctly against a deliberately
+   vulnerable model and that the approval gate genuinely blocks an unapproved program via the CLI,
+   not just in a unit test.
 4. *(not started, lower priority)* Authenticated-session-diffing for IDOR: fetch the same resource
    under two different user contexts and flag if both succeed identically -- needs a way to supply a
    second identity's session/token, which today's CLI has no concept of.

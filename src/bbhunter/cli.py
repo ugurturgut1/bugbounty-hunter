@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime
+from pathlib import Path
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from bbhunter.discovery import ALL_CONNECTORS
-from bbhunter.models import AssetType, FindingStatus, TestType
+from bbhunter.models import AIEndpointConfig, AssetType, FindingStatus, TestType
 from bbhunter.prioritize import prioritize
 from bbhunter.recon import run_passive_recon
 from bbhunter.recon.passive import _tool_path
@@ -19,13 +21,16 @@ from bbhunter.reporting import (
     submit_report,
 )
 from bbhunter.testing import run_active_checks
+from bbhunter.testing.ai_safety import run_ai_safety_probes
 from bbhunter.state import (
+    get_ai_endpoint,
     get_finding,
     get_program,
     get_recon_result,
     list_findings,
     list_programs,
     list_reconned_program_keys,
+    upsert_ai_endpoint,
     upsert_finding,
     upsert_program,
     upsert_recon_result,
@@ -343,6 +348,130 @@ def test_active_cmd(
     if new_findings:
         console.print("[yellow]note[/yellow]: verify each manually before drafting a PoC -- "
                        "see `bbhunter findings`")
+
+
+@app.command(name="ai-endpoint-set")
+def ai_endpoint_set_cmd(
+    key: str,
+    url: str = typer.Option(..., "--url", help="The AI/LLM product endpoint URL, e.g. a chat-completions API"),
+    request_template_file: Path = typer.Option(
+        ..., "--request-template-file",
+        help="Path to a JSON file for the request body, containing a {{PROMPT}} placeholder somewhere "
+             "in a string value, e.g. {\"model\": \"...\", \"messages\": [{\"role\": \"user\", "
+             "\"content\": \"{{PROMPT}}\"}]}",
+    ),
+    response_path: str = typer.Option(
+        ..., "--response-path",
+        help="Dot-separated path into the JSON response for the model's text reply, e.g. "
+             "choices.0.message.content (numeric segments index into arrays)",
+    ),
+    method: str = typer.Option("POST", "--method"),
+    header: list[str] = typer.Option(
+        [], "--header", help="Extra static 'Key: Value' header, repeatable. Not for secrets -- use --auth-env-var."
+    ),
+    auth_header: str | None = typer.Option(None, "--auth-header", help="Header name for the auth token, e.g. Authorization"),
+    auth_env_var: str | None = typer.Option(
+        None, "--auth-env-var", help="Env var holding the raw API key/token -- read at request time only, never stored"
+    ),
+    auth_template: str = typer.Option("Bearer {token}", "--auth-template", help="How to format the token into the header value"),
+    note: str | None = typer.Option(None, "--note", help="Why this endpoint is in scope, e.g. citing the program's policy"),
+):
+    """Configure how to send a prompt to a program's in-scope AI/LLM
+    product endpoint and read back its text response, for later use by
+    `bbhunter test-ai`. Never stores a real credential -- only the name
+    of the env var to read one from at request time."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+
+    if not request_template_file.exists():
+        console.print(f"[red]not found[/red]: {request_template_file}")
+        raise typer.Exit(1)
+    request_template = request_template_file.read_text()
+    if "{{PROMPT}}" not in request_template:
+        console.print("[red]invalid template[/red]: request template must contain a {{PROMPT}} placeholder")
+        raise typer.Exit(1)
+
+    headers: dict[str, str] = {}
+    for h in header:
+        if ":" not in h:
+            console.print(f"[red]invalid header[/red]: {h!r} (expected 'Key: Value')")
+            raise typer.Exit(1)
+        hk, _, hv = h.partition(":")
+        headers[hk.strip()] = hv.strip()
+
+    config = AIEndpointConfig(
+        program_key=key,
+        url=url,
+        method=method,
+        headers=headers,
+        auth_header=auth_header,
+        auth_env_var=auth_env_var,
+        auth_template=auth_template,
+        request_template=request_template,
+        response_text_path=response_path,
+        notes=note,
+    )
+    upsert_ai_endpoint(config)
+    console.print(f"[green]saved[/green]: AI endpoint config for {key} -> {url}")
+    if auth_env_var and not os.environ.get(auth_env_var):
+        console.print(
+            f"[yellow]note[/yellow]: ${auth_env_var} isn't set in this environment -- `test-ai` will send "
+            "requests without an auth header until it is"
+        )
+
+
+@app.command(name="ai-endpoint-show")
+def ai_endpoint_show_cmd(key: str):
+    """Show the AI endpoint config saved for a program, if any. Never
+    prints a real credential -- only the configured env var name."""
+    config = get_ai_endpoint(key)
+    if not config:
+        console.print(f"[yellow]none configured[/yellow] for {key} -- use `bbhunter ai-endpoint-set` first")
+        raise typer.Exit(1)
+    console.print(config.model_dump_json(indent=2))
+
+
+@app.command(name="test-ai")
+def test_ai_cmd(key: str):
+    """Run the opt-in AI/LLM safety probes (prompt injection, system-
+    prompt leakage, sensitive-info disclosure, excessive agency -- see
+    testing/ai_safety.py) against a program's configured AI endpoint.
+    Refuses unless `approve-active --test-type ai_safety_probe` has
+    already recorded a human decision permitting it -- same gate as
+    every other active check, no passive-floor exception for this one.
+
+    Unlike the web checks, each probe here is a real call to the
+    program's AI model, which may cost real money per request if it's a
+    paid model API -- this runs exactly 4 requests total, but that's
+    worth knowing before running it repeatedly."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+
+    config = get_ai_endpoint(key)
+    if not config:
+        console.print(f"[red]not configured[/red]: run `bbhunter ai-endpoint-set {key}` first")
+        raise typer.Exit(1)
+
+    if not program.rules.permits(TestType.AI_SAFETY_PROBE):
+        console.print(
+            f"[red]blocked[/red]: {key} does not permit AI safety probes. Run `bbhunter review-rules` then "
+            "`bbhunter approve-active --test-type ai_safety_probe --note \"...\"` if the policy actually "
+            "covers testing this AI product endpoint."
+        )
+        raise typer.Exit(1)
+
+    console.print(f"[cyan]running AI safety probes[/cyan] against {config.url} for {key} (4 requests)...")
+    new_findings = run_ai_safety_probes(program, config)
+    for finding in new_findings:
+        upsert_finding(finding)
+    console.print(f"[green]done[/green] -- {len(new_findings)} candidate(s) found")
+    if new_findings:
+        console.print("[yellow]note[/yellow]: these are heuristic signals from a single prompt each -- read the "
+                       "actual model responses yourself before treating any as confirmed, see `bbhunter findings`")
 
 
 @app.command()

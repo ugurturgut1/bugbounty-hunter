@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from bbhunter.config import DB_PATH
-from bbhunter.models import Finding, Program, ReconResult
+from bbhunter.models import AIEndpointConfig, Finding, Program, ReconResult
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS programs (
@@ -28,6 +28,12 @@ CREATE TABLE IF NOT EXISTS recon_results (
     program_key TEXT PRIMARY KEY,
     data TEXT NOT NULL,
     last_run TEXT NOT NULL,
+    FOREIGN KEY (program_key) REFERENCES programs(key)
+);
+
+CREATE TABLE IF NOT EXISTS ai_endpoints (
+    program_key TEXT PRIMARY KEY,
+    data TEXT NOT NULL,
     FOREIGN KEY (program_key) REFERENCES programs(key)
 );
 """
@@ -108,3 +114,18 @@ def list_reconned_program_keys(db_path: Path = DB_PATH) -> set[str]:
     with connect(db_path) as conn:
         rows = conn.execute("SELECT program_key FROM recon_results").fetchall()
     return {row[0] for row in rows}
+
+
+def upsert_ai_endpoint(config: AIEndpointConfig, db_path: Path = DB_PATH) -> None:
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO ai_endpoints (program_key, data) VALUES (?, ?) "
+            "ON CONFLICT(program_key) DO UPDATE SET data=excluded.data",
+            (config.program_key, config.model_dump_json()),
+        )
+
+
+def get_ai_endpoint(program_key: str, db_path: Path = DB_PATH) -> AIEndpointConfig | None:
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT data FROM ai_endpoints WHERE program_key = ?", (program_key,)).fetchone()
+    return AIEndpointConfig.model_validate_json(row[0]) if row else None

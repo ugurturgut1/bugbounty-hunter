@@ -40,6 +40,11 @@ class TestType(StrEnum):
     VERSION_CVE_MATCH = "version_cve_match"  # matching fingerprinted versions against known CVEs, no exploitation
     ACTIVE_LOW_IMPACT = "active_low_impact"  # e.g. safe XSS/SQLi probes, auth/config checks, no data modification
     ACTIVE_INTRUSIVE = "active_intrusive"    # anything that could degrade service, brute force, DoS-adjacent, automated scanners at volume
+    AI_SAFETY_PROBE = "ai_safety_probe"    # single-prompt-per-check probes against an in-scope AI/LLM product endpoint
+                                            # (prompt injection, system-prompt leakage, sensitive-info disclosure,
+                                            # excessive agency) -- see testing/ai_safety.py. Unlike every other
+                                            # TestType, this has no passive-floor equivalent: an API call to a model
+                                            # is inherently an active request, so permits() never allows it for free.
     SOCIAL_ENGINEERING = "social_engineering"
     PHYSICAL = "physical"
 
@@ -161,3 +166,31 @@ class ReconResult(BaseModel):
         this field existed default both to 0, which reads as complete
         (0/0) since there's no way to tell for them either way."""
         return self.seeds_processed >= self.seeds_total
+
+
+class AIEndpointConfig(BaseModel):
+    """How to send a prompt to one program's in-scope AI/LLM product
+    endpoint and read back its text response. Every provider's API shape
+    is different (OpenAI/Anthropic/Google/a custom chatbot all structure
+    requests and responses differently), so this is deliberately generic
+    rather than hardcoded to one provider: `request_template` is a JSON
+    string with a `{{PROMPT}}` placeholder substituted (JSON-escaped) at
+    call time, and `response_text_path` is a dot-separated path (numeric
+    segments index into JSON arrays) into the parsed JSON response that
+    resolves to the model's text reply.
+
+    Never stores a real secret: `auth_env_var` names an environment
+    variable to read the API key/token from at request time, so the
+    config itself (persisted to the local state DB, gitignored, but
+    still) never contains credential material."""
+
+    program_key: str
+    url: str
+    method: str = "POST"
+    headers: dict[str, str] = Field(default_factory=dict)  # static, non-secret headers, e.g. {"Content-Type": "application/json"}
+    auth_header: str | None = None       # header name for the auth token, e.g. "Authorization"
+    auth_env_var: str | None = None      # env var holding the raw token/key -- read at request time only, never persisted
+    auth_template: str = "Bearer {token}"  # how to format the token into the header value; override for e.g. a raw API key header
+    request_template: str                # JSON string containing a "{{PROMPT}}" placeholder
+    response_text_path: str              # e.g. "choices.0.message.content"
+    notes: str | None = None
