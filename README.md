@@ -60,6 +60,16 @@ submit.
    to do anything with real-world impact -- see `testing/ai_safety.py`'s
    module docstring for what each of the 4 probes actually checks and why
    LLM10 (unbounded consumption) is deliberately never probed.
+8. **`bbhunter test-mass-assignment` is the one check in this project that sends a real,
+   state-changing request** -- every other check anywhere in this codebase is read-only by design;
+   this is a deliberate, isolated exception, not a precedent for anything else. It requires its own
+   `TestType.MASS_ASSIGNMENT_PROBE` approval (separate from `active_low_impact`, whose own definition
+   explicitly says "no data modification"), its own explicit `--confirm-disposable` flag on top of
+   that, and only ever attempts one field on one resource the user confirms they own/control. It
+   captures a baseline first and attempts a best-effort revert, but that revert is never guaranteed --
+   read the finding's evidence for the actual outcome, every time. If this project's read-only posture
+   is ever revisited, this is the one check that already crossed that line, not a reason to assume
+   others should too.
 
 ## Status
 
@@ -303,16 +313,23 @@ what it covers.
 **All four roadmap phases above were done as of 2026-09-17.** A second round, same day, is adding
 OWASP API Security Top 10 2023 coverage and multi-turn LLM jailbreak-chain testing:
 
-5. *(in progress 2026-09-17)* OWASP API Top 10 2023. Done so far: BFLA (`check_bfla`/`test-bfla`,
-   reusing the BOLA/IDOR access-diffing mechanism against admin/privileged endpoints instead of data
-   objects), excessive data exposure (`_scan_json_for_sensitive_fields` in `testing/active.py` --
-   signature-only key-name match against a curated sensitive-field list, piggybacks on the `/` request
-   every host already gets, so this adds zero extra requests), API inventory/shadow-version discovery
+5. *(done 2026-09-17)* OWASP API Top 10 2023: BFLA (`check_bfla`/`test-bfla`, reusing the BOLA/IDOR
+   access-diffing mechanism against admin/privileged endpoints instead of data objects), excessive
+   data exposure (`_scan_json_for_sensitive_fields` in `testing/active.py` -- signature-only key-name
+   match against a curated sensitive-field list, piggybacks on the `/` request every host already
+   gets, so this adds zero extra requests), API inventory/shadow-version discovery
    (`_API_INVENTORY_CHECKS` -- exposed Swagger/OpenAPI specs, only strong-signature paths included, no
-   bare version-guess paths with a weak signature), and a weak/info-only rate-limit-header signal.
-   Still to come: mass assignment (the write-capable half of API3) -- the one check in this whole
-   project that would send a real state-changing request, so it needs its own gated command and its
-   own guardrails conversation before it's built, not a silent addition to the read-only checks above.
+   bare version-guess paths with a weak signature), a weak/info-only rate-limit-header signal, and
+   mass assignment (`testing/mass_assignment.py`, `bbhunter test-mass-assignment`) -- the one check in
+   this whole project that sends a real state-changing request (one PATCH adding an unauthorized
+   field, e.g. `isAdmin=true`, to a resource the user explicitly confirms they own via
+   `--confirm-disposable`), gated by its own dedicated `TestType.MASS_ASSIGNMENT_PROBE` (not folded
+   into `active_low_impact`, whose own definition says "no data modification") requiring a separate
+   `approve-active --test-type mass_assignment_probe` decision. Captures the field's baseline value
+   first and attempts a best-effort revert afterward, with the outcome always stated explicitly in the
+   finding's evidence -- live end-to-end smoke-tested against a local mock mutable API (never a real
+   target): confirmed the mutation, detection, and revert all worked, verified by checking the mock
+   server's actual live state matched its original value after the run completed.
 6. *(not started)* Multi-turn LLM jailbreak chains: scripted multi-turn conversations testing whether a
    model resists escalation across turns even when it would refuse the same request single-shot -- a
    materially more realistic red-team technique than the single-turn probes alone.

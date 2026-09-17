@@ -23,6 +23,7 @@ from bbhunter.reporting import (
 from bbhunter.testing import run_active_checks
 from bbhunter.testing.ai_safety import run_ai_safety_probes
 from bbhunter.testing.idor import run_bfla_check, run_idor_check
+from bbhunter.testing.mass_assignment import run_mass_assignment_check
 from bbhunter.state import (
     get_ai_endpoint,
     get_finding,
@@ -577,6 +578,92 @@ def test_bfla_cmd(
     else:
         console.print("[green]no candidate[/green] -- either properly denied, or the baseline request as the "
                        "authorized identity itself didn't succeed (check --authorized-header/the URL)")
+
+
+def _coerce_field_value(raw: str):
+    """Best-effort type coercion for a CLI-supplied field value, so
+    `--field isAdmin=true` produces a real JSON boolean rather than the
+    literal string "true"."""
+    if raw.lower() in ("true", "false"):
+        return raw.lower() == "true"
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    return raw
+
+
+@app.command(name="test-mass-assignment")
+def test_mass_assignment_cmd(
+    key: str,
+    url: str = typer.Option(..., "--url", help="A resource URL you own/control and are fine mutating, e.g. https://target/api/profile/42"),
+    owner_header: list[str] = typer.Option(
+        ..., "--owner-header", help="'Key: Value' auth header for the identity that owns this resource, repeatable"
+    ),
+    field: str = typer.Option(..., "--field", help="One 'name=value' pair to attempt to inject, e.g. isAdmin=true"),
+    confirm_disposable: bool = typer.Option(
+        False, "--confirm-disposable",
+        help="Required. Confirms this exact resource is one you own/control and accept the risk of an "
+             "imperfect revert on -- this check sends a real write.",
+    ),
+    owner_note: str | None = typer.Option(None, "--owner-note", help="How you know you own/control this resource"),
+):
+    """THE ONE CHECK IN THIS PROJECT THAT SENDS A REAL WRITE. Sends one
+    PATCH adding a privileged field to a resource you confirm you own,
+    checks whether it stuck, and attempts a best-effort revert (not
+    guaranteed -- read the finding's evidence for the actual outcome).
+    Requires its own separate `approve-active --test-type
+    mass_assignment_probe` decision, distinct from every other active
+    check on this program. Never run this against a resource you don't
+    personally control."""
+    if not confirm_disposable:
+        console.print(
+            "[red]refusing[/red]: --confirm-disposable is required. This check sends a real, state-changing "
+            "PATCH request to the exact URL given, then attempts a best-effort (not guaranteed) revert. "
+            "Only pass this flag if you own/control this specific resource and accept that risk."
+        )
+        raise typer.Exit(1)
+
+    if "=" not in field:
+        console.print(f"[red]invalid --field[/red]: {field!r} (expected 'name=value')")
+        raise typer.Exit(1)
+    field_name, _, raw_value = field.partition("=")
+    field_value = _coerce_field_value(raw_value)
+
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+
+    if not program.rules.permits(TestType.MASS_ASSIGNMENT_PROBE):
+        console.print(
+            f"[red]blocked[/red]: {key} does not permit mass assignment testing. Run `bbhunter review-rules` "
+            "then `bbhunter approve-active --test-type mass_assignment_probe --note \"...\"` if the policy "
+            "actually allows write-capable testing -- this is separate from active_low_impact approval."
+        )
+        raise typer.Exit(1)
+
+    owner_headers = _parse_headers(owner_header)
+
+    console.print(
+        f"[yellow]warning[/yellow]: sending a real PATCH to {url} with field '{field_name}' = {field_value!r}, "
+        "then attempting a best-effort revert (up to 4 requests total)..."
+    )
+    new_findings = run_mass_assignment_check(program, url, owner_headers, field_name, field_value, owner_note=owner_note)
+    for finding in new_findings:
+        upsert_finding(finding)
+    if new_findings:
+        console.print(
+            "[red]candidate found[/red] -- see `bbhunter findings`, read the evidence for the revert outcome "
+            "before doing anything else with this resource"
+        )
+    else:
+        console.print("[green]no candidate[/green] -- the field was rejected, didn't stick, or the baseline "
+                       "request itself didn't succeed (check --owner-header/the URL)")
 
 
 @app.command()

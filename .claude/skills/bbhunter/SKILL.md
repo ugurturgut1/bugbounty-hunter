@@ -114,6 +114,29 @@ invent, guess, or attempt to obtain these credentials yourself -- if the
 user doesn't have two test accounts/sessions to give you, these checks
 simply aren't runnable, and that's fine, don't improvise a substitute.
 
+### Mass assignment (`bbhunter test-mass-assignment`) -- reads carefully, this one writes
+
+This is the ONLY command in this whole skill that sends a real,
+state-changing request to the target. Treat it with the same caution
+you'd use for any other hard-to-reverse action:
+
+1. It needs its own separate approval -- `approve-active --test-type
+   mass_assignment_probe`, distinct from `active_low_impact` -- following
+   the same review-rules-first, user's-own-words process as every other
+   gate here.
+2. Beyond that, get an explicit, specific "yes, go ahead" from the user
+   for the exact resource URL and field before running it, even after
+   the approval gate is satisfied -- this is not something to run just
+   because it's technically unblocked. Confirm they actually own/control
+   that specific resource; never run it against something you're not
+   certain is theirs.
+3. Tell them plainly beforehand: this sends a real PATCH, then attempts
+   a best-effort revert that is NOT guaranteed to succeed. After running
+   it, always show them the finding's evidence (it states the revert
+   outcome explicitly) rather than just reporting "done."
+4. Never invent the `--field` value or pick the resource yourself --
+   both come from the user.
+
 ## 4. PoC -- GATE 2
 
 ```bash

@@ -45,6 +45,12 @@ class TestType(StrEnum):
                                             # excessive agency) -- see testing/ai_safety.py. Unlike every other
                                             # TestType, this has no passive-floor equivalent: an API call to a model
                                             # is inherently an active request, so permits() never allows it for free.
+    MASS_ASSIGNMENT_PROBE = "mass_assignment_probe"  # OWASP API3:2023 write-capable half -- see testing/mass_assignment.py.
+                                            # Deliberately its OWN TestType, not folded into ACTIVE_LOW_IMPACT: that
+                                            # type's own definition above says "no data modification", and this is the
+                                            # one check in the whole project that sends a real state-changing request.
+                                            # Needs its own explicit approve-active decision, separate from every other
+                                            # active check on the same program.
     SOCIAL_ENGINEERING = "social_engineering"
     PHYSICAL = "physical"
 
