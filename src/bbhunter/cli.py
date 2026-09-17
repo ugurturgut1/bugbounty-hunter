@@ -8,6 +8,7 @@ from rich.table import Table
 
 from bbhunter.discovery import ALL_CONNECTORS
 from bbhunter.models import AssetType, FindingStatus, TestType
+from bbhunter.prioritize import prioritize
 from bbhunter.recon import run_passive_recon
 from bbhunter.reporting import (
     ManualSubmissionRequired,
@@ -23,6 +24,7 @@ from bbhunter.state import (
     get_recon_result,
     list_findings,
     list_programs,
+    list_reconned_program_keys,
     upsert_finding,
     upsert_program,
     upsert_recon_result,
@@ -75,6 +77,45 @@ def list_cmd():
             p.rules.confidence,
             "yes" if p.rules.human_reviewed else "no",
             "yes" if p.rules.permits(TestType.ACTIVE_LOW_IMPACT) else "no",
+        )
+    console.print(table)
+
+
+@app.command(name="prioritize")
+def prioritize_cmd(
+    top: int = typer.Option(15, "--top", help="How many programs to show"),
+    show_reconned: bool = typer.Option(
+        False, "--show-reconned", help="Include programs already reconned once (default: hide them)"
+    ),
+):
+    """Rank synced programs by a rough recon-effort-vs-payoff score, e.g.
+    to decide which of several newly-uncovered large scopes is actually
+    worth the time. See prioritize.py for exactly what the score is (and
+    isn't) -- it's a heuristic to shortlist candidates for a human to
+    sanity-check, not a real EV model."""
+    programs = list_programs()
+    reconned = list_reconned_program_keys()
+    ranked = prioritize(programs, reconned)
+    if not show_reconned:
+        ranked = [r for r in ranked if not r.already_reconned]
+
+    table = Table(width=200)
+    table.add_column("Program", no_wrap=True)
+    table.add_column("Score", justify="right")
+    table.add_column("Est. recon time", justify="right")
+    table.add_column("Seeds", justify="right")
+    table.add_column("Bounty?")
+    table.add_column("Reconned?")
+    table.add_column("Why")
+    for r in ranked[:top]:
+        table.add_row(
+            f"{r.program_key} ({r.name})",
+            f"{r.score:.2f}",
+            f"{r.est_recon_minutes:.0f}m",
+            str(r.eligible_seeds),
+            "yes" if r.offers_bounties else "no",
+            "yes" if r.already_reconned else "no",
+            "; ".join(r.reasons),
         )
     console.print(table)
 

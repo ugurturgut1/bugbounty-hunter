@@ -102,3 +102,9 @@ def get_recon_result(program_key: str, db_path: Path = DB_PATH) -> ReconResult |
     with connect(db_path) as conn:
         row = conn.execute("SELECT data FROM recon_results WHERE program_key = ?", (program_key,)).fetchone()
     return ReconResult.model_validate_json(row[0]) if row else None
+
+
+def list_reconned_program_keys(db_path: Path = DB_PATH) -> set[str]:
+    with connect(db_path) as conn:
+        rows = conn.execute("SELECT program_key FROM recon_results").fetchall()
+    return {row[0] for row in rows}
