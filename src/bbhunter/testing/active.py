@@ -51,12 +51,31 @@ import httpx
 from bbhunter.models import AssetType, Finding, FindingStatus, Program, ReconResult, RulesOfEngagement, TestType
 from bbhunter.recon.passive import _extract_host, _request_headers, _tool_path
 
-# Curated for TestType.ACTIVE_LOW_IMPACT: detection-only template classes.
+# Curated for TestType.ACTIVE_LOW_IMPACT: detection-only template classes,
+# chosen 2026-09-17 to close real gaps against OWASP Top 10 2021 (A10 SSRF)
+# and the vuln classes that actually drive bug bounty payouts in practice
+# (CORS misconfig, JWT weaknesses, GraphQL introspection, subdomain
+# takeover, SSTI, XXE, host-header injection, prototype pollution,
+# open-redirect -- all covered by nuclei's own vetted template set rather
+# than reinventing detection logic for each). Every one of these
+# categories' nuclei templates is single-request/signature-based, same as
+# everything else in this module -- SSRF templates use an out-of-band
+# interactsh callback to detect the request left the target, not a
+# destructive payload.
+#
 # Explicitly excludes anything nuclei itself tags as higher-impact --
-# denial-of-service-adjacent, fuzzing, credential brute-forcing, session
-# hijacking -- regardless of what -tags would otherwise pull in.
-NUCLEI_TAGS = "misconfig,exposure,tech,cve"
-NUCLEI_EXCLUDE_TAGS = "dos,intrusive,fuzz,bruteforce,hijack"
+# denial-of-service-adjacent, fuzzing, credential brute-forcing/default
+# logins, auth-bypass, session hijacking, remote code execution (many RCE
+# templates actually execute a command like `id` to confirm, which is
+# exploitation, not detection), and blind/time-based SQLi (this module's
+# own SQLi coverage stays to the error-signature-only check in
+# `_check_injection_signals`, deliberately never blind/time-based) --
+# regardless of what -tags would otherwise pull in. IDOR, business-logic,
+# and race-condition classes aren't included: they're inherently
+# app-specific and not meaningfully templatable, so nuclei has near-zero
+# real coverage for them anyway.
+NUCLEI_TAGS = "misconfig,exposure,tech,cve,cors,ssrf,jwt,graphql,takeover,ssti,xxe,host-header,prototype-pollution,redirect"
+NUCLEI_EXCLUDE_TAGS = "dos,intrusive,fuzz,bruteforce,hijack,rce,sqli,default-login,authentication-bypass"
 NUCLEI_RATE_LIMIT_PER_SECOND = 1  # matches this module's own REQUEST_DELAY_SECONDS pacing philosophy, not nuclei's much higher default
 NUCLEI_RUN_TIMEOUT_SECONDS = 900  # whole-run cap across every host handed to a single nuclei invocation
 

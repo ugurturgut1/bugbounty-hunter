@@ -42,10 +42,14 @@ submit.
    `--injection` sends at most one canary/signature per query parameter
    (no boolean/time-based blind techniques, no extraction, no follow-
    through past detection) and `--nuclei` runs only
-   misconfig/exposure/tech/cve-tagged templates with
-   dos/intrusive/fuzz/bruteforce/hijack tags explicitly excluded, rate-
-   limited to 1 req/s. Neither is ever turned on by the `/bbhunter`
-   skill on its own judgment -- see its SKILL.md.
+   misconfig/exposure/tech/cve/cors/ssrf/jwt/graphql/takeover/ssti/xxe/
+   host-header/prototype-pollution/redirect-tagged templates, with
+   rce/sqli/dos/intrusive/fuzz/bruteforce/hijack/default-login/
+   authentication-bypass tags explicitly excluded, rate-limited to 1
+   req/s. Neither is ever turned on by the `/bbhunter` skill on its own
+   judgment -- see its SKILL.md. See "Vulnerability class coverage"
+   below for what this does and doesn't cover against OWASP Top 10 and
+   common bug bounty vuln classes.
 
 ## Status
 
@@ -154,13 +158,17 @@ passive recon -> gated active testing -> PoC drafting -> report drafting
       baseline) -- never a boolean/time-based blind technique, never
       more than one marker per request. `--nuclei` (`run_nuclei_scan`)
       shells out to the optional `nuclei` binary restricted to
-      misconfig/exposure/tech/cve-tagged templates with
-      dos/intrusive/fuzz/bruteforce/hijack tags explicitly excluded via
-      `-etags`, rate-limited to 1 req/s with a single connection
-      (`-rate-limit 1 -bulk-size 1 -c 1`) -- well below nuclei's own
-      defaults, matching this module's existing pacing. Both are
-      skipped/no-ops with a clear note if their prerequisites (param
-      URLs from a prior `recon` run; the `nuclei` binary) aren't there.
+      misconfig/exposure/tech/cve/cors/ssrf/jwt/graphql/takeover/ssti/
+      xxe/host-header/prototype-pollution/redirect-tagged templates,
+      with rce/sqli/dos/intrusive/fuzz/bruteforce/hijack/default-login/
+      authentication-bypass tags explicitly excluded via `-etags`,
+      rate-limited to 1 req/s with a single connection (`-rate-limit 1
+      -bulk-size 1 -c 1`) -- well below nuclei's own defaults, matching
+      this module's existing pacing. Both are skipped/no-ops with a
+      clear note if their prerequisites (param URLs from a prior
+      `recon` run; the `nuclei` binary) aren't there. See
+      "Vulnerability class coverage" below for what this set was
+      chosen to close.
 - [x] Phase 4: PoC drafting -> approval gate -> report drafting ->
       approval gate -> submission (`reporting/poc.py`,
       `reporting/report.py`, `reporting/submission.py`). `draft-poc`
@@ -188,6 +196,50 @@ passive recon -> gated active testing -> PoC drafting -> report drafting
       approval, submission) must be an explicit decision obtained from
       the user in that conversation -- the skill is not permitted to
       approve its own findings.
+
+## Vulnerability class coverage
+
+Assessed 2026-09-17 against OWASP Top 10 2021 (the current official web
+edition -- no ratified refresh exists yet) and the vuln classes that
+actually drive bug bounty payouts, which don't map 1:1 onto OWASP's
+list. Kept here so coverage claims don't silently go stale as more gets
+built -- update this table in the same commit as any check that changes
+what it covers.
+
+| Class | Coverage | How |
+|---|---|---|
+| A05 Security Misconfiguration | Good | exposed-file checks, missing-headers check, nuclei `misconfig`/`exposure` tags |
+| A06 Vulnerable/Outdated Components | Good | NVD CVE-keyword match (version-range aware) + nuclei `cve` tag |
+| CORS misconfiguration | Good | nuclei `cors` tag |
+| Subdomain takeover | Good | nuclei `takeover` tag |
+| JWT weaknesses | Good | nuclei `jwt` tag |
+| GraphQL introspection | Good | nuclei `graphql` tag |
+| SSTI / XXE | Good | nuclei `ssti`/`xxe` tags (signature-based, not blind) |
+| Open redirect | Good | nuclei `redirect` tag |
+| Host header injection | Good | nuclei `host-header` tag |
+| Prototype pollution | Thin | nuclei `prototype-pollution` tag -- template count is small upstream |
+| A10 SSRF | Partial | nuclei `ssrf` tag (out-of-band/interactsh-based, detection only) |
+| A03 Injection (XSS/SQLi) | Partial | custom single-request reflected-XSS canary + SQL-error-signature checks (`--injection`); no SSTI/XXE beyond nuclei above, no command/LDAP/NoSQL injection |
+| A02 Cryptographic Failures | Thin | HSTS presence only; no TLS/cert weakness testing |
+| A01 Broken Access Control (IDOR) | **Missing** | inherently app-specific, not generically templatable -- would need a authenticated-session-diffing feature (planned, not built) |
+| A07 Auth Failures | **Missing by design** | guardrails exclude credential brute-forcing/default-login entirely |
+| Business logic / race conditions | **Missing** | not generically automatable |
+| LLM/AI-specific vulns (OWASP Top 10 for LLM Apps 2025: prompt injection, system prompt leakage, excessive agency, sensitive info disclosure, insecure output handling, unbounded consumption) | **Missing entirely** | no AI/LLM-target asset type or check class exists yet -- planned |
+
+**Roadmap (phased, tracked here so it survives across sessions):**
+1. *(done 2026-09-17)* Web gap-fill via curated nuclei tag expansion -- see table above.
+2. *(not started)* Tech-stack-aware check routing: use the `httpx` tech-detect data recon already
+   collects (`ReconResult.fingerprints[...]["tech"]`) to select which checks run against which host,
+   instead of running the same fixed set against everything (e.g. only run GraphQL checks where
+   GraphQL was actually detected).
+3. *(not started)* LLM/AI red-team module: a new check class for AI-product bug bounty scope
+   (prompt injection, system-prompt-leakage, excessive-agency/tool-misuse, sensitive-info-disclosure
+   probes), modeled on OWASP's LLM Top 10 2025. Needs its own design pass -- likely a new `AssetType`
+   and `TestType`, and its own guardrails conversation (what "detection-only" even means against a
+   model endpoint is a different question than against a web server).
+4. *(not started, lower priority)* Authenticated-session-diffing for IDOR: fetch the same resource
+   under two different user contexts and flag if both succeed identically -- needs a way to supply a
+   second identity's session/token, which today's CLI has no concept of.
 
 ## Why HackerOne/Bugcrowd/Intigriti/YesWeHack connectors use official APIs, not scraping
 

@@ -183,7 +183,17 @@ def test_run_nuclei_scan_uses_conservative_rate_limit_flags():
     assert "-rate-limit" in cmd and cmd[cmd.index("-rate-limit") + 1] == "1"
     assert "-etags" in cmd
     excluded = cmd[cmd.index("-etags") + 1]
-    assert "dos" in excluded and "intrusive" in excluded
+    # dos/intrusive/etc were the original conservative excludes; rce/sqli/
+    # default-login/authentication-bypass were added 2026-09-17 alongside
+    # the wider tag set (cors/ssrf/jwt/graphql/etc) specifically so that
+    # expansion couldn't accidentally pull in exploitation-grade templates.
+    for tag in ("dos", "intrusive", "rce", "sqli", "default-login", "authentication-bypass"):
+        assert tag in excluded, f"expected {tag!r} in nuclei -etags, got {excluded!r}"
+
+    assert "-tags" in cmd
+    included = cmd[cmd.index("-tags") + 1]
+    for tag in ("cors", "ssrf", "jwt", "graphql", "takeover", "ssti", "xxe"):
+        assert tag in included, f"expected {tag!r} in nuclei -tags, got {included!r}"
 
 
 def test_run_nuclei_scan_returns_none_on_subprocess_error():

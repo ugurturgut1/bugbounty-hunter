@@ -299,9 +299,11 @@ def test_active_cmd(
     ),
     nuclei: bool = typer.Option(
         False, "--nuclei",
-        help="Also run the `nuclei` binary with a curated misconfig/exposure/tech/cve template set "
-             "(dos/intrusive/fuzz/bruteforce/hijack tags excluded), rate-limited to 1 req/s. Requires "
-             "`nuclei` installed (see README) and is skipped silently otherwise. Same gate as --injection.",
+        help="Also run the `nuclei` binary with a curated template set: misconfig/exposure/tech/cve plus "
+             "cors/ssrf/jwt/graphql/takeover/ssti/xxe/host-header/prototype-pollution/redirect (rce/sqli/"
+             "dos/intrusive/fuzz/bruteforce/hijack/default-login/auth-bypass tags excluded), rate-limited "
+             "to 1 req/s. Requires `nuclei` installed (see README) and is skipped silently otherwise. Same "
+             "gate as --injection.",
     ),
 ):
     """Run Phase 3 active checks (exposed-file/misconfig scan, read-only)
