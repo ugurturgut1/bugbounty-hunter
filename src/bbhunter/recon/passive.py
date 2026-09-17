@@ -215,7 +215,16 @@ def nvd_search(keyword: str, *, timeout: float = 30) -> list[dict]:
     return results
 
 
-def run_passive_recon(program: Program) -> tuple[ReconResult, list[Finding]]:
+def run_passive_recon(
+    program: Program, *, max_subdomains_per_seed: int = MAX_SUBDOMAINS_PER_SEED
+) -> tuple[ReconResult, list[Finding]]:
+    """`max_subdomains_per_seed` only narrows *breadth* (how many
+    crt.sh-discovered subdomains get fingerprinted per seed, 0 meaning
+    "just the seed hosts themselves") -- it never touches per-request
+    pacing against the target (FINGERPRINT_DELAY_SECONDS), which is
+    calibrated to programs' own stated rate-limit requirements (e.g.
+    Visa's policy: "rate limit any... testing to 1 request per second or
+    longer") and must never be reduced to make a run finish faster."""
     if not program.rules.permits(TestType.PASSIVE_RECON):
         # Should be unreachable -- passive recon is always in the default
         # allowed set -- but fail loudly rather than silently proceed if
@@ -244,7 +253,7 @@ def run_passive_recon(program: Program) -> tuple[ReconResult, list[Finding]]:
             if not crtsh_ok:
                 crtsh_failures.append(host)
 
-            hosts_to_fingerprint = [host] + sorted(discovered)[:MAX_SUBDOMAINS_PER_SEED]
+            hosts_to_fingerprint = [host] + sorted(discovered)[:max_subdomains_per_seed]
             for target_host in hosts_to_fingerprint:
                 if target_host in fingerprints:
                     continue

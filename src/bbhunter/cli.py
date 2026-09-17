@@ -214,7 +214,15 @@ def show(key: str):
 
 
 @app.command()
-def recon(key: str):
+def recon(
+    key: str,
+    max_subdomains_per_seed: int = typer.Option(
+        25, "--max-subdomains-per-seed",
+        help="Cap on crt.sh-discovered subdomains fingerprinted per seed host. 0 = only fingerprint the "
+             "seed hosts themselves, skipping subdomain expansion -- much faster, less thorough. Never "
+             "affects per-request pacing against the target, only how much breadth gets covered.",
+    ),
+):
     """Run passive recon (subdomain enum, fingerprinting, CVE keyword
     matching) against one program's in-scope URL/wildcard assets, e.g.
     `bbhunter recon intigriti:coca-cola`. Sends live but low-impact,
@@ -233,7 +241,7 @@ def recon(key: str):
     console.print(f"[cyan]running passive recon[/cyan] on {key} ({recon_asset_count} seed asset(s))...")
     console.print("[dim]Ctrl-C (or `kill -INT`/`pkill -INT -f` on this process) stops cleanly and saves "
                    "whatever's been gathered so far -- nothing is lost.[/dim]")
-    result, findings = run_passive_recon(program)
+    result, findings = run_passive_recon(program, max_subdomains_per_seed=max_subdomains_per_seed)
     upsert_recon_result(result)
     for finding in findings:
         upsert_finding(finding)
