@@ -36,6 +36,15 @@ Injection probes are scoped identically: only URLs whose host is
 already in that same selected-hosts set are ever tested, even though
 `ReconResult.param_urls` itself is keyed by seed host, not by the
 individual URLs' own hosts.
+
+Exposed-file checks are also tech-stack-aware (`_detected_stacks`,
+`_STACK_CHECKS`): a WordPress-specific check only runs against a host
+recon's fingerprint data actually flagged as WordPress, rather than every
+check running against every host regardless of what it's running. A host
+with no fingerprint on file (e.g. `test-active` run without a prior
+`recon`) still gets the stack-agnostic `_GENERIC_CHECKS` -- narrowing
+never drops below that floor, it only adds more when there's a real
+signal to add them on.
 """
 from __future__ import annotations
 
@@ -102,21 +111,73 @@ _SQL_ERROR_SIGNATURES = [
 ]
 
 # path -> (title, signature substrings that must appear in the body for a real hit, severity)
-_CHECKS: dict[str, tuple[str, tuple[str, ...], str]] = {
+# Stack-agnostic: worth checking on every host regardless of detected tech,
+# since none of these are specific to one framework/server.
+_GENERIC_CHECKS: dict[str, tuple[str, tuple[str, ...], str]] = {
     "/.git/config": ("Exposed .git/config", ("[core]", "repositoryformatversion"), "medium"),
     "/.git/HEAD": ("Exposed .git/HEAD", ("ref:",), "medium"),
     "/.env": ("Exposed .env file", ("=",), "high"),
     "/.env.local": ("Exposed .env.local file", ("=",), "high"),
     "/.aws/credentials": ("Exposed AWS credentials file", ("aws_access_key_id", "[default]"), "critical"),
-    "/wp-config.php.bak": ("Exposed WordPress config backup", ("db_name", "<?php"), "high"),
-    "/config.php.bak": ("Exposed PHP config backup", ("<?php",), "high"),
     "/.svn/entries": ("Exposed .svn/entries", ("svn",), "medium"),
     "/docker-compose.yml": ("Exposed docker-compose.yml", ("version:", "services:"), "medium"),
     "/backup.sql": ("Exposed SQL backup", ("insert into", "create table"), "high"),
-    "/actuator/env": ("Exposed Spring Boot actuator env", ("propertysources", "systemproperties"), "high"),
-    "/server-status": ("Exposed Apache mod_status", ("apache server status",), "low"),
-    "/phpinfo.php": ("Exposed phpinfo()", ("phpinfo()", "php version"), "medium"),
 }
+
+# tech-detect keyword (matched case-insensitively as a substring against
+# ReconResult.fingerprints[host]["tech"]/"server"/"powered_by") -> extra
+# checks worth running only when that stack was actually detected. Keeps
+# `test-active` from firing e.g. a WordPress config-backup probe at every
+# single host regardless of what it's actually running -- narrower host
+# selection means more of the program's own rate-limit budget goes to
+# checks that could plausibly hit, not ones that can't by construction.
+# Falls back to _GENERIC_CHECKS-only when no fingerprint data is on file
+# for a host (e.g. --nuclei/--injection run without a prior `recon`).
+_STACK_CHECKS: dict[str, dict[str, tuple[str, tuple[str, ...], str]]] = {
+    "wordpress": {
+        "/wp-config.php.bak": ("Exposed WordPress config backup", ("db_name", "<?php"), "high"),
+        "/wp-json/wp/v2/users": ("WordPress user enumeration via REST API", ('"slug"', '"name"'), "low"),
+    },
+    "php": {
+        "/config.php.bak": ("Exposed PHP config backup", ("<?php",), "high"),
+        "/phpinfo.php": ("Exposed phpinfo()", ("phpinfo()", "php version"), "medium"),
+    },
+    "spring": {
+        "/actuator/env": ("Exposed Spring Boot actuator env", ("propertysources", "systemproperties"), "high"),
+        "/actuator/heapdump": ("Exposed Spring Boot heap dump", ("java",), "critical"),
+        "/actuator/mappings": ("Exposed Spring Boot actuator mappings", ("dispatcherservlet",), "medium"),
+    },
+    "apache": {
+        "/server-status": ("Exposed Apache mod_status", ("apache server status",), "low"),
+    },
+    "laravel": {
+        "/storage/logs/laravel.log": ("Exposed Laravel log file", ("local.error", "stack trace"), "medium"),
+    },
+    "express": {
+        "/package.json": ("Exposed package.json", ('"dependencies"', '"name"'), "low"),
+    },
+    "node.js": {
+        "/package.json": ("Exposed package.json", ('"dependencies"', '"name"'), "low"),
+    },
+    "ruby on rails": {
+        "/config/database.yml": ("Exposed Rails database.yml", ("adapter:", "database:"), "high"),
+    },
+    "asp.net": {
+        "/web.config": ("Exposed web.config", ("<configuration>", "connectionstrings"), "high"),
+    },
+}
+
+
+def _detected_stacks(tech: list[str], server: str | None, powered_by: str | None) -> set[str]:
+    """Which `_STACK_CHECKS` keys apply, based on tech-detect output plus
+    the plain Server/X-Powered-By headers (covers hosts fingerprinted via
+    `fingerprint_host` alone, without the optional `httpx` binary's
+    tech-detect). Substring match, case-insensitive, deliberately
+    permissive -- a false-positive stack match just means a few extra
+    cheap, narrow, soft-404-gated requests; a false negative silently
+    skips a check that could have found something, which is worse."""
+    haystack = " ".join([*tech, server or "", powered_by or ""]).lower()
+    return {stack for stack in _STACK_CHECKS if stack in haystack}
 
 _SECURITY_HEADERS = [
     "content-security-policy",
@@ -135,12 +196,18 @@ def _baseline(client: httpx.Client, host: str) -> tuple[int, int] | None:
         return None
 
 
-def _check_host(client: httpx.Client, host: str) -> list[dict]:
+def _check_host(client: httpx.Client, host: str, fingerprint: dict | None = None) -> list[dict]:
     hits: list[dict] = []
     baseline = _baseline(client, host)
     time.sleep(REQUEST_DELAY_SECONDS)
 
-    for path, (title, signatures, severity) in _CHECKS.items():
+    fingerprint = fingerprint or {}
+    stacks = _detected_stacks(fingerprint.get("tech") or [], fingerprint.get("server"), fingerprint.get("powered_by"))
+    checks = dict(_GENERIC_CHECKS)
+    for stack in stacks:
+        checks.update(_STACK_CHECKS[stack])
+
+    for path, (title, signatures, severity) in checks.items():
         try:
             resp = client.get(f"https://{host}{path}", timeout=15, follow_redirects=True)
         except httpx.HTTPError:
@@ -372,10 +439,12 @@ def run_active_checks(
     hosts = _select_hosts(program, recon_result)
     host_set = set(hosts)
 
+    fingerprints = recon_result.fingerprints if recon_result else {}
+
     findings: list[Finding] = []
     with httpx.Client(headers=headers) as client:
         for host in hosts:
-            for hit in _check_host(client, host):
+            for hit in _check_host(client, host, fingerprints.get(host)):
                 findings.append(
                     Finding(
                         id=f"{program.key}:{host}:{hit['path']}",

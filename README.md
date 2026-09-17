@@ -228,10 +228,19 @@ what it covers.
 
 **Roadmap (phased, tracked here so it survives across sessions):**
 1. *(done 2026-09-17)* Web gap-fill via curated nuclei tag expansion -- see table above.
-2. *(not started)* Tech-stack-aware check routing: use the `httpx` tech-detect data recon already
-   collects (`ReconResult.fingerprints[...]["tech"]`) to select which checks run against which host,
-   instead of running the same fixed set against everything (e.g. only run GraphQL checks where
-   GraphQL was actually detected).
+2. *(done 2026-09-17)* Tech-stack-aware check routing for the exposed-file checks
+   (`testing/active.py`'s `_detected_stacks`/`_STACK_CHECKS`): `_GENERIC_CHECKS` (`.git`, `.env`,
+   AWS creds, `.svn`, docker-compose, SQL backups) still runs against every host, but
+   framework-specific checks (WordPress config backups + user enumeration, PHP `phpinfo()`, Spring
+   Boot actuator endpoints, Apache mod_status, Laravel logs, Node/Express `package.json`, Rails
+   `database.yml`, ASP.NET `web.config`) now only fire against a host whose recon fingerprint
+   (`ReconResult.fingerprints[host]["tech"/"server"/"powered_by"]`) actually matched that stack --
+   substring match, case-insensitive, deliberately permissive (a false-positive match just costs a
+   few extra narrow/soft-404-gated requests; a false negative silently skips a check that could have
+   found something). A host with no fingerprint on file still gets the generic floor. `nuclei`'s own
+   tag set wasn't narrowed the same way -- its templates already condition on the actual response
+   content before matching, so per-host tag routing wouldn't reduce anything nuclei doesn't already
+   skip internally.
 3. *(not started)* LLM/AI red-team module: a new check class for AI-product bug bounty scope
    (prompt injection, system-prompt-leakage, excessive-agency/tool-misuse, sensitive-info-disclosure
    probes), modeled on OWASP's LLM Top 10 2025. Needs its own design pass -- likely a new `AssetType`
