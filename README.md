@@ -231,7 +231,7 @@ what it covers.
 | A10 SSRF | Partial | nuclei `ssrf` tag (out-of-band/interactsh-based, detection only) |
 | A03 Injection (XSS/SQLi) | Partial | custom single-request reflected-XSS canary + SQL-error-signature checks (`--injection`); no SSTI/XXE beyond nuclei above, no command/LDAP/NoSQL injection |
 | A02 Cryptographic Failures | Thin | HSTS presence only; no TLS/cert weakness testing |
-| A01 Broken Access Control (IDOR) | **Missing** | inherently app-specific, not generically templatable -- would need a authenticated-session-diffing feature (planned, not built) |
+| A01 Broken Access Control (IDOR) | Partial (manual-input-driven) | `testing/idor.py`, `bbhunter test-idor` -- needs a human-supplied resource URL + two real identities' credentials, see below |
 | A07 Auth Failures | **Missing by design** | guardrails exclude credential brute-forcing/default-login entirely |
 | Business logic / race conditions | **Missing** | not generically automatable |
 | LLM01 Prompt Injection, LLM02 Sensitive Info Disclosure, LLM06 Excessive Agency, LLM07 System Prompt Leakage (OWASP LLM Top 10 2025) | Good (heuristic) | `testing/ai_safety.py`, `bbhunter test-ai` -- see below |
@@ -274,9 +274,28 @@ what it covers.
    server (never a real/paid API) confirming all 4 probes fire correctly against a deliberately
    vulnerable model and that the approval gate genuinely blocks an unapproved program via the CLI,
    not just in a unit test.
-4. *(not started, lower priority)* Authenticated-session-diffing for IDOR: fetch the same resource
-   under two different user contexts and flag if both succeed identically -- needs a way to supply a
-   second identity's session/token, which today's CLI has no concept of.
+4. *(done 2026-09-17)* Authenticated-session-diffing for IDOR (`testing/idor.py`,
+   `bbhunter test-idor`): unlike every other check here, IDOR is inherently app-specific -- there's
+   no generic path/signature to scan for the way there is for an exposed `.env` file -- so this is
+   deliberately manual-input-driven rather than automated discovery. `bbhunter test-idor <key> --url
+   <resource-url> --owner-header "Authorization: Bearer <A>" --other-header "Authorization: Bearer
+   <B>" --owner-note "..."` fetches the same URL once as its confirmed owner (the baseline -- if this
+   itself fails or looks denied, there's nothing to conclude) and once as a second, unrelated
+   identity: exactly two requests, no ID enumeration or guessing. Flags a candidate only if the
+   second identity also gets a clean HTTP 200 (not a 401/403, not a body matching denial-signature
+   phrases like "access denied"/"please log in") of similar size to the owner's response -- a
+   meaningfully different size likely means a different/generic page (e.g. a login redirect), not
+   the same resource actually being served. Gated by the same `permits(ACTIVE_LOW_IMPACT)` check as
+   the rest of `testing/active.py` -- same class of "safe probes, no data modification", not a new
+   tier. Both identities' credentials always come from whoever runs this, never invented, guessed, or
+   brute-forced. 10 new tests, plus a real end-to-end smoke test against a local mock server with a
+   deliberately IDOR-vulnerable endpoint, confirming the CLI correctly flags it.
+
+**All four roadmap phases above are now done as of 2026-09-17.** Longer-term ideas not yet
+scoped into a phase: broader business-logic/race-condition testing (not generically automatable, would
+need per-program custom logic), a richer LLM probe set (e.g. multi-turn escalation -- deliberately out
+of scope so far, since every probe here is single-request by design), and TLS/certificate weakness
+checks for A02.
 
 ## Why HackerOne/Bugcrowd/Intigriti/YesWeHack connectors use official APIs, not scraping
 

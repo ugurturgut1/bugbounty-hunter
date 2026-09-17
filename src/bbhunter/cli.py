@@ -22,6 +22,7 @@ from bbhunter.reporting import (
 )
 from bbhunter.testing import run_active_checks
 from bbhunter.testing.ai_safety import run_ai_safety_probes
+from bbhunter.testing.idor import run_idor_check
 from bbhunter.state import (
     get_ai_endpoint,
     get_finding,
@@ -38,6 +39,20 @@ from bbhunter.state import (
 
 app = typer.Typer(help="Personal bug-bounty discovery/recon/reporting pipeline")
 console = Console()
+
+
+def _parse_headers(raw: list[str]) -> dict[str, str]:
+    """Parses repeatable '--header "Key: Value"' CLI options into a
+    dict, exiting with a clear error on anything malformed rather than
+    silently dropping it."""
+    headers: dict[str, str] = {}
+    for h in raw:
+        if ":" not in h:
+            console.print(f"[red]invalid header[/red]: {h!r} (expected 'Key: Value')")
+            raise typer.Exit(1)
+        key, _, value = h.partition(":")
+        headers[key.strip()] = value.strip()
+    return headers
 
 
 @app.command()
@@ -393,13 +408,7 @@ def ai_endpoint_set_cmd(
         console.print("[red]invalid template[/red]: request template must contain a {{PROMPT}} placeholder")
         raise typer.Exit(1)
 
-    headers: dict[str, str] = {}
-    for h in header:
-        if ":" not in h:
-            console.print(f"[red]invalid header[/red]: {h!r} (expected 'Key: Value')")
-            raise typer.Exit(1)
-        hk, _, hv = h.partition(":")
-        headers[hk.strip()] = hv.strip()
+    headers = _parse_headers(header)
 
     config = AIEndpointConfig(
         program_key=key,
@@ -472,6 +481,53 @@ def test_ai_cmd(key: str):
     if new_findings:
         console.print("[yellow]note[/yellow]: these are heuristic signals from a single prompt each -- read the "
                        "actual model responses yourself before treating any as confirmed, see `bbhunter findings`")
+
+
+@app.command(name="test-idor")
+def test_idor_cmd(
+    key: str,
+    url: str = typer.Option(..., "--url", help="A resource URL known to belong to the 'owner' identity, e.g. https://target/api/orders/12345"),
+    owner_header: list[str] = typer.Option(
+        ..., "--owner-header", help="'Key: Value' auth header for the identity that owns the resource, repeatable"
+    ),
+    other_header: list[str] = typer.Option(
+        ..., "--other-header", help="'Key: Value' auth header for a second, unrelated identity, repeatable"
+    ),
+    owner_note: str | None = typer.Option(
+        None, "--owner-note", help="How you know this resource belongs to the owner identity, e.g. \"order 12345, created by test account A\""
+    ),
+):
+    """Check one resource URL for IDOR by fetching it once as its
+    confirmed owner and once as a second, unrelated identity -- exactly
+    two requests. Refuses unless `approve-active` has already recorded a
+    human decision permitting active testing (same gate as
+    `test-active`). Both identities' credentials must be real sessions
+    you (or the user directing this) actually control -- never invented,
+    guessed, or brute-forced."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+
+    if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
+        console.print(
+            f"[red]blocked[/red]: {key} does not permit active testing. "
+            "Run `bbhunter review-rules` then `bbhunter approve-active` if the policy actually allows it."
+        )
+        raise typer.Exit(1)
+
+    owner_headers = _parse_headers(owner_header)
+    other_headers = _parse_headers(other_header)
+
+    console.print(f"[cyan]checking IDOR[/cyan] on {url} for {key} (2 requests)...")
+    new_findings = run_idor_check(program, url, owner_headers, other_headers, owner_note=owner_note)
+    for finding in new_findings:
+        upsert_finding(finding)
+    if new_findings:
+        console.print("[red]candidate found[/red] -- see `bbhunter findings`, verify manually before drafting a PoC")
+    else:
+        console.print("[green]no candidate[/green] -- either properly denied, or the baseline request as the "
+                       "owner identity itself didn't succeed (check --owner-header/the URL)")
 
 
 @app.command()
