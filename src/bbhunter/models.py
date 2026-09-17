@@ -199,4 +199,11 @@ class AIEndpointConfig(BaseModel):
     auth_template: str = "Bearer {token}"  # how to format the token into the header value; override for e.g. a raw API key header
     request_template: str                # JSON string containing a "{{PROMPT}}" placeholder
     response_text_path: str              # e.g. "choices.0.message.content"
+    # Optional, separate from request_template: a JSON string containing a "{{MESSAGES}}"
+    # placeholder, substituted with a JSON-encoded [{"role": "user"/"assistant", "content": "..."}, ...]
+    # array -- the stateless resend-the-whole-history-each-turn pattern used by OpenAI/Anthropic-style
+    # chat-completions APIs. Only needed for testing/ai_safety.py's multi-turn jailbreak-chain checks
+    # (`test-ai --multiturn`); single-turn probes never use this field. None means multi-turn checks
+    # are skipped, not an error -- request_template alone can't express a growing message history.
+    conversation_template: str | None = None
     notes: str | None = None

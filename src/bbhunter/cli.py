@@ -390,6 +390,12 @@ def ai_endpoint_set_cmd(
         None, "--auth-env-var", help="Env var holding the raw API key/token -- read at request time only, never stored"
     ),
     auth_template: str = typer.Option("Bearer {token}", "--auth-template", help="How to format the token into the header value"),
+    conversation_template_file: Path | None = typer.Option(
+        None, "--conversation-template-file",
+        help="Optional: path to a JSON file for multi-turn probes (`test-ai --multiturn`), containing "
+             "a {{MESSAGES}} placeholder, e.g. {\"messages\": \"{{MESSAGES}}\"} for an API that takes "
+             "the whole history as an array. Skip this if you only want the single-turn probes.",
+    ),
     note: str | None = typer.Option(None, "--note", help="Why this endpoint is in scope, e.g. citing the program's policy"),
 ):
     """Configure how to send a prompt to a program's in-scope AI/LLM
@@ -409,6 +415,16 @@ def ai_endpoint_set_cmd(
         console.print("[red]invalid template[/red]: request template must contain a {{PROMPT}} placeholder")
         raise typer.Exit(1)
 
+    conversation_template: str | None = None
+    if conversation_template_file is not None:
+        if not conversation_template_file.exists():
+            console.print(f"[red]not found[/red]: {conversation_template_file}")
+            raise typer.Exit(1)
+        conversation_template = conversation_template_file.read_text()
+        if "{{MESSAGES}}" not in conversation_template:
+            console.print("[red]invalid template[/red]: conversation template must contain a {{MESSAGES}} placeholder")
+            raise typer.Exit(1)
+
     headers = _parse_headers(header)
 
     config = AIEndpointConfig(
@@ -421,6 +437,7 @@ def ai_endpoint_set_cmd(
         auth_template=auth_template,
         request_template=request_template,
         response_text_path=response_path,
+        conversation_template=conversation_template,
         notes=note,
     )
     upsert_ai_endpoint(config)
@@ -444,7 +461,16 @@ def ai_endpoint_show_cmd(key: str):
 
 
 @app.command(name="test-ai")
-def test_ai_cmd(key: str):
+def test_ai_cmd(
+    key: str,
+    multiturn: bool = typer.Option(
+        False, "--multiturn",
+        help="Also run scripted 3-turn jailbreak chains (roleplay/persona framing, gradual "
+             "system-prompt probing) -- up to 6 more requests. Requires --conversation-template-file "
+             "to have been set via ai-endpoint-set; skipped with a note otherwise. Same gate as the "
+             "base probes, not a separate tier.",
+    ),
+):
     """Run the opt-in AI/LLM safety probes (prompt injection, system-
     prompt leakage, sensitive-info disclosure, excessive agency -- see
     testing/ai_safety.py) against a program's configured AI endpoint.
@@ -454,8 +480,8 @@ def test_ai_cmd(key: str):
 
     Unlike the web checks, each probe here is a real call to the
     program's AI model, which may cost real money per request if it's a
-    paid model API -- this runs exactly 4 requests total, but that's
-    worth knowing before running it repeatedly."""
+    paid model API -- this runs exactly 4 requests total (10 with
+    --multiturn), but that's worth knowing before running it repeatedly."""
     program = get_program(key)
     if not program:
         console.print(f"[red]not found[/red]: {key}")
@@ -474,14 +500,22 @@ def test_ai_cmd(key: str):
         )
         raise typer.Exit(1)
 
-    console.print(f"[cyan]running AI safety probes[/cyan] against {config.url} for {key} (4 requests)...")
-    new_findings = run_ai_safety_probes(program, config)
+    if multiturn and not config.conversation_template:
+        console.print(
+            "[yellow]note[/yellow]: --multiturn requested but no conversation template is configured -- "
+            "run `bbhunter ai-endpoint-set --conversation-template-file ...` first. Continuing with the "
+            "single-turn probes only."
+        )
+
+    request_count = "4 requests" if not (multiturn and config.conversation_template) else "up to 10 requests"
+    console.print(f"[cyan]running AI safety probes[/cyan] against {config.url} for {key} ({request_count})...")
+    new_findings = run_ai_safety_probes(program, config, multiturn=multiturn)
     for finding in new_findings:
         upsert_finding(finding)
     console.print(f"[green]done[/green] -- {len(new_findings)} candidate(s) found")
     if new_findings:
-        console.print("[yellow]note[/yellow]: these are heuristic signals from a single prompt each -- read the "
-                       "actual model responses yourself before treating any as confirmed, see `bbhunter findings`")
+        console.print("[yellow]note[/yellow]: these are heuristic signals -- read the actual model responses "
+                       "yourself before treating any as confirmed, see `bbhunter findings`")
 
 
 @app.command(name="test-idor")

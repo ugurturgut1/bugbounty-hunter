@@ -89,11 +89,16 @@ policy language, following the same review-rules-first, user's-own-words
 process as step 3 above -- never approve this yourself either.
 
 Before configuring or running it, tell the user explicitly: each
-`test-ai` run sends exactly 4 prompts to the real model endpoint, which
-may cost real money per request if it's a paid API (unlike the free HTTP
-checks elsewhere in this pipeline). Get their go-ahead on that before
-running `uv run bbhunter test-ai <program-key>`, even after the
-approval gate above is satisfied.
+`test-ai` run sends exactly 4 prompts to the real model endpoint (10 with
+`--multiturn`), which may cost real money per request if it's a paid API
+(unlike the free HTTP checks elsewhere in this pipeline). Get their
+go-ahead on that before running `uv run bbhunter test-ai <program-key>`,
+even after the approval gate above is satisfied. `--multiturn` runs two
+scripted jailbreak conversations (still only the same non-destructive
+canary/heuristic signals as the base probes, just reached across a few
+turns) -- only pass it when the user has said so, same as
+`--injection`/`--nuclei` on `test-active`, and only if they've also set
+up `--conversation-template-file` via `ai-endpoint-set`.
 
 `bbhunter ai-endpoint-set` needs the user to supply (or confirm) the
 actual endpoint URL, request/response shape, and which env var holds

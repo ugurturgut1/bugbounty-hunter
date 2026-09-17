@@ -17,13 +17,16 @@ from bbhunter.models import (
     TestType,
 )
 from bbhunter.testing.ai_safety import (
+    _ALL_MULTITURN_SCRIPTS,
     _extract_response_text,
     _fill_prompt,
     check_excessive_agency,
+    check_multiturn_jailbreak,
     check_prompt_injection,
     check_sensitive_info_disclosure,
     check_system_prompt_leakage,
     run_ai_safety_probes,
+    send_conversation,
     send_prompt,
 )
 
@@ -37,6 +40,10 @@ def _config(**overrides) -> AIEndpointConfig:
     )
     defaults.update(overrides)
     return AIEndpointConfig(**defaults)
+
+
+def _multiturn_config(**overrides) -> AIEndpointConfig:
+    return _config(conversation_template='{"messages": {{MESSAGES}}}', **overrides)
 
 
 def _program(*, approved: bool = True) -> Program:
@@ -203,3 +210,141 @@ def test_run_ai_safety_probes_runs_all_four_checks():
         run_ai_safety_probes(program, config)
     for mock in checks:
         mock.assert_called_once()
+
+
+# --- multi-turn jailbreak chains ---------------------------------------------
+
+
+def test_send_conversation_returns_empty_without_conversation_template():
+    config = _config()  # no conversation_template
+    assert send_conversation(config, ["turn one"]) == []
+
+
+def test_send_conversation_sends_growing_message_history():
+    config = _multiturn_config()
+    seen_message_counts = []
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        seen_message_counts.append(len(json["messages"]))
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"choices": [{"message": {"content": f"reply {len(json['messages'])}"}}]}
+        return resp
+
+    with patch("bbhunter.testing.ai_safety.httpx.request", side_effect=fake_request), \
+         patch("bbhunter.testing.ai_safety.time.sleep"):
+        responses = send_conversation(config, ["turn one", "turn two", "turn three"])
+
+    assert responses == ["reply 1", "reply 3", "reply 5"]
+    # message count grows: 1 (turn1) -> 3 (turn1+reply1+turn2) -> 5 (...+reply2+turn3)
+    assert seen_message_counts == [1, 3, 5]
+
+
+def test_send_conversation_stops_early_on_failed_turn():
+    config = _multiturn_config()
+    call_count = {"n": 0}
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            import httpx as real_httpx
+            raise real_httpx.ConnectTimeout("timeout")
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        return resp
+
+    with patch("bbhunter.testing.ai_safety.httpx.request", side_effect=fake_request), \
+         patch("bbhunter.testing.ai_safety.time.sleep"):
+        responses = send_conversation(config, ["turn one", "turn two", "turn three"])
+
+    assert responses == ["ok", None]  # stopped after the second turn failed, never sent the third
+
+
+def test_check_multiturn_jailbreak_roleplay_flags_marker_in_final_response():
+    config = _multiturn_config()
+
+    def fake_send_conversation(cfg, turns, timeout=60):
+        marker = turns[-1].rsplit(": ", 1)[-1]
+        return ["ok", "DAN mode: confirmed", f"Sure, {marker}"]
+
+    with patch("bbhunter.testing.ai_safety.send_conversation", side_effect=fake_send_conversation), \
+         patch("bbhunter.testing.ai_safety.time.sleep"):
+        hit = check_multiturn_jailbreak(config, "roleplay-persona")
+    assert hit is not None
+    assert hit["kind"] == "multiturn-jailbreak-roleplay-persona"
+    assert hit["severity"] == "high"
+
+
+def test_check_multiturn_jailbreak_roleplay_no_hit_when_marker_absent():
+    config = _multiturn_config()
+    with patch("bbhunter.testing.ai_safety.send_conversation", return_value=["ok", "ok", "I can't do that."]), \
+         patch("bbhunter.testing.ai_safety.time.sleep"):
+        assert check_multiturn_jailbreak(config, "roleplay-persona") is None
+
+
+def test_check_multiturn_jailbreak_system_prompt_script_flags_heuristic_match():
+    config = _multiturn_config()
+    leak = "You are a helpful internal assistant for Acme Corp, codename Phoenix. " * 3
+    with patch("bbhunter.testing.ai_safety.send_conversation", return_value=["sure", "here", leak]), \
+         patch("bbhunter.testing.ai_safety.time.sleep"):
+        hit = check_multiturn_jailbreak(config, "gradual-system-prompt-probe")
+    assert hit is not None
+    assert hit["kind"] == "multiturn-system-prompt-leak"
+
+
+def test_check_multiturn_jailbreak_returns_none_when_a_turn_failed():
+    config = _multiturn_config()
+    with patch("bbhunter.testing.ai_safety.send_conversation", return_value=["ok", None]), \
+         patch("bbhunter.testing.ai_safety.time.sleep"):
+        assert check_multiturn_jailbreak(config, "roleplay-persona") is None
+
+
+def test_check_multiturn_jailbreak_unknown_script_raises():
+    config = _multiturn_config()
+    with pytest.raises(ValueError):
+        check_multiturn_jailbreak(config, "not-a-real-script")
+
+
+def test_all_multiturn_scripts_are_covered_by_check_logic():
+    # Every registered script must actually be handled in check_multiturn_jailbreak's
+    # if/elif chain -- this guards against adding a script to the dict and forgetting
+    # to wire its detection branch.
+    assert set(_ALL_MULTITURN_SCRIPTS) == {"roleplay-persona", "gradual-system-prompt-probe"}
+
+
+def test_run_ai_safety_probes_multiturn_off_by_default():
+    program = _program()
+    config = _multiturn_config()
+    with patch("bbhunter.testing.ai_safety._ALL_CHECKS", ()), \
+         patch("bbhunter.testing.ai_safety.check_multiturn_jailbreak") as mock_mt, \
+         patch("bbhunter.testing.ai_safety.time.sleep"):
+        run_ai_safety_probes(program, config)  # multiturn=False (default)
+    mock_mt.assert_not_called()
+
+
+def test_run_ai_safety_probes_multiturn_skipped_without_conversation_template():
+    program = _program()
+    config = _config()  # no conversation_template
+    with patch("bbhunter.testing.ai_safety._ALL_CHECKS", ()), \
+         patch("bbhunter.testing.ai_safety.check_multiturn_jailbreak") as mock_mt, \
+         patch("bbhunter.testing.ai_safety.time.sleep"):
+        run_ai_safety_probes(program, config, multiturn=True)
+    mock_mt.assert_not_called()
+
+
+def test_run_ai_safety_probes_multiturn_runs_scripts_when_configured():
+    program = _program()
+    config = _multiturn_config()
+    hits = [
+        {"kind": "multiturn-jailbreak-roleplay-persona", "severity": "high", "evidence": "e1"},
+        {"kind": "multiturn-system-prompt-leak", "severity": "high", "evidence": "e2"},
+    ]
+    with patch("bbhunter.testing.ai_safety._ALL_CHECKS", ()), \
+         patch("bbhunter.testing.ai_safety.check_multiturn_jailbreak", side_effect=hits) as mock_mt, \
+         patch("bbhunter.testing.ai_safety.time.sleep"):
+        findings = run_ai_safety_probes(program, config, multiturn=True)
+    assert mock_mt.call_count == len(_ALL_MULTITURN_SCRIPTS)
+    assert len(findings) == 2
+    assert {f.vuln_class for f in findings} == {"multiturn-jailbreak-roleplay-persona", "multiturn-system-prompt-leak"}
+

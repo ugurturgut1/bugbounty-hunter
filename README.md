@@ -254,6 +254,7 @@ what it covers.
 | API9:2023 Improper Inventory Management | Good | `_API_INVENTORY_CHECKS` in `testing/active.py` -- exposed Swagger/OpenAPI specs, shadow v1/v2 version detection |
 | API2 Broken Auth, API6 Unrestricted Sensitive Business Flows, API10 Unsafe Consumption of APIs | **Missing** | API2 excluded by design (same as A07); API6/API10 aren't generically automatable |
 | LLM01 Prompt Injection, LLM02 Sensitive Info Disclosure, LLM06 Excessive Agency, LLM07 System Prompt Leakage (OWASP LLM Top 10 2025) | Good (heuristic) | `testing/ai_safety.py`, `bbhunter test-ai` -- see below |
+| LLM01/LLM07 via multi-turn conversational escalation | Good (heuristic), opt-in | `check_multiturn_jailbreak`, `test-ai --multiturn` -- catches jailbreaks that succeed only via roleplay/rapport-building framing, not single-shot |
 | LLM03 Supply Chain, LLM04 Data/Model Poisoning, LLM08 Embedding Weaknesses, LLM09 Misinformation | **Missing** | not meaningfully blackbox-probable with a single HTTP request |
 | LLM10 Unbounded Consumption | **Missing by design** | would mean deliberately running up cost/resource usage against a real endpoint -- the AI-endpoint equivalent of the DoS testing excluded everywhere else in this project |
 
@@ -330,13 +331,27 @@ OWASP API Security Top 10 2023 coverage and multi-turn LLM jailbreak-chain testi
    finding's evidence -- live end-to-end smoke-tested against a local mock mutable API (never a real
    target): confirmed the mutation, detection, and revert all worked, verified by checking the mock
    server's actual live state matched its original value after the run completed.
-6. *(not started)* Multi-turn LLM jailbreak chains: scripted multi-turn conversations testing whether a
-   model resists escalation across turns even when it would refuse the same request single-shot -- a
-   materially more realistic red-team technique than the single-turn probes alone.
+6. *(done 2026-09-17)* Multi-turn LLM jailbreak chains (`testing/ai_safety.py`'s
+   `check_multiturn_jailbreak`/`send_conversation`, `test-ai --multiturn`): two fixed, pre-written
+   3-turn scripts -- `roleplay-persona` (the classic "DAN" persona-jailbreak pattern, building up to
+   the same marker-echo request the single-turn probe uses) and `gradual-system-prompt-probe`
+   (rapport-building "I'm a developer debugging this" framing, building up to the same
+   verbatim-instructions request). Only the FINAL turn's response is checked, against the same signal
+   a single-turn probe would look for -- the point is testing whether conversational framing changes
+   the outcome, not adding a new detection heuristic. Requires
+   `AIEndpointConfig.conversation_template` (a separate, optional `{{MESSAGES}}`-templated config for
+   stateless multi-turn chat APIs -- the OpenAI/Anthropic-style pattern of resending the full history
+   each turn; stateful/server-side-conversation-ID APIs aren't supported), set via
+   `ai-endpoint-set --conversation-template-file`; skipped with a clear note if not configured. Opt-in
+   and off by default on `test-ai` since it costs up to 6 more requests than the base 4-probe run.
+   12 new tests, plus a real end-to-end smoke test against a local mock multi-turn server scripted to
+   resist the single-shot version of each probe but cave after conversational buildup: confirmed via
+   the actual CLI that both single-turn probes correctly did NOT fire while both multi-turn scripts
+   correctly DID -- the exact escalation-specific distinction this feature exists to catch.
 
 Longer-term ideas not yet scoped into a phase: broader business-logic/race-condition testing (not
-generically automatable, would need per-program custom logic), and TLS/certificate weakness checks
-for A02.
+generically automatable, would need per-program custom logic), stateful (server-side conversation ID)
+multi-turn AI APIs, and TLS/certificate weakness checks for A02.
 
 ## Why HackerOne/Bugcrowd/Intigriti/YesWeHack connectors use official APIs, not scraping
 
