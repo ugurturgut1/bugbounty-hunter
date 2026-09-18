@@ -35,6 +35,13 @@ our own (so self-signed certs are observed, not rejected). Findings from
 this (`tls_findings`: expired/soon-expiring, self-signed, weak SHA-1
 signature, hostname not covered by the cert's SAN) land as
 TestType.PASSIVE_RECON, same floor as everything else here.
+
+Per seed host, `recon/dns_hygiene.py` also runs SPF/DMARC/DKIM
+email-spoofing misconfig checks (public DNS lookups only, same request
+class as crt.sh/Wayback), and every fingerprinted host gets a
+dangling-CNAME check -- run BEFORE the HTTP fingerprint attempt, since a
+truly dangling target often never responds to HTTP at all, which would
+otherwise skip it entirely.
 """
 from __future__ import annotations
 
@@ -50,6 +57,7 @@ from urllib.parse import urlparse
 import httpx
 
 from bbhunter.models import AssetType, Finding, FindingStatus, Program, ReconResult, RulesOfEngagement, TestType
+from bbhunter.recon.dns_hygiene import check_dangling_cname, check_dkim, check_dmarc, check_spf
 
 CRTSH_URL = "https://crt.sh/"
 NVD_CVE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
@@ -66,6 +74,7 @@ SUBFINDER_TIMEOUT_SECONDS = 30  # live-tested 2026-09-17: unauthenticated subfin
                                  # (vs. subfinder's own 60s default) trades some source coverage for keeping a
                                  # full multi-seed `bbhunter recon` run from taking hours on a large program
 WAYBACK_DELAY_SECONDS = 0.5  # archive.org is a free public service, not the target
+DNS_DELAY_SECONDS = 0.3  # public DNS resolvers, not the target -- still worth pacing
 
 
 def _tool_path(name: str) -> str | None:
@@ -658,6 +667,23 @@ def run_passive_recon(
 
             subdomains_by_seed[host] = sorted(discovered)
 
+            email_domain = host[4:] if host.lower().startswith("www.") else host
+            for hit in [*check_spf(email_domain), *check_dmarc(email_domain), *check_dkim(email_domain)]:
+                findings.append(
+                    Finding(
+                        id=f"{program.key}:{email_domain}:{hit['kind']}",
+                        program_key=program.key,
+                        asset=email_domain,
+                        title=hit["kind"].replace("-", " "),
+                        vuln_class=hit["kind"],
+                        test_type=TestType.PASSIVE_RECON,
+                        evidence=hit["evidence"],
+                        status=FindingStatus.CANDIDATE,
+                        notes=f"severity guess: {hit['severity']} -- verify manually before drafting a PoC",
+                    )
+                )
+            time.sleep(DNS_DELAY_SECONDS)
+
             param_urls = wayback_param_urls(host)
             time.sleep(WAYBACK_DELAY_SECONDS)
             if param_urls:
@@ -667,6 +693,24 @@ def run_passive_recon(
             for target_host in hosts_to_fingerprint:
                 if target_host in fingerprints:
                     continue
+
+                cname_hit = check_dangling_cname(target_host)
+                time.sleep(DNS_DELAY_SECONDS)
+                if cname_hit:
+                    findings.append(
+                        Finding(
+                            id=f"{program.key}:{target_host}:{cname_hit['kind']}",
+                            program_key=program.key,
+                            asset=target_host,
+                            title=cname_hit["kind"].replace("-", " "),
+                            vuln_class=cname_hit["kind"],
+                            test_type=TestType.PASSIVE_RECON,
+                            evidence=cname_hit["evidence"],
+                            status=FindingStatus.CANDIDATE,
+                            notes=f"severity guess: {cname_hit['severity']} -- verify manually before drafting a PoC",
+                        )
+                    )
+
                 fp = fingerprint(target_host, program.rules)
                 time.sleep(FINGERPRINT_DELAY_SECONDS)
                 if not fp:
