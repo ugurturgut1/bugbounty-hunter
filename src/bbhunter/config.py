@@ -63,3 +63,15 @@ class YesWeHackCreds:
     @property
     def configured(self) -> bool:
         return bool(self.token)
+
+
+@dataclass(frozen=True)
+class GitHubCreds:
+    # GitHub's code-search API requires an authenticated token even for
+    # public repos -- a free personal access token with NO scopes checked
+    # works, since this only ever calls a public read-only search endpoint.
+    token: str | None = os.environ.get("GITHUB_API_TOKEN")
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.token)

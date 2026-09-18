@@ -42,7 +42,9 @@ def test_interrupt_mid_loop_returns_partial_result_not_nothing():
          patch("bbhunter.recon.passive.check_dkim", return_value=[]), \
          patch("bbhunter.recon.passive.check_dangling_cname", return_value=None), \
          patch("bbhunter.recon.passive._harvest_js_for_host", return_value=[]), \
+         patch("bbhunter.recon.passive.GitHubCreds") as mock_gh_creds, \
          patch("bbhunter.recon.passive.time.sleep"):
+        mock_gh_creds.return_value.configured = False
         result, findings = run_passive_recon(program)
 
     assert result.seeds_total == 3
@@ -72,7 +74,9 @@ def test_max_subdomains_per_seed_zero_skips_subdomain_expansion():
          patch("bbhunter.recon.passive.check_dkim", return_value=[]), \
          patch("bbhunter.recon.passive.check_dangling_cname", return_value=None), \
          patch("bbhunter.recon.passive._harvest_js_for_host", return_value=[]), \
+         patch("bbhunter.recon.passive.GitHubCreds") as mock_gh_creds, \
          patch("bbhunter.recon.passive.time.sleep"):
+        mock_gh_creds.return_value.configured = False
         run_passive_recon(program, max_subdomains_per_seed=0)
 
     assert fingerprinted == ["seed.example.com"]  # discovered subdomain skipped, only the seed itself
@@ -92,7 +96,9 @@ def test_full_run_reports_complete():
          patch("bbhunter.recon.passive.check_dkim", return_value=[]), \
          patch("bbhunter.recon.passive.check_dangling_cname", return_value=None), \
          patch("bbhunter.recon.passive._harvest_js_for_host", return_value=[]), \
+         patch("bbhunter.recon.passive.GitHubCreds") as mock_gh_creds, \
          patch("bbhunter.recon.passive.time.sleep"):
+        mock_gh_creds.return_value.configured = False
         result, _ = run_passive_recon(program)
 
     assert result.seeds_total == 1

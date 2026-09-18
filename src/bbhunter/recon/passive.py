@@ -48,6 +48,12 @@ Per seed host, `recon/js_harvest.py` also fetches the page and every
 receives) to scan for hardcoded secrets, exposed source maps, and
 internal-looking API paths referenced in the JS -- see that module's
 docstring for exactly what and why.
+
+Per seed host, `recon/github_dork.py` optionally searches GitHub's
+public code-search API for the domain alongside a real secret-shaped
+pattern -- classic "GitHub recon" dorking, entirely third-party (never
+touches the target), skipped silently unless a free GitHub personal
+access token is configured (`GITHUB_API_TOKEN`, see .env.example).
 """
 from __future__ import annotations
 
@@ -63,8 +69,10 @@ from urllib.parse import urlparse
 
 import httpx
 
+from bbhunter.config import GitHubCreds
 from bbhunter.models import AssetType, Finding, FindingStatus, Program, ReconResult, RulesOfEngagement, TestType
 from bbhunter.recon.dns_hygiene import check_dangling_cname, check_dkim, check_dmarc, check_spf
+from bbhunter.recon.github_dork import GITHUB_SEARCH_DELAY_SECONDS, scan_github_results_for_secrets, search_domain_mentions
 from bbhunter.recon.js_harvest import (
     check_source_map_exposed,
     extract_script_urls,
@@ -699,6 +707,7 @@ def run_passive_recon(
     param_urls_by_seed: dict[str, list[str]] = {}
     findings: list[Finding] = []
     nvd_cache: dict[str, list[dict]] = {}
+    github_creds = GitHubCreds()
 
     recon_assets = [a for a in program.in_scope if a.asset_type in (AssetType.URL, AssetType.WILDCARD)]
     seeds_processed = 0
@@ -765,6 +774,25 @@ def run_passive_recon(
                         notes=f"severity guess: {hit['severity']} -- verify manually before drafting a PoC",
                     )
                 )
+
+            if github_creds.configured:
+                github_items = search_domain_mentions(email_domain, github_creds)
+                time.sleep(GITHUB_SEARCH_DELAY_SECONDS)
+                for hit in scan_github_results_for_secrets(email_domain, github_items):
+                    digest = hashlib.sha256(f"{email_domain}:{hit['kind']}:{hit['evidence']}".encode()).hexdigest()[:12]
+                    findings.append(
+                        Finding(
+                            id=f"{program.key}:{email_domain}:{digest}",
+                            program_key=program.key,
+                            asset=email_domain,
+                            title=hit["kind"].replace("-", " "),
+                            vuln_class=hit["kind"],
+                            test_type=TestType.PASSIVE_RECON,
+                            evidence=hit["evidence"],
+                            status=FindingStatus.CANDIDATE,
+                            notes=f"severity guess: {hit['severity']} -- verify manually before drafting a PoC",
+                        )
+                    )
 
             hosts_to_fingerprint = [host] + sorted(discovered)[:max_subdomains_per_seed]
             for target_host in hosts_to_fingerprint:
