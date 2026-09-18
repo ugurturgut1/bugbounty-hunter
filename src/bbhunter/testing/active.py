@@ -257,7 +257,19 @@ _SECURITY_HEADERS = [
     "x-frame-options",
     "strict-transport-security",
     "x-content-type-options",
+    "cross-origin-opener-policy",
+    "cross-origin-resource-policy",
 ]
+
+# A present-but-weak CSP is a different (and more common) finding than a
+# missing one -- these directive values defeat most of what CSP is meant
+# to stop. Checked against the whole header value, case-insensitively.
+_WEAK_CSP_SIGNATURES = (
+    "unsafe-inline",
+    "unsafe-eval",
+    "script-src *",
+    "default-src *",
+)
 
 # Header names that suggest a program actually surfaces rate-limit state
 # to clients. Absence is a genuinely weak signal (plenty of real rate
@@ -406,6 +418,21 @@ def _check_host(client: httpx.Client, host: str, fingerprint: dict | None = None
                     "url": str(resp.url),
                 }
             )
+
+        csp = resp.headers.get("content-security-policy")
+        if csp:
+            csp_lower = csp.lower()
+            weak_directives = [sig for sig in _WEAK_CSP_SIGNATURES if sig in csp_lower]
+            if weak_directives:
+                hits.append(
+                    {
+                        "path": "/",
+                        "title": f"Weak Content-Security-Policy directive(s): {', '.join(weak_directives)}",
+                        "severity": "low",
+                        "status_code": resp.status_code,
+                        "url": str(resp.url),
+                    }
+                )
 
         if not (present & _RATE_LIMIT_HEADERS):
             hits.append(

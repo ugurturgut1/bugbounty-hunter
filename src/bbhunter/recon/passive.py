@@ -26,6 +26,15 @@ security team can recognize the traffic. If a program's rules specify a
 required User-Agent or header (RulesOfEngagement.required_user_agent /
 required_request_header, as Intigriti exposes structurally), that is
 used instead of the default and is a hard requirement, not a suggestion.
+
+Each fingerprinted host also gets one raw TLS handshake to port 443 (via
+the `openssl` binary, see `tls_cert_info`) to read its certificate --
+the same information any browser already reads on every visit, no
+application-layer request sent, no validation against a trust store of
+our own (so self-signed certs are observed, not rejected). Findings from
+this (`tls_findings`: expired/soon-expiring, self-signed, weak SHA-1
+signature, hostname not covered by the cert's SAN) land as
+TestType.PASSIVE_RECON, same floor as everything else here.
 """
 from __future__ import annotations
 
@@ -285,6 +294,171 @@ def _request_headers(rules: RulesOfEngagement) -> dict[str, str]:
     return headers
 
 
+TLS_CERT_TIMEOUT_SECONDS = 10
+TLS_CERT_SOON_EXPIRING_DAYS = 14
+
+_CERT_END_MARKER = "-----END CERTIFICATE-----"
+_VERIFY_CODE_RE = re.compile(r"Verify return code:\s*(\d+)\s*\(([^)]*)\)")
+_NOT_AFTER_RE = re.compile(r"notAfter=(.+)")
+_SUBJECT_RE = re.compile(r"^subject=(.+)$", re.MULTILINE)
+_SIGNATURE_ALGO_RE = re.compile(r"Signature Algorithm:\s*(\S+)")
+_SAN_DNS_RE = re.compile(r"DNS:([^,\s]+)")
+# openssl verify return codes for a self-signed leaf/chain -- see `verify(1)`:
+# 18 = self signed certificate, 19 = self signed certificate in certificate chain
+_SELF_SIGNED_VERIFY_CODES = {18, 19}
+
+
+def tls_cert_info(host: str, *, timeout: float = TLS_CERT_TIMEOUT_SECONDS) -> dict | None:
+    """One raw TLS handshake to `host:443` via the `openssl` binary --
+    reads the certificate any browser visiting this host already reads
+    on every connection, sends no application-layer request at all (no
+    HTTP GET happens here), and never validates against a trust store
+    of our own (so a self-signed cert is observed, not rejected). Same
+    request class as `fingerprint`'s plain GET: read-only, single
+    connection, no interaction beyond what establishing TLS requires.
+    Returns None if `openssl` isn't installed, the connection/handshake
+    fails, or no certificate was presented -- callers must treat that as
+    "no signal", never as "found nothing wrong"."""
+    binary = shutil.which("openssl")
+    if not binary:
+        return None
+
+    try:
+        s_client = subprocess.run(
+            [binary, "s_client", "-connect", f"{host}:443", "-servername", host],
+            input=b"", capture_output=True, timeout=timeout,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+
+    combined = s_client.stdout.decode(errors="ignore") + "\n" + s_client.stderr.decode(errors="ignore")
+    if _CERT_END_MARKER not in combined:
+        return None
+    pem = combined[combined.index("-----BEGIN CERTIFICATE-----"): combined.index(_CERT_END_MARKER) + len(_CERT_END_MARKER)]
+
+    verify_code = None
+    verify_text = None
+    verify_match = _VERIFY_CODE_RE.search(combined)
+    if verify_match:
+        verify_code = int(verify_match.group(1))
+        verify_text = verify_match.group(2)
+
+    try:
+        x509_out = subprocess.run(
+            [binary, "x509", "-noout", "-enddate", "-subject", "-ext", "subjectAltName", "-text"],
+            input=pem.encode(), capture_output=True, timeout=timeout,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    x509_text = x509_out.stdout.decode(errors="ignore")
+
+    not_after = None
+    m = _NOT_AFTER_RE.search(x509_text)
+    if m:
+        not_after = m.group(1).strip()
+    subject = None
+    m = _SUBJECT_RE.search(x509_text)
+    if m:
+        subject = m.group(1).strip()
+    signature_algorithm = None
+    m = _SIGNATURE_ALGO_RE.search(x509_text)
+    if m:
+        signature_algorithm = m.group(1)
+    san_dns_names = _SAN_DNS_RE.findall(x509_text)
+
+    return {
+        "not_after": not_after,
+        "subject": subject,
+        "signature_algorithm": signature_algorithm,
+        "san_dns_names": san_dns_names,
+        "verify_code": verify_code,
+        "verify_text": verify_text,
+    }
+
+
+def _parse_openssl_not_after(not_after: str) -> datetime | None:
+    try:
+        return datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
+    except ValueError:
+        return None
+
+
+def _hostname_covered_by_san(host: str, san_dns_names: list[str]) -> bool:
+    """Deliberately permissive wildcard match -- a false negative here
+    (silently skipping a real SAN mismatch) is worse than a false
+    positive on an unusual-but-legitimate CDN/multi-tenant cert setup,
+    consistent with this project's general stack/signature-matching
+    philosophy elsewhere."""
+    host_lower = host.lower()
+    for name in san_dns_names:
+        name_lower = name.lower()
+        if name_lower == host_lower:
+            return True
+        if name_lower.startswith("*.") and host_lower.endswith(name_lower[1:]):
+            return True
+    return False
+
+
+def tls_findings(host: str, info: dict) -> list[dict]:
+    """Turns `tls_cert_info`'s raw output into hit dicts (title/severity/
+    evidence), same shape testing/active.py's checks already use. Every
+    check here is read-only interpretation of a certificate that was
+    already fetched -- no additional connection."""
+    hits: list[dict] = []
+
+    if info.get("verify_code") in _SELF_SIGNED_VERIFY_CODES:
+        hits.append({
+            "kind": "tls-self-signed-cert",
+            "severity": "low",
+            "evidence": (
+                f"TLS handshake to {host}:443 presented a self-signed certificate "
+                f"(openssl verify: {info.get('verify_text')}). Could be a forgotten dev/staging cert "
+                "left reachable on a production host, or an intentional internal setup -- verify context "
+                "before reporting."
+            ),
+        })
+
+    not_after = info.get("not_after")
+    if not_after:
+        expiry = _parse_openssl_not_after(not_after)
+        if expiry:
+            days_left = (expiry - datetime.utcnow()).total_seconds() / 86400
+            if days_left < 0:
+                hits.append({
+                    "kind": "tls-cert-expired",
+                    "severity": "medium",
+                    "evidence": f"TLS certificate for {host} expired on {not_after} ({abs(days_left):.0f} day(s) ago).",
+                })
+            elif days_left <= TLS_CERT_SOON_EXPIRING_DAYS:
+                hits.append({
+                    "kind": "tls-cert-expiring-soon",
+                    "severity": "info",
+                    "evidence": f"TLS certificate for {host} expires {not_after} (in {days_left:.0f} day(s)).",
+                })
+
+    sig_algo = info.get("signature_algorithm") or ""
+    if "sha1" in sig_algo.lower():
+        hits.append({
+            "kind": "tls-weak-signature-algorithm",
+            "severity": "low",
+            "evidence": f"TLS certificate for {host} is signed with {sig_algo}, deprecated and rejected by modern browsers/clients.",
+        })
+
+    san_dns_names = info.get("san_dns_names") or []
+    if san_dns_names and not _hostname_covered_by_san(host, san_dns_names):
+        hits.append({
+            "kind": "tls-hostname-not-in-san",
+            "severity": "info",
+            "evidence": (
+                f"TLS certificate presented for {host} doesn't appear to cover it in its Subject "
+                f"Alternative Names ({', '.join(san_dns_names[:10])}). Heuristic wildcard match only -- "
+                "verify manually before reporting, shared/CDN certs are common and often legitimate."
+            ),
+        })
+
+    return hits
+
+
 def fingerprint_host(host: str, rules: RulesOfEngagement, *, timeout: float = 15) -> dict | None:
     headers = _request_headers(rules)
     for scheme in ("https", "http"):
@@ -498,6 +672,25 @@ def run_passive_recon(
                 if not fp:
                     continue
                 fingerprints[target_host] = fp
+
+                tls_info = tls_cert_info(target_host)
+                time.sleep(FINGERPRINT_DELAY_SECONDS)
+                if tls_info:
+                    fp["tls"] = tls_info
+                    for hit in tls_findings(target_host, tls_info):
+                        findings.append(
+                            Finding(
+                                id=f"{program.key}:{target_host}:{hit['kind']}",
+                                program_key=program.key,
+                                asset=target_host,
+                                title=hit["kind"].replace("-", " "),
+                                vuln_class=hit["kind"],
+                                test_type=TestType.PASSIVE_RECON,
+                                evidence=hit["evidence"],
+                                status=FindingStatus.CANDIDATE,
+                                notes=f"severity guess: {hit['severity']} -- verify manually before drafting a PoC",
+                            )
+                        )
 
                 banners = []
                 header_banner = _versioned_banner(fp.get("server"), fp.get("powered_by"))
