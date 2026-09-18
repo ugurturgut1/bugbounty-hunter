@@ -83,7 +83,22 @@ from bbhunter.recon.passive import _extract_host, _request_headers, _tool_path
 # and race-condition classes aren't included: they're inherently
 # app-specific and not meaningfully templatable, so nuclei has near-zero
 # real coverage for them anyway.
-NUCLEI_TAGS = "misconfig,exposure,tech,cve,cors,ssrf,jwt,graphql,takeover,ssti,xxe,host-header,prototype-pollution,redirect"
+# `ssl`/`cache` added 2026-09-18, live-verified against the real nuclei-templates
+# repo (v3.11.1): `-tags <old set>,ssl,cache -etags <same excludes>` matches 5,775
+# templates vs. 5,727 without them (+48 net, after exclusions) -- a modest, real
+# addition, not a noise bomb. `ssl` (61 templates) is a dedicated `ssl/` directory:
+# expired/self-signed/revoked certs, deprecated TLS versions, insecure cipher
+# suites, mismatched-hostname certs -- complements (doesn't duplicate) Phase 1's
+# openssl-based TLS checks in recon/passive.py, which don't check cipher suites,
+# TLS version, or revocation at all. `cache` (40 templates, mostly redundant with
+# `cve` for WordPress-plugin CVEs already caught either way) pulls in the real
+# net-new templates: generic cache-poisoning/cache-poisoning-xss and Next.js
+# cache-poisoning detection -- a live, common bug-bounty-payout class. The single
+# actual `cache-poisoning` tag (1 template) is too narrow on its own since the
+# generic detection templates are tagged just `cache`. `NUCLEI_EXCLUDE_TAGS`
+# still wins on overlap (confirmed: `cache-poisoning-fuzz.yaml` is tagged both
+# `cache` and `fuzz` and stays excluded).
+NUCLEI_TAGS = "misconfig,exposure,tech,cve,cors,ssrf,jwt,graphql,takeover,ssti,xxe,host-header,prototype-pollution,redirect,ssl,cache"
 NUCLEI_EXCLUDE_TAGS = "dos,intrusive,fuzz,bruteforce,hijack,rce,sqli,default-login,authentication-bypass"
 NUCLEI_RATE_LIMIT_PER_SECOND = 1  # matches this module's own REQUEST_DELAY_SECONDS pacing philosophy, not nuclei's much higher default
 NUCLEI_RUN_TIMEOUT_SECONDS = 900  # whole-run cap across every host handed to a single nuclei invocation
