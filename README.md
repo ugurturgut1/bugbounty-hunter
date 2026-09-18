@@ -381,6 +381,9 @@ uv run bbhunter list
 uv run bbhunter show hackerone:<handle>   # or bugcrowd:<code>, intigriti:<handle>
 uv run bbhunter recon <program-key>       # passive only, always allowed
 uv run bbhunter findings
+uv run bbhunter report <program-key>      # full audit trail: scope/approval status, everything
+                                           # recon found, every check that's actually been run
+                                           # (`test_runs`, including clean results), and findings
 ```
 
 ### Optional external recon tooling

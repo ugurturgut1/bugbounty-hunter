@@ -174,6 +174,23 @@ class ReconResult(BaseModel):
         return self.seeds_processed >= self.seeds_total
 
 
+class TestRun(BaseModel):
+    """One record that a check actually executed against a program,
+    independent of whether it produced a Finding. Findings alone can't
+    answer "did we already check X" for a clean result -- only positive
+    candidates get persisted as Finding rows, so a check that ran and found
+    nothing would otherwise leave no trace at all. `bbhunter report` reads
+    this table (alongside ReconResult and Finding) to reconstruct a full
+    per-program audit trail: what was looked at, when, and what came of it."""
+
+    id: str
+    program_key: str
+    test_type: TestType
+    ran_at: datetime = Field(default_factory=datetime.utcnow)
+    findings_created: int = 0
+    detail: str = ""  # freeform one-line summary of scope, e.g. "112 hosts (incl. wildcard-discovered), --injection --nuclei"
+
+
 class AIEndpointConfig(BaseModel):
     """How to send a prompt to one program's in-scope AI/LLM product
     endpoint and read back its text response. Every provider's API shape

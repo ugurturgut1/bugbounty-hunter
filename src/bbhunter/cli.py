@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -9,7 +10,7 @@ from rich.console import Console
 from rich.table import Table
 
 from bbhunter.discovery import ALL_CONNECTORS
-from bbhunter.models import AIEndpointConfig, AssetType, FindingStatus, TestType
+from bbhunter.models import AIEndpointConfig, AssetType, FindingStatus, TestRun, TestType
 from bbhunter.prioritize import prioritize
 from bbhunter.recon import run_passive_recon
 from bbhunter.recon.passive import _tool_path
@@ -32,11 +33,23 @@ from bbhunter.state import (
     list_findings,
     list_programs,
     list_reconned_program_keys,
+    list_test_runs,
+    record_test_run,
     upsert_ai_endpoint,
     upsert_finding,
     upsert_program,
     upsert_recon_result,
 )
+
+
+def _log_test_run(key: str, test_type: TestType, findings_created: int, detail: str) -> None:
+    record_test_run(TestRun(
+        id=str(uuid.uuid4()),
+        program_key=key,
+        test_type=test_type,
+        findings_created=findings_created,
+        detail=detail,
+    ))
 
 app = typer.Typer(help="Personal bug-bounty discovery/recon/reporting pipeline")
 console = Console()
@@ -236,6 +249,103 @@ def show(key: str):
 
 
 @app.command()
+def report(key: str):
+    """Full per-program audit trail: scope/approval status, everything
+    passive recon found (hosts, subdomains, param URLs), every check
+    that has actually been run against this program (from `test_runs`,
+    which records a run whether or not it produced a Finding -- a clean
+    result otherwise leaves no trace), and every Finding on file. Meant
+    to answer "what have we looked at here and what came of it" without
+    re-deriving it from scattered command output."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+
+    r = program.rules
+    console.print(f"[bold]{program.name}[/bold] ({key}) -- {program.platform.value}")
+    console.print(f"  bounties: {'yes' if program.offers_bounties else 'no'}  |  safe harbor: {r.safe_harbor}  |  "
+                   f"in-scope assets: {len(program.in_scope)}  |  last synced: {program.last_synced}")
+    console.print(f"  active testing: {'[green]permitted[/green]' if r.human_reviewed and r.confidence == 'high' else '[yellow]not approved[/yellow]'}"
+                   f" (confidence={r.confidence}, allowed_test_types={sorted(t.value for t in r.allowed_test_types) if r.human_reviewed else '[]'})")
+    if r.requires_authorization_request:
+        console.print("  [red]requires prior written authorization[/red] -- confirm this has actually been granted before any active check")
+
+    recon_result = get_recon_result(key)
+    console.print()
+    console.print("[bold]Recon[/bold]")
+    if not recon_result:
+        console.print("  [dim]none yet -- run `bbhunter recon` " + key + "`[/dim]")
+    else:
+        console.print(f"  last run: {recon_result.last_run}  |  seeds: {recon_result.seeds_processed}/{recon_result.seeds_total}"
+                       f"{' (incomplete)' if not recon_result.complete else ''}")
+        total_subdomains = sum(len(v) for v in recon_result.subdomains.values())
+        total_param_urls = sum(len(v) for v in recon_result.param_urls.values())
+        console.print(f"  {len(recon_result.fingerprints)} host(s) fingerprinted, {total_subdomains} subdomain(s) discovered, "
+                       f"{total_param_urls} param URL(s) from Wayback")
+        if recon_result.fingerprints:
+            table = Table(title="Fingerprinted hosts")
+            table.add_column("Host")
+            table.add_column("Status")
+            table.add_column("Server")
+            table.add_column("Tech")
+            for host, fp in sorted(recon_result.fingerprints.items()):
+                table.add_row(
+                    host,
+                    str(fp.get("status_code", "")),
+                    str(fp.get("server", "") or ""),
+                    ", ".join(fp.get("tech", []) or []) if isinstance(fp.get("tech"), list) else str(fp.get("tech", "") or ""),
+                )
+            console.print(table)
+        failures = []
+        if recon_result.crtsh_failures:
+            failures.append(f"crt.sh failed for {len(recon_result.crtsh_failures)} seed(s)")
+        if recon_result.subfinder_failures:
+            failures.append(f"subfinder failed for {len(recon_result.subfinder_failures)} seed(s)")
+        if recon_result.wayback_failures:
+            failures.append(f"Wayback failed for {len(recon_result.wayback_failures)} seed(s)")
+        if failures:
+            console.print(f"  [yellow]incomplete coverage[/yellow]: {'; '.join(failures)}")
+
+    runs = list_test_runs(key)
+    console.print()
+    console.print("[bold]Test run history[/bold]")
+    if not runs:
+        console.print("  [dim]no active checks have been run against this program yet[/dim]")
+    else:
+        table = Table()
+        table.add_column("When")
+        table.add_column("Check")
+        table.add_column("Detail")
+        table.add_column("Findings", justify="right")
+        for run in runs:
+            table.add_row(
+                str(run.ran_at),
+                run.test_type.value,
+                run.detail,
+                str(run.findings_created),
+            )
+        console.print(table)
+
+    program_findings = [f for f in list_findings() if f.program_key == key]
+    console.print()
+    console.print(f"[bold]Findings[/bold] ({len(program_findings)})")
+    if not program_findings:
+        console.print("  [dim]none on file[/dim]")
+    else:
+        table = Table()
+        table.add_column("ID")
+        table.add_column("Test type")
+        table.add_column("Asset")
+        table.add_column("Title")
+        table.add_column("Status")
+        table.add_column("Severity")
+        for f in program_findings:
+            table.add_row(f.id, f.test_type.value, f.asset, f.title, f.status.value, f.severity or "")
+        console.print(table)
+
+
+@app.command()
 def recon(
     key: str,
     max_subdomains_per_seed: int = typer.Option(
@@ -267,6 +377,11 @@ def recon(
     upsert_recon_result(result)
     for finding in findings:
         upsert_finding(finding)
+    _log_test_run(
+        key, TestType.PASSIVE_RECON, len(findings),
+        f"{result.seeds_processed}/{result.seeds_total} seed(s), {len(result.fingerprints)} host(s) fingerprinted"
+        f"{'' if result.complete else ' (interrupted)'}",
+    )
 
     total_hosts = len(result.fingerprints)
     if result.complete:
@@ -360,6 +475,10 @@ def test_active_cmd(
     new_findings = run_active_checks(program, recon_result, injection=injection, nuclei=nuclei)
     for finding in new_findings:
         upsert_finding(finding)
+    _log_test_run(
+        key, TestType.ACTIVE_LOW_IMPACT, len(new_findings),
+        f"exposed-file/misconfig scan{f', incl. {extras}' if extras else ''}",
+    )
     console.print(f"[green]done[/green] -- {len(new_findings)} candidate(s) found")
     if new_findings:
         console.print("[yellow]note[/yellow]: verify each manually before drafting a PoC -- "
@@ -512,6 +631,7 @@ def test_ai_cmd(
     new_findings = run_ai_safety_probes(program, config, multiturn=multiturn)
     for finding in new_findings:
         upsert_finding(finding)
+    _log_test_run(key, TestType.AI_SAFETY_PROBE, len(new_findings), f"against {config.url} ({request_count}{', +multiturn' if multiturn else ''})")
     console.print(f"[green]done[/green] -- {len(new_findings)} candidate(s) found")
     if new_findings:
         console.print("[yellow]note[/yellow]: these are heuristic signals -- read the actual model responses "
@@ -558,6 +678,7 @@ def test_idor_cmd(
     new_findings = run_idor_check(program, url, owner_headers, other_headers, owner_note=owner_note)
     for finding in new_findings:
         upsert_finding(finding)
+    _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, len(new_findings), f"IDOR check on {url}")
     if new_findings:
         console.print("[red]candidate found[/red] -- see `bbhunter findings`, verify manually before drafting a PoC")
     else:
@@ -607,6 +728,7 @@ def test_bfla_cmd(
     new_findings = run_bfla_check(program, url, authorized_headers, other_headers, authorized_note=authorized_note)
     for finding in new_findings:
         upsert_finding(finding)
+    _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, len(new_findings), f"BFLA check on {url}")
     if new_findings:
         console.print("[red]candidate found[/red] -- see `bbhunter findings`, verify manually before drafting a PoC")
     else:
@@ -690,6 +812,7 @@ def test_mass_assignment_cmd(
     new_findings = run_mass_assignment_check(program, url, owner_headers, field_name, field_value, owner_note=owner_note)
     for finding in new_findings:
         upsert_finding(finding)
+    _log_test_run(key, TestType.MASS_ASSIGNMENT_PROBE, len(new_findings), f"mass-assignment probe on {url} (field: {field_name})")
     if new_findings:
         console.print(
             "[red]candidate found[/red] -- see `bbhunter findings`, read the evidence for the revert outcome "

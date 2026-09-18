@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from bbhunter.config import DB_PATH
-from bbhunter.models import AIEndpointConfig, Finding, Program, ReconResult
+from bbhunter.models import AIEndpointConfig, Finding, Program, ReconResult, TestRun
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS programs (
@@ -33,6 +33,14 @@ CREATE TABLE IF NOT EXISTS recon_results (
 
 CREATE TABLE IF NOT EXISTS ai_endpoints (
     program_key TEXT PRIMARY KEY,
+    data TEXT NOT NULL,
+    FOREIGN KEY (program_key) REFERENCES programs(key)
+);
+
+CREATE TABLE IF NOT EXISTS test_runs (
+    id TEXT PRIMARY KEY,
+    program_key TEXT NOT NULL,
+    ran_at TEXT NOT NULL,
     data TEXT NOT NULL,
     FOREIGN KEY (program_key) REFERENCES programs(key)
 );
@@ -129,3 +137,19 @@ def get_ai_endpoint(program_key: str, db_path: Path = DB_PATH) -> AIEndpointConf
     with connect(db_path) as conn:
         row = conn.execute("SELECT data FROM ai_endpoints WHERE program_key = ?", (program_key,)).fetchone()
     return AIEndpointConfig.model_validate_json(row[0]) if row else None
+
+
+def record_test_run(run: TestRun, db_path: Path = DB_PATH) -> None:
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO test_runs (id, program_key, ran_at, data) VALUES (?, ?, ?, ?)",
+            (run.id, run.program_key, run.ran_at.isoformat(), run.model_dump_json()),
+        )
+
+
+def list_test_runs(program_key: str, db_path: Path = DB_PATH) -> list[TestRun]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT data FROM test_runs WHERE program_key = ? ORDER BY ran_at", (program_key,)
+        ).fetchall()
+    return [TestRun.model_validate_json(row[0]) for row in rows]

@@ -200,6 +200,14 @@ uv run bbhunter approve-report <finding-id> --note "<confirmation>"
 
 ## Reference
 
+- `uv run bbhunter report <program-key>` gives a full per-program audit
+  trail: scope/approval status, everything recon found (hosts,
+  subdomains, param URLs), every check that has actually been run
+  against this program including clean ones (`test_runs` -- a Finding
+  alone can't show "we checked X and it was clean"), and every Finding
+  on file. Reach for this whenever the user asks what's been
+  looked at / tested for a program, instead of re-deriving it from
+  scattered command output or memory.
 - `uv run bbhunter show <program-key>` / `show-finding <finding-id>` for
   full JSON detail.
 - Data lives in `~/bugbounty-hunter/state/` (SQLite + PoC/report markdown
