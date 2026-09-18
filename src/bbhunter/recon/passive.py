@@ -42,9 +42,16 @@ class as crt.sh/Wayback), and every fingerprinted host gets a
 dangling-CNAME check -- run BEFORE the HTTP fingerprint attempt, since a
 truly dangling target often never responds to HTTP at all, which would
 otherwise skip it entirely.
+
+Per seed host, `recon/js_harvest.py` also fetches the page and every
+`<script src>` it links (public static content any visitor already
+receives) to scan for hardcoded secrets, exposed source maps, and
+internal-looking API paths referenced in the JS -- see that module's
+docstring for exactly what and why.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -58,6 +65,14 @@ import httpx
 
 from bbhunter.models import AssetType, Finding, FindingStatus, Program, ReconResult, RulesOfEngagement, TestType
 from bbhunter.recon.dns_hygiene import check_dangling_cname, check_dkim, check_dmarc, check_spf
+from bbhunter.recon.js_harvest import (
+    check_source_map_exposed,
+    extract_script_urls,
+    fetch_text_capped,
+    find_source_map_url,
+    scan_js_internal_paths,
+    scan_js_secrets,
+)
 
 CRTSH_URL = "https://crt.sh/"
 NVD_CVE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
@@ -614,6 +629,52 @@ def nvd_search(keyword: str, *, timeout: float = 30) -> list[dict]:
     return results
 
 
+def _harvest_js_for_host(host: str, rules: RulesOfEngagement) -> list[dict]:
+    """One page GET to find `<script src>` tags, then one GET per linked
+    JS file (capped, see js_harvest.MAX_JS_FILES_PER_PAGE) -- same
+    request class as the plain-GET fingerprint request, just reading
+    public static assets a normal page load already triggers. Returns
+    [] on any failure to fetch the page itself."""
+    headers = _request_headers(rules)
+    try:
+        resp = httpx.get(f"https://{host}", headers=headers, timeout=15, follow_redirects=True)
+    except httpx.HTTPError:
+        return []
+    if resp.status_code != 200:
+        return []
+
+    hits: list[dict] = []
+    internal_paths: set[str] = set()
+    for js_url in extract_script_urls(str(resp.url), resp.text):
+        js_text = fetch_text_capped(js_url)
+        time.sleep(FINGERPRINT_DELAY_SECONDS)
+        if not js_text:
+            continue
+
+        hits.extend(scan_js_secrets(js_url, js_text))
+        internal_paths.update(scan_js_internal_paths(js_text))
+
+        map_url = find_source_map_url(js_url, js_text)
+        if map_url:
+            map_hit = check_source_map_exposed(map_url)
+            time.sleep(FINGERPRINT_DELAY_SECONDS)
+            if map_hit:
+                hits.append(map_hit)
+
+    if internal_paths:
+        sample = ", ".join(sorted(internal_paths)[:10])
+        hits.append({
+            "kind": "js-referenced-internal-api-paths",
+            "severity": "info",
+            "evidence": (
+                f"Public JS on {host} references {len(internal_paths)} internal-looking API path(s), "
+                f"e.g.: {sample}. Worth manually exploring for endpoints not otherwise discovered."
+            ),
+        })
+
+    return hits
+
+
 def run_passive_recon(
     program: Program, *, max_subdomains_per_seed: int = MAX_SUBDOMAINS_PER_SEED
 ) -> tuple[ReconResult, list[Finding]]:
@@ -688,6 +749,22 @@ def run_passive_recon(
             time.sleep(WAYBACK_DELAY_SECONDS)
             if param_urls:
                 param_urls_by_seed[host] = param_urls
+
+            for hit in _harvest_js_for_host(host, program.rules):
+                digest = hashlib.sha256(f"{host}:{hit['kind']}:{hit['evidence']}".encode()).hexdigest()[:12]
+                findings.append(
+                    Finding(
+                        id=f"{program.key}:{host}:{digest}",
+                        program_key=program.key,
+                        asset=host,
+                        title=hit["kind"].replace("-", " "),
+                        vuln_class=hit["kind"],
+                        test_type=TestType.PASSIVE_RECON,
+                        evidence=hit["evidence"],
+                        status=FindingStatus.CANDIDATE,
+                        notes=f"severity guess: {hit['severity']} -- verify manually before drafting a PoC",
+                    )
+                )
 
             hosts_to_fingerprint = [host] + sorted(discovered)[:max_subdomains_per_seed]
             for target_host in hosts_to_fingerprint:
