@@ -59,6 +59,7 @@ import httpx
 
 from bbhunter.models import AssetType, Finding, FindingStatus, Program, ReconResult, RulesOfEngagement, TestType
 from bbhunter.recon.passive import _extract_host, _request_headers, _tool_path
+from bbhunter.testing.cloud_storage import check_cloud_buckets_for_name
 
 # Curated for TestType.ACTIVE_LOW_IMPACT: detection-only template classes,
 # chosen 2026-09-17 to close real gaps against OWASP Top 10 2021 (A10 SSRF)
@@ -646,22 +647,53 @@ def _select_hosts(program: Program, recon_result: ReconResult | None) -> list[st
     return hosts[:MAX_HOSTS_PER_PROGRAM]
 
 
+def _seed_base_names(program: Program) -> list[str]:
+    """The organizational-ish label from each in-scope URL/WILDCARD
+    seed (e.g. "example" from "example.com", "www.example.com", or
+    "*.example.com") -- input for cloud_storage.py's bucket-name
+    guessing, deliberately derived only from what the program itself
+    already lists as in scope, never an invented/unrelated name."""
+    names: list[str] = []
+    for asset in program.in_scope:
+        if asset.asset_type not in (AssetType.URL, AssetType.WILDCARD):
+            continue
+        host = _extract_host(asset.identifier)
+        if not host:
+            continue
+        label = host.lower()
+        if label.startswith("www."):
+            label = label[4:]
+        parts = label.split(".")
+        base = parts[0] if len(parts) <= 2 else parts[-2]
+        if base and base not in names:
+            names.append(base)
+    return names
+
+
 def run_active_checks(
     program: Program,
     recon_result: ReconResult | None = None,
     *,
     injection: bool = False,
     nuclei: bool = False,
+    cloud_buckets: bool = False,
 ) -> list[Finding]:
     """`injection=True` additionally runs the reflected-XSS/SQL-error-
     signature checks (see module docstring) against Wayback-discovered
     param URLs from `recon_result`. `nuclei=True` additionally runs the
     curated nuclei template set (see `run_nuclei_scan`) against the same
-    selected hosts, skipped silently if the binary isn't installed. Both
-    are gated by the exact same `permits(ACTIVE_LOW_IMPACT)` check as
-    everything else here -- neither is a separate or higher permission
-    tier, just a separate opt-in since each is a qualitatively different
-    request shape worth a deliberate choice to include."""
+    selected hosts, skipped silently if the binary isn't installed.
+    `cloud_buckets=True` additionally checks a small set of S3/GCS/
+    Azure bucket-name variations derived from the program's own in-scope
+    domains for a publicly-listable cloud storage bucket (see
+    testing/cloud_storage.py) -- every finding from this one lands at
+    "info" severity with an explicit ownership-verification caveat,
+    since a same-named bucket can genuinely belong to an unrelated third
+    party. All three are gated by the exact same
+    `permits(ACTIVE_LOW_IMPACT)` check as everything else here -- none
+    is a separate or higher permission tier, just a separate opt-in
+    since each is a qualitatively different request shape worth a
+    deliberate choice to include."""
     if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
         raise RuntimeError(
             f"{program.key}: active testing blocked by rules.permits() -- run `bbhunter review-rules` "
@@ -745,5 +777,23 @@ def run_active_checks(
                     notes=f"nuclei severity: {info.get('severity', 'unknown')} -- verify manually before drafting a PoC",
                 )
             )
+
+    if cloud_buckets:
+        for base_name in _seed_base_names(program):
+            for hit in check_cloud_buckets_for_name(base_name):
+                digest = hashlib.sha256(f"{base_name}:{hit['kind']}:{hit['evidence']}".encode()).hexdigest()[:12]
+                findings.append(
+                    Finding(
+                        id=f"{program.key}:cloud:{digest}",
+                        program_key=program.key,
+                        asset=base_name,
+                        title=hit["kind"].replace("-", " "),
+                        vuln_class=hit["kind"],
+                        test_type=TestType.ACTIVE_LOW_IMPACT,
+                        evidence=hit["evidence"],
+                        status=FindingStatus.CANDIDATE,
+                        notes=f"severity guess: {hit['severity']} -- verify manually before drafting a PoC",
+                    )
+                )
 
     return findings

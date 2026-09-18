@@ -435,11 +435,19 @@ def test_active_cmd(
     ),
     nuclei: bool = typer.Option(
         False, "--nuclei",
-        help="Also run the `nuclei` binary with a curated template set: misconfig/exposure/tech/cve plus "
-             "cors/ssrf/jwt/graphql/takeover/ssti/xxe/host-header/prototype-pollution/redirect (rce/sqli/"
-             "dos/intrusive/fuzz/bruteforce/hijack/default-login/auth-bypass tags excluded), rate-limited "
-             "to 1 req/s. Requires `nuclei` installed (see README) and is skipped silently otherwise. Same "
-             "gate as --injection.",
+        help="Also run the `nuclei` binary with a curated template set: misconfig/exposure/tech/cve/ssl/"
+             "cache plus cors/ssrf/jwt/graphql/takeover/ssti/xxe/host-header/prototype-pollution/redirect "
+             "(rce/sqli/dos/intrusive/fuzz/bruteforce/hijack/default-login/auth-bypass tags excluded), "
+             "rate-limited to 1 req/s. Requires `nuclei` installed (see README) and is skipped silently "
+             "otherwise. Same gate as --injection.",
+    ),
+    cloud_buckets: bool = typer.Option(
+        False, "--cloud-buckets",
+        help="Also check a small set of S3/GCS/Azure bucket-name variations derived from this program's "
+             "own in-scope domains for a publicly-listable cloud storage bucket. Every request goes to "
+             "the cloud PROVIDER's infrastructure, not the target's own hosts. Findings land at 'info' "
+             "severity with an explicit ownership-verification caveat -- a same-named bucket can "
+             "legitimately belong to an unrelated third party. Same gate as --injection/--nuclei.",
     ),
 ):
     """Run Phase 3 active checks (exposed-file/misconfig scan, read-only)
@@ -470,9 +478,11 @@ def test_active_cmd(
             "[yellow]note[/yellow]: --nuclei requested but the `nuclei` binary isn't installed -- skipping "
             "that check class. See README.md Setup for `go install ...nuclei/v3/cmd/nuclei@latest`."
         )
-    extras = ", ".join(name for name, flag in (("injection", injection), ("nuclei", nuclei)) if flag)
+    extras = ", ".join(
+        name for name, flag in (("injection", injection), ("nuclei", nuclei), ("cloud-buckets", cloud_buckets)) if flag
+    )
     console.print(f"[cyan]running active checks[/cyan] on {key}{f' (incl. {extras})' if extras else ''}...")
-    new_findings = run_active_checks(program, recon_result, injection=injection, nuclei=nuclei)
+    new_findings = run_active_checks(program, recon_result, injection=injection, nuclei=nuclei, cloud_buckets=cloud_buckets)
     for finding in new_findings:
         upsert_finding(finding)
     _log_test_run(
