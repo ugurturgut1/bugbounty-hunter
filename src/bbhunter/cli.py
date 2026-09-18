@@ -591,15 +591,16 @@ def test_ai_cmd(
     ),
 ):
     """Run the opt-in AI/LLM safety probes (prompt injection, system-
-    prompt leakage, sensitive-info disclosure, excessive agency -- see
-    testing/ai_safety.py) against a program's configured AI endpoint.
-    Refuses unless `approve-active --test-type ai_safety_probe` has
-    already recorded a human decision permitting it -- same gate as
+    prompt leakage, sensitive-info disclosure, excessive agency,
+    improper output handling, indirect prompt injection, misinformation
+    -- see testing/ai_safety.py) against a program's configured AI
+    endpoint. Refuses unless `approve-active --test-type ai_safety_probe`
+    has already recorded a human decision permitting it -- same gate as
     every other active check, no passive-floor exception for this one.
 
     Unlike the web checks, each probe here is a real call to the
     program's AI model, which may cost real money per request if it's a
-    paid model API -- this runs exactly 4 requests total (10 with
+    paid model API -- this runs exactly 7 requests total (13 with
     --multiturn), but that's worth knowing before running it repeatedly."""
     program = get_program(key)
     if not program:
@@ -626,7 +627,7 @@ def test_ai_cmd(
             "single-turn probes only."
         )
 
-    request_count = "4 requests" if not (multiturn and config.conversation_template) else "up to 10 requests"
+    request_count = "7 requests" if not (multiturn and config.conversation_template) else "up to 13 requests"
     console.print(f"[cyan]running AI safety probes[/cyan] against {config.url} for {key} ({request_count})...")
     new_findings = run_ai_safety_probes(program, config, multiturn=multiturn)
     for finding in new_findings:

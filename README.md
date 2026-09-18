@@ -219,8 +219,11 @@ passive recon -> gated active testing -> PoC drafting -> report drafting
 
 ## Vulnerability class coverage
 
-Assessed 2026-09-17 against OWASP Top 10 2021 (the current official web
-edition -- no ratified refresh exists yet) and the vuln classes that
+Assessed 2026-09-17, updated 2026-09-18, against OWASP Top 10 2021 (the
+current official web edition -- no ratified refresh exists yet, so
+"2025"-named coverage below refers specifically to OWASP's own
+separately-versioned LLM Top 10 2025 and API Security Top 10:2023, not a
+web-edition refresh that doesn't exist), plus the vuln classes that
 actually drive bug bounty payouts, which don't map 1:1 onto OWASP's
 list. Kept here so coverage claims don't silently go stale as more gets
 built -- update this table in the same commit as any check that changes
@@ -228,7 +231,7 @@ what it covers.
 
 | Class | Coverage | How |
 |---|---|---|
-| A05 Security Misconfiguration | Good | exposed-file checks, missing-headers check, nuclei `misconfig`/`exposure` tags |
+| A05 Security Misconfiguration | Good | exposed-file checks (now spanning ~25 self-hosted stacks/admin panels, see `_STACK_CHECKS`), missing-headers check, nuclei `misconfig`/`exposure` tags |
 | A06 Vulnerable/Outdated Components | Good | NVD CVE-keyword match (version-range aware) + nuclei `cve` tag |
 | CORS misconfiguration | Good | nuclei `cors` tag |
 | Subdomain takeover | Good | nuclei `takeover` tag |
@@ -255,7 +258,10 @@ what it covers.
 | API2 Broken Auth, API6 Unrestricted Sensitive Business Flows, API10 Unsafe Consumption of APIs | **Missing** | API2 excluded by design (same as A07); API6/API10 aren't generically automatable |
 | LLM01 Prompt Injection, LLM02 Sensitive Info Disclosure, LLM06 Excessive Agency, LLM07 System Prompt Leakage (OWASP LLM Top 10 2025) | Good (heuristic) | `testing/ai_safety.py`, `bbhunter test-ai` -- see below |
 | LLM01/LLM07 via multi-turn conversational escalation | Good (heuristic), opt-in | `check_multiturn_jailbreak`, `test-ai --multiturn` -- catches jailbreaks that succeed only via roleplay/rapport-building framing, not single-shot |
-| LLM03 Supply Chain, LLM04 Data/Model Poisoning, LLM08 Embedding Weaknesses, LLM09 Misinformation | **Missing** | not meaningfully blackbox-probable with a single HTTP request |
+| LLM05 Improper Output Handling | Good (heuristic) | `check_improper_output_handling` -- tests only the model's half (does it echo active markup unescaped), not whether the surrounding app then renders it unsanitized |
+| LLM08 Vector and Embedding Weaknesses | Good (heuristic), the blackbox-probable half only | `check_indirect_prompt_injection` -- simulates a poisoned RAG document/tool result carrying an embedded instruction; can't actually poison a real vector store or embedding pipeline, which is the rest of LLM08 |
+| LLM09 Misinformation | Thin (heuristic) | `check_misinformation` -- narrow confident-fabrication-about-a-nonexistent-product test; real-world hallucination risk is far more subtle than this can detect, a clean result proves little |
+| LLM03 Supply Chain, LLM04 Data/Model Poisoning | **Missing** | genuinely need dependency/build-pipeline or training-time access this project has no path to from a single HTTP endpoint |
 | LLM10 Unbounded Consumption | **Missing by design** | would mean deliberately running up cost/resource usage against a real endpoint -- the AI-endpoint equivalent of the DoS testing excluded everywhere else in this project |
 
 **Roadmap (phased, tracked here so it survives across sessions):**
@@ -348,6 +354,42 @@ OWASP API Security Top 10 2023 coverage and multi-turn LLM jailbreak-chain testi
    resist the single-shot version of each probe but cave after conversational buildup: confirmed via
    the actual CLI that both single-turn probes correctly did NOT fire while both multi-turn scripts
    correctly DID -- the exact escalation-specific distinction this feature exists to catch.
+
+7. *(done 2026-09-18)* Closed the remaining blackbox-probable gaps in the LLM Top 10 2025 and
+   broadened tech-stack coverage, both explicitly requested to make active testing find more real
+   things once the user approves it, not to loosen any approval gate:
+   - `testing/ai_safety.py` gained 3 new single-turn probes, bringing `test-ai`'s base run from 4 to 7
+     requests (13 with `--multiturn`): `check_improper_output_handling` (LLM05 -- does the model echo
+     active markup, e.g. `<img onerror=...>`, completely unescaped when asked to repeat it verbatim;
+     tests only the model's half, never claims the surrounding app renders it unsanitized),
+     `check_indirect_prompt_injection` (LLM08 -- embeds a fake `[SYSTEM INSTRUCTION OVERRIDE]` inside a
+     "document" the model is asked to summarize, checking whether it follows the embedded instruction
+     instead of treating retrieved/third-party content as data -- the real mechanism behind indirect
+     prompt injection against RAG/browsing/tool-use products, and the only black-box-reachable half of
+     LLM08 since this project can't poison an actual vector store), and `check_misinformation` (LLM09,
+     explicitly labeled Thin -- asks about a product proven not to exist and checks for confident
+     fabrication vs. appropriate hedging; a much narrower test than real hallucination risk). LLM03/
+     LLM04 stay Missing (need dependency/build-pipeline or training-time access, not reachable from an
+     HTTP endpoint) and LLM10 stays excluded by design (would mean deliberately running up cost/
+     resource usage against a real endpoint). 6 new tests.
+   - `testing/active.py`'s `_STACK_CHECKS` grew from 9 to ~25 stacks: Django, Flask/Werkzeug (exposed
+     debugger console -- RCE-adjacent if reachable, detection-only, no interaction with the console
+     itself), Jenkins, Elasticsearch, Kibana, Grafana, Prometheus, Consul, Vault, RabbitMQ, Traefik,
+     Nextcloud, Magento, Drupal, Joomla, Strapi, Solr, Jira, Confluence, plus two new Laravel checks
+     (exposed Telescope debug panel, Ignition health-check). `_GENERIC_CHECKS` gained 4 stack-agnostic
+     entries for small standalone apps commonly deployed alongside (not part of) a fingerprinted
+     framework: `/metrics` (Prometheus-format), `/phpmyadmin/`, `/adminer.php`, `/v2/_catalog` (Docker
+     Registry). Every new check is the same read-only, soft-404-gated, signature-matched GET this
+     module already used -- no new request shape, no interaction beyond one GET per path. 8 new tests,
+     including a regression guard that every `_STACK_CHECKS` key is actually reachable via
+     `_detected_stacks`' substring match (catches a typo'd key that would otherwise silently never
+     fire).
+   - This is a curated, high-value set, not literally "every tech stack" -- deliberately left out
+     stacks that don't fit this module's signature-match-on-a-known-path model without a much higher
+     false-positive rate (e.g. bare "Go" as a tech-detect substring would false-positive-match "Google"
+     on effectively every host) or that need protocol/port access this project (HTTP-only, in-scope-URL
+     driven) doesn't have (e.g. Redis/Memcached/MongoDB's native protocols, Kubernetes' own API server
+     rather than an app that happens to run on K8s).
 
 Longer-term ideas not yet scoped into a phase: broader business-logic/race-condition testing (not
 generically automatable, would need per-program custom logic), stateful (server-side conversation ID)

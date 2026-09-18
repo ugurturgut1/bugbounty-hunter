@@ -89,7 +89,7 @@ policy language, following the same review-rules-first, user's-own-words
 process as step 3 above -- never approve this yourself either.
 
 Before configuring or running it, tell the user explicitly: each
-`test-ai` run sends exactly 4 prompts to the real model endpoint (10 with
+`test-ai` run sends exactly 7 prompts to the real model endpoint (13 with
 `--multiturn`), which may cost real money per request if it's a paid API
 (unlike the free HTTP checks elsewhere in this pipeline). Get their
 go-ahead on that before running `uv run bbhunter test-ai <program-key>`,

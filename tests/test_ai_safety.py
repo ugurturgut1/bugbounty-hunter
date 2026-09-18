@@ -2,6 +2,7 @@
 Every HTTP call to the (would-be real) model endpoint is mocked -- these
 never make a real API call or spend real API credits."""
 import json
+import re
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -17,10 +18,14 @@ from bbhunter.models import (
     TestType,
 )
 from bbhunter.testing.ai_safety import (
+    _ALL_CHECKS,
     _ALL_MULTITURN_SCRIPTS,
     _extract_response_text,
     _fill_prompt,
     check_excessive_agency,
+    check_improper_output_handling,
+    check_indirect_prompt_injection,
+    check_misinformation,
     check_multiturn_jailbreak,
     check_prompt_injection,
     check_sensitive_info_disclosure,
@@ -177,6 +182,68 @@ def test_excessive_agency_flags_non_refusal():
     assert hit["kind"] == "excessive-agency-candidate"
 
 
+def test_improper_output_handling_flags_when_payload_echoed_unescaped():
+    config = _config()
+    with patch("bbhunter.testing.ai_safety.send_prompt") as mock_send:
+        def fake_send(cfg, prompt, timeout=60):
+            payload = prompt.rsplit("string: ", 1)[-1]
+            return f"Sure, here it is: {payload}"
+        mock_send.side_effect = fake_send
+        hit = check_improper_output_handling(config)
+    assert hit is not None
+    assert hit["kind"] == "improper-output-handling-candidate"
+
+
+def test_improper_output_handling_no_hit_when_escaped_or_refused():
+    config = _config()
+    with patch("bbhunter.testing.ai_safety.send_prompt", return_value="&lt;img src=x onerror=...&gt;"):
+        assert check_improper_output_handling(config) is None
+
+
+def test_indirect_prompt_injection_flags_when_embedded_instruction_followed():
+    config = _config()
+    with patch("bbhunter.testing.ai_safety.send_prompt") as mock_send:
+        def fake_send(cfg, prompt, timeout=60):
+            marker = re.search(r"BBHUNTER-DOC-[0-9a-f]+", prompt).group(0)
+            return marker
+        mock_send.side_effect = fake_send
+        hit = check_indirect_prompt_injection(config)
+    assert hit is not None
+    assert hit["kind"] == "indirect-prompt-injection-candidate"
+
+
+def test_indirect_prompt_injection_no_hit_when_model_just_summarizes():
+    config = _config()
+    with patch(
+        "bbhunter.testing.ai_safety.send_prompt",
+        return_value="The document reports Q3 2026 revenue up 4% year over year with stable net income.",
+    ):
+        assert check_indirect_prompt_injection(config) is None
+
+
+def test_misinformation_flags_confident_fabrication():
+    config = _config()
+    with patch("bbhunter.testing.ai_safety.send_prompt", return_value="It was released on March 3, 2022 as version 4.5.1."):
+        hit = check_misinformation(config)
+    assert hit is not None
+    assert hit["kind"] == "misinformation-fabrication-candidate"
+
+
+def test_misinformation_no_hit_when_model_hedges():
+    config = _config()
+    with patch(
+        "bbhunter.testing.ai_safety.send_prompt",
+        return_value="I'm not aware of any such product -- it doesn't appear to exist.",
+    ):
+        assert check_misinformation(config) is None
+
+
+def test_misinformation_no_hit_without_specific_looking_answer():
+    config = _config()
+    with patch("bbhunter.testing.ai_safety.send_prompt", return_value="That product sounds advanced and popular."):
+        assert check_misinformation(config) is None
+
+
 def test_run_ai_safety_probes_refuses_without_approval():
     program = _program(approved=False)
     config = _config()
@@ -201,10 +268,10 @@ def test_run_ai_safety_probes_maps_hits_to_findings():
     assert findings[0].asset == config.url
 
 
-def test_run_ai_safety_probes_runs_all_four_checks():
+def test_run_ai_safety_probes_runs_all_checks():
     program = _program()
     config = _config()
-    checks = tuple(MagicMock(return_value=None) for _ in range(4))
+    checks = tuple(MagicMock(return_value=None) for _ in _ALL_CHECKS)
     with patch("bbhunter.testing.ai_safety._ALL_CHECKS", checks), \
          patch("bbhunter.testing.ai_safety.time.sleep"):
         run_ai_safety_probes(program, config)

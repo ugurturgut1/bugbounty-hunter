@@ -122,6 +122,14 @@ _GENERIC_CHECKS: dict[str, tuple[str, tuple[str, ...], str]] = {
     "/.svn/entries": ("Exposed .svn/entries", ("svn",), "medium"),
     "/docker-compose.yml": ("Exposed docker-compose.yml", ("version:", "services:"), "medium"),
     "/backup.sql": ("Exposed SQL backup", ("insert into", "create table"), "high"),
+    # The following aren't gated by a detected tech stack the way _STACK_CHECKS entries are:
+    # each is its own small standalone app/endpoint commonly deployed alongside (rather than
+    # as part of) whatever framework the main site runs, so recon's fingerprint of the main
+    # site's tech doesn't predict whether one of these also exists at a well-known path.
+    "/metrics": ("Exposed Prometheus-format metrics endpoint", ("# help", "# type"), "medium"),
+    "/phpmyadmin/": ("Publicly accessible phpMyAdmin instance", ("phpmyadmin",), "info"),
+    "/adminer.php": ("Publicly accessible Adminer instance", ("adminer",), "info"),
+    "/v2/_catalog": ("Exposed Docker Registry catalog (unauthenticated)", ('"repositories"',), "high"),
 }
 
 # tech-detect keyword (matched case-insensitively as a substring against
@@ -152,6 +160,8 @@ _STACK_CHECKS: dict[str, dict[str, tuple[str, tuple[str, ...], str]]] = {
     },
     "laravel": {
         "/storage/logs/laravel.log": ("Exposed Laravel log file", ("local.error", "stack trace"), "medium"),
+        "/telescope/requests": ("Exposed Laravel Telescope debug panel", ("telescope", "requests"), "high"),
+        "/_ignition/health-check": ("Exposed Laravel Ignition debug endpoint", ("ignition", "health"), "high"),
     },
     "express": {
         "/package.json": ("Exposed package.json", ('"dependencies"', '"name"'), "low"),
@@ -164,6 +174,69 @@ _STACK_CHECKS: dict[str, dict[str, tuple[str, tuple[str, ...], str]]] = {
     },
     "asp.net": {
         "/web.config": ("Exposed web.config", ("<configuration>", "connectionstrings"), "high"),
+    },
+    "django": {
+        "/admin/login/": ("Exposed Django admin login page", ("csrfmiddlewaretoken", "django administration"), "info"),
+    },
+    "flask": {
+        "/console": ("Possible exposed Werkzeug debugger console (RCE-adjacent if reachable)", ("werkzeug debugger", "traceback"), "critical"),
+    },
+    "werkzeug": {
+        "/console": ("Possible exposed Werkzeug debugger console (RCE-adjacent if reachable)", ("werkzeug debugger", "traceback"), "critical"),
+    },
+    "jenkins": {
+        "/api/json": ("Exposed Jenkins API (unauthenticated)", ('"jobs"', "hudson.model"), "high"),
+    },
+    "elasticsearch": {
+        "/_cluster/health": ("Exposed Elasticsearch cluster health API", ('"cluster_name"', '"status"'), "high"),
+        "/_cat/indices?v": ("Exposed Elasticsearch indices listing (unauthenticated)", ("health", "index"), "critical"),
+    },
+    "kibana": {
+        "/api/status": ("Exposed Kibana status API", ('"kibana"', '"status"'), "low"),
+    },
+    "grafana": {
+        "/api/health": ("Exposed Grafana health API", ('"database"', '"version"'), "info"),
+        "/api/datasources": ("Exposed Grafana datasources API (auth misconfig)", ('"id"', '"type"'), "high"),
+    },
+    "prometheus": {
+        "/api/v1/status/config": ("Exposed Prometheus config API", ("global", "scrape_configs"), "high"),
+    },
+    "consul": {
+        "/v1/agent/self": ("Exposed Consul agent API (unauthenticated)", ('"config"', '"member"'), "high"),
+    },
+    "vault": {
+        "/v1/sys/health": ("Exposed Vault health endpoint", ("initialized", "sealed"), "info"),
+    },
+    "rabbitmq": {
+        "/api/overview": ("Exposed RabbitMQ management API (unauthenticated)", ("rabbitmq_version", "management_version"), "high"),
+    },
+    "traefik": {
+        "/api/rawdata": ("Exposed Traefik dashboard API", ('"routers"', '"services"'), "medium"),
+        "/api/version": ("Exposed Traefik version API", ('"version"',), "low"),
+    },
+    "nextcloud": {
+        "/status.php": ("Exposed Nextcloud status.php", ('"installed"', '"version"'), "info"),
+    },
+    "magento": {
+        "/app/etc/env.php": ("Exposed Magento env.php (DB credentials)", ("'db'", "'password'"), "critical"),
+    },
+    "drupal": {
+        "/CHANGELOG.txt": ("Exposed Drupal CHANGELOG.txt (version disclosure)", ("drupal",), "low"),
+    },
+    "joomla": {
+        "/administrator/manifests/files/joomla.xml": ("Exposed Joomla version manifest", ("<version>",), "low"),
+    },
+    "strapi": {
+        "/admin/init": ("Exposed Strapi admin init API", ("strapiversion", "currentenvironment"), "info"),
+    },
+    "solr": {
+        "/solr/admin/info/system": ("Exposed Apache Solr system info", ("solr_home", "lucene"), "high"),
+    },
+    "jira": {
+        "/rest/api/2/serverInfo": ("Exposed Jira server info API", ("servertitle", "version"), "info"),
+    },
+    "confluence": {
+        "/rest/api/space": ("Exposed Confluence space API (unauthenticated)", ('"results"', '"space"'), "medium"),
     },
 }
 

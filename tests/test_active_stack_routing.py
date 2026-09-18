@@ -32,6 +32,23 @@ def test_unrelated_tech_matches_nothing():
     assert _detected_stacks(["Cloudflare", "HSTS"], "cloudflare", None) == set()
 
 
+def test_every_stack_key_self_detects():
+    """Regression guard: every _STACK_CHECKS key must actually be
+    reachable via _detected_stacks' substring match against itself --
+    catches a typo'd key that would otherwise silently never fire."""
+    for stack in _STACK_CHECKS:
+        assert _detected_stacks([stack], None, None) == {stack}, stack
+
+
+def test_new_devops_and_cms_stacks_detected():
+    assert _detected_stacks(["Django"], None, None) == {"django"}
+    assert _detected_stacks([], "Werkzeug/2.0 Python/3.9", None) == {"werkzeug"}
+    assert _detected_stacks(["Jenkins"], None, None) == {"jenkins"}
+    assert _detected_stacks(["Elasticsearch"], None, None) == {"elasticsearch"}
+    assert _detected_stacks(["Grafana"], None, None) == {"grafana"}
+    assert _detected_stacks(["Drupal 10"], None, None) == {"drupal"}
+
+
 class _FakeResponse:
     def __init__(self, status_code=404, content=b"not found", text="not found"):
         self.status_code = status_code
@@ -88,3 +105,50 @@ def test_check_host_flags_a_real_wordpress_hit():
     matching = [h for h in hits if h["path"] == "/wp-config.php.bak"]
     assert len(matching) == 1
     assert matching[0]["severity"] == "high"
+
+
+def test_check_host_flags_exposed_werkzeug_debugger():
+    client = MagicMock()
+
+    def fake_get(url, timeout=15, follow_redirects=True):
+        if url.endswith("/console"):
+            return _FakeResponse(status_code=200, content=b"x" * 500, text="Werkzeug Debugger -- Traceback")
+        return _FakeResponse()
+
+    client.get.side_effect = fake_get
+    fingerprint = {"tech": [], "server": "Werkzeug/2.0 Python/3.9", "powered_by": None}
+    with patch("bbhunter.testing.active.time.sleep"):
+        hits = _check_host(client, "example.com", fingerprint=fingerprint)
+
+    matching = [h for h in hits if h["path"] == "/console"]
+    assert len(matching) == 1
+    assert matching[0]["severity"] == "critical"
+
+
+def test_check_host_flags_exposed_jenkins_api():
+    client = MagicMock()
+
+    def fake_get(url, timeout=15, follow_redirects=True):
+        if url.endswith("/api/json"):
+            return _FakeResponse(status_code=200, content=b"x" * 500, text='{"jobs": [], "_class": "hudson.model.Hudson"}')
+        return _FakeResponse()
+
+    client.get.side_effect = fake_get
+    fingerprint = {"tech": ["Jenkins"], "server": None, "powered_by": None}
+    with patch("bbhunter.testing.active.time.sleep"):
+        hits = _check_host(client, "example.com", fingerprint=fingerprint)
+
+    matching = [h for h in hits if h["path"] == "/api/json"]
+    assert len(matching) == 1
+    assert matching[0]["severity"] == "high"
+
+
+def test_new_generic_checks_are_attempted_against_every_host():
+    client = MagicMock()
+    client.get.return_value = _FakeResponse()
+    with patch("bbhunter.testing.active.time.sleep"):
+        _check_host(client, "example.com", fingerprint=None)
+
+    requested_paths = {call.args[0].split("example.com", 1)[-1] for call in client.get.call_args_list}
+    for path in ("/metrics", "/phpmyadmin/", "/adminer.php", "/v2/_catalog"):
+        assert path in requested_paths
