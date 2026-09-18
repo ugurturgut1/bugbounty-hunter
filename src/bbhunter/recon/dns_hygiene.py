@@ -30,9 +30,14 @@ import base64
 import dns.exception
 import dns.resolver
 
-DNS_TIMEOUT_SECONDS = 5.0
+DNS_TIMEOUT_SECONDS = 3.0  # trimmed from 5.0 2026-09-18 -- a real NXDOMAIN/NoAnswer resolves in
+                           # well under a second; this only bounds an unresponsive-resolver wait,
+                           # and it's charged per DKIM selector tried, so it multiplies fast
 
-_DKIM_SELECTOR_CANDIDATES = ("default", "google", "selector1", "selector2", "k1", "dkim", "mail")
+# Trimmed from 7 to the 4 most impactful selectors 2026-09-18 (Google Workspace + Microsoft 365
+# cover the large majority of real domains): each guessed selector that doesn't exist costs one
+# full DNS_TIMEOUT_SECONDS-bounded lookup, charged once per seed host, every recon run.
+_DKIM_SELECTOR_CANDIDATES = ("default", "google", "selector1", "selector2")
 # Rough floor: a 1024-bit RSA SubjectPublicKeyInfo blob base64-decodes to ~162 bytes.
 # Below this is short enough to almost certainly be a sub-1024-bit (weak) key.
 _DKIM_WEAK_KEY_BYTE_THRESHOLD = 150

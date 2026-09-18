@@ -326,7 +326,9 @@ def _request_headers(rules: RulesOfEngagement) -> dict[str, str]:
     return headers
 
 
-TLS_CERT_TIMEOUT_SECONDS = 10
+TLS_CERT_TIMEOUT_SECONDS = 5  # trimmed from 10 2026-09-18 -- a real handshake completes in well under a
+                              # second; this only bounds how long a per-host attempt can hang against an
+                              # unresponsive port, which multiplies fast across dozens of subdomains
 TLS_CERT_SOON_EXPIRING_DAYS = 14
 
 _CERT_END_MARKER = "-----END CERTIFICATE-----"
@@ -822,8 +824,14 @@ def run_passive_recon(
                     continue
                 fingerprints[target_host] = fp
 
-                tls_info = tls_cert_info(target_host)
-                time.sleep(FINGERPRINT_DELAY_SECONDS)
+                # Only worth attempting if we already know this host actually served something
+                # over HTTPS -- a host that fell back to plain HTTP (or only ever answered HTTP)
+                # is a guaranteed TLS_CERT_TIMEOUT_SECONDS-long wasted attempt otherwise, and that
+                # cost multiplies fast across dozens of subdomains.
+                tls_info = None
+                if (fp.get("final_url") or "").startswith("https://"):
+                    tls_info = tls_cert_info(target_host)
+                    time.sleep(FINGERPRINT_DELAY_SECONDS)
                 if tls_info:
                     fp["tls"] = tls_info
                     for hit in tls_findings(target_host, tls_info):

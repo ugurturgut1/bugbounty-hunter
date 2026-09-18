@@ -36,9 +36,10 @@ from bs4 import BeautifulSoup
 from bbhunter.secret_patterns import SECRET_PATTERNS
 
 MAX_JS_FILES_PER_PAGE = 8
-JS_FETCH_TIMEOUT_SECONDS = 15
+JS_FETCH_TIMEOUT_SECONDS = 8  # trimmed from 15 2026-09-18 -- charged per linked JS file (up to 8), a
+                              # dead/unreachable CDN link at the old timeout could cost 2 minutes on its own
 JS_FETCH_MAX_BYTES = 2_000_000  # ~2MB -- enough for basically any real bundle's meaningful content
-SOURCE_MAP_FETCH_TIMEOUT_SECONDS = 15
+SOURCE_MAP_FETCH_TIMEOUT_SECONDS = 8
 
 _SOURCE_MAP_COMMENT_RE = re.compile(r"//[#@]\s*sourceMappingURL=(\S+)")
 _INTERNAL_PATH_RE = re.compile(r'["\'](/api/[a-zA-Z0-9_\-/{}.]{2,80})["\']')
