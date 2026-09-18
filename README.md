@@ -226,7 +226,8 @@ passive recon -> gated active testing -> PoC drafting -> report drafting
 
 ## Vulnerability class coverage
 
-Assessed 2026-09-17, updated 2026-09-18, against OWASP Top 10 2021 (the
+Assessed 2026-09-17, updated 2026-09-18 (twice -- see roadmap phases 1-7
+below), against OWASP Top 10 2021 (the
 current official web edition -- no ratified refresh exists yet, so
 "2025"-named coverage below refers specifically to OWASP's own
 separately-versioned LLM Top 10 2025 and API Security Top 10:2023, not a
@@ -238,19 +239,23 @@ what it covers.
 
 | Class | Coverage | How |
 |---|---|---|
-| A05 Security Misconfiguration | Good | exposed-file checks (now spanning ~25 self-hosted stacks/admin panels, see `_STACK_CHECKS`), missing-headers check, nuclei `misconfig`/`exposure` tags |
+| A05 Security Misconfiguration | Good | exposed-file checks (now spanning ~25 self-hosted stacks/admin panels, see `_STACK_CHECKS`), missing-headers check (now incl. COOP/CORP), weak-but-present-CSP check, nuclei `misconfig`/`exposure` tags |
 | A06 Vulnerable/Outdated Components | Good | NVD CVE-keyword match (version-range aware) + nuclei `cve` tag |
 | CORS misconfiguration | Good | nuclei `cors` tag |
-| Subdomain takeover | Good | nuclei `takeover` tag |
+| Subdomain takeover | Good | nuclei `takeover` tag (HTTP-signature-based) + `recon/dns_hygiene.py`'s `check_dangling_cname` (DNS-level, catches a dead target even if it never responds to HTTP at all -- passive, always on) |
 | JWT weaknesses | Good | nuclei `jwt` tag |
 | GraphQL introspection | Good | nuclei `graphql` tag |
 | SSTI / XXE | Good | nuclei `ssti`/`xxe` tags (signature-based, not blind) |
 | Open redirect | Good | nuclei `redirect` tag |
 | Host header injection | Good | nuclei `host-header` tag |
+| Cache poisoning/deception | Good (added 2026-09-18) | nuclei `cache` tag -- generic + Next.js cache-poisoning detection templates |
 | Prototype pollution | Thin | nuclei `prototype-pollution` tag -- template count is small upstream |
 | A10 SSRF | Partial | nuclei `ssrf` tag (out-of-band/interactsh-based, detection only) |
-| A03 Injection (XSS/SQLi) | Partial | custom single-request reflected-XSS canary + SQL-error-signature checks (`--injection`); no SSTI/XXE beyond nuclei above, no command/LDAP/NoSQL injection |
-| A02 Cryptographic Failures | Thin | HSTS presence only; no TLS/cert weakness testing |
+| A03 Injection (XSS/SQLi/NoSQLi/command) | Partial, broader as of 2026-09-18 | custom single-request reflected-XSS, SQL-error, NoSQL-error, and benign-echo command-injection signature checks (`--injection`, 5 requests/param); no SSTI/XXE beyond nuclei above, no LDAP injection |
+| A02 Cryptographic Failures | Good, up from Thin (2026-09-18) | `recon/passive.py`'s `tls_cert_info`/`tls_findings` (passive, always on: expired/soon-expiring, self-signed, weak SHA-1 signature, hostname not in SAN) + nuclei `ssl` tag (deprecated TLS versions, insecure cipher suites, cert revocation -- neither checked by the openssl-based passive check) |
+| Email spoofing (SPF/DMARC/DKIM misconfig) | Good (heuristic), added 2026-09-18 | `recon/dns_hygiene.py` -- passive, always on. `check_dkim` only ever reports a positive signal (a weak key found at a common selector), never "missing", since a domain's real selector isn't discoverable |
+| Secret/credential leakage (public JS, GitHub) | Good (heuristic), added 2026-09-18 | `recon/js_harvest.py` (passive, always on: hardcoded secrets + exposed source maps in linked JS) and `recon/github_dork.py` (passive, optional -- needs a free `GITHUB_API_TOKEN`) |
+| Cloud storage bucket exposure (S3/GCS/Azure) | Good (heuristic), opt-in, added 2026-09-18 | `testing/cloud_storage.py`, `test-active --cloud-buckets` -- bucket names derived only from the program's own in-scope domains, findings always at "info" severity pending manual ownership verification |
 | A01 Broken Access Control (IDOR) | Partial (manual-input-driven) | `testing/idor.py`, `bbhunter test-idor` -- needs a human-supplied resource URL + two real identities' credentials, see below |
 | A07 Auth Failures | **Missing by design** | guardrails exclude credential brute-forcing/default-login entirely |
 | Business logic / race conditions | **Missing** | not generically automatable |
@@ -398,6 +403,38 @@ OWASP API Security Top 10 2023 coverage and multi-turn LLM jailbreak-chain testi
      driven) doesn't have (e.g. Redis/Memcached/MongoDB's native protocols, Kubernetes' own API server
      rather than an app that happens to run on K8s).
 
+**A third round, 2026-09-18 (user: "build all that's mentioned here in phases... don't stop until
+all of its done"), covering both passive recon (no gate, always on) and active recon (opt-in flags,
+same `permits(ACTIVE_LOW_IMPACT)` gate as everything else) -- 7 sub-phases, each committed and
+pushed separately:**
+8. *(done)* Passive TLS/cert posture (`recon/passive.py`'s `tls_cert_info`/`tls_findings`, one
+   `openssl`-based handshake per fingerprinted host, same graceful-degradation pattern as subfinder/
+   nuclei) + weak-CSP/COOP/CORP header checks in `testing/active.py`. Closed A02's "Thin" rating.
+9. *(done)* Passive DNS hygiene (`recon/dns_hygiene.py`, new `dnspython` dependency): SPF/DMARC
+   misconfig, a conservative DKIM check that only ever reports a positive signal, and dangling-CNAME
+   detection wired in BEFORE the HTTP fingerprint attempt (a dangling target often never answers
+   HTTP at all).
+10. *(done)* Passive JS harvesting (`recon/js_harvest.py`): hardcoded secrets (new shared
+    `bbhunter/secret_patterns.py`, used by this, `testing/ai_safety.py`, and phase 11 below),
+    exposed source maps, and aggregated internal-API-path references in linked JS.
+11. *(done)* Optional passive GitHub code-search dorking (`recon/github_dork.py`, new `GitHubCreds`/
+    `GITHUB_API_TOKEN`): only ever reports a Finding when a real secret pattern matches a returned
+    snippet, since "a repo mentions this domain" alone is far too common to be useful signal.
+12. *(done)* `ssl`/`cache` nuclei tags added to `NUCLEI_TAGS` -- live-verified template-count impact
+    (+48 net after exclusions) before committing.
+13. *(done)* Opt-in S3/GCS/Azure cloud storage bucket exposure check (`testing/cloud_storage.py`,
+    `test-active --cloud-buckets`) -- bucket names derived only from the program's own in-scope
+    domains, findings always at "info" severity pending manual ownership verification, since a
+    same-named bucket can legitimately belong to an unrelated third party.
+14. *(done)* NoSQL-error-signature and benign-echo command-injection probes added to
+    `_check_injection_signals` (`--injection`, now 5 requests/parameter instead of 3).
+
+All of the above stayed within this project's existing guardrails throughout -- nothing in this
+round created a new permission tier, lowered the bar for `approve-active`, or let any heuristic
+self-authorize active testing. The user was explicit about this going in ("I will be the one
+approving any active recon"): the goal was making the tool find more once a human has already said
+yes for a specific program, not changing who gets to say yes.
+
 Longer-term ideas not yet scoped into a phase: broader business-logic/race-condition testing (not
 generically automatable, would need per-program custom logic), stateful (server-side conversation ID)
 multi-turn AI APIs, and TLS/certificate weakness checks for A02.
@@ -439,10 +476,15 @@ uv run bbhunter report <program-key>      # full audit trail: scope/approval sta
 
 `bbhunter recon` and `bbhunter test-active` work fully without any of
 this -- crt.sh, archive.org, NVD, and the plain-GET checks are pure
-Python/HTTP and always on. Installing these three
-[projectdiscovery](https://github.com/projectdiscovery) Go binaries
-widens coverage; every integration point checks for the binary first
-and silently falls back (or skips that source/flag) if it's missing:
+Python/HTTP and always on. `dnspython` (SPF/DMARC/DKIM/dangling-CNAME
+checks) is a regular pip dependency, already installed by `uv sync`,
+nothing extra to set up. `openssl` (TLS cert posture checks) is
+virtually always present on Linux/macOS already; both are skipped
+silently, same as everything below, if genuinely absent. Installing
+these three [projectdiscovery](https://github.com/projectdiscovery) Go
+binaries widens coverage; every integration point checks for the binary
+first and silently falls back (or skips that source/flag) if it's
+missing:
 
 ```bash
 go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest  # extra passive subdomain source, merged with crt.sh + Wayback
@@ -452,6 +494,11 @@ nuclei -update-templates
 # go install puts binaries in `go env GOPATH`/bin (~/go/bin by default) --
 # make sure that's on PATH (`export PATH="$HOME/go/bin:$PATH"`)
 ```
+
+One more optional source, not a binary: `recon/github_dork.py`'s
+passive GitHub code-search recon needs a free GitHub personal access
+token (no scopes required) in `.env` as `GITHUB_API_TOKEN` -- see
+`.env.example`. Skipped silently if absent, same as everything else here.
 
 ## Full pipeline, one finding at a time
 

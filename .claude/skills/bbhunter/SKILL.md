@@ -68,16 +68,37 @@ this skill must not make that decision:
 If the user is ambiguous, unsure, or the policy is silent: do not
 approve. Passive-only is always a safe default to fall back to.
 
-`test-active` has two opt-in flags, `--injection` (single-request
-reflected-XSS/SQL-error-signature probes) and `--nuclei` (curated
-misconfig/exposure/tech/cve/cors/ssrf/jwt/graphql/takeover/ssti/xxe/
-host-header/prototype-pollution/redirect nuclei templates, rce/sqli/dos/
-intrusive/fuzz/bruteforce/hijack/default-login/authentication-bypass tags
-excluded). Both still run only under the same `ACTIVE_LOW_IMPACT`
-approval from step 3.2 above -- they are not a separate gate to skip.
-Only pass them when the user has said so in this conversation (e.g. "yes,
-include the injection checks too"); never add them on your own
-initiative just because they're available.
+`test-active` has three opt-in flags, `--injection` (single-request
+reflected-XSS/SQL-error/NoSQL-error/benign-echo-command-injection
+signature probes, 5 requests per parameter), `--nuclei` (curated
+misconfig/exposure/tech/cve/ssl/cache/cors/ssrf/jwt/graphql/takeover/
+ssti/xxe/host-header/prototype-pollution/redirect nuclei templates,
+rce/sqli/dos/intrusive/fuzz/bruteforce/hijack/default-login/
+authentication-bypass tags excluded), and `--cloud-buckets` (checks a
+small set of S3/GCS/Azure bucket-name variations derived from the
+program's own in-scope domains -- every request goes to the cloud
+provider's infrastructure, not the target's, and findings always land
+at "info" severity pending manual ownership verification since a
+same-named bucket can belong to an unrelated third party). All three
+still run only under the same `ACTIVE_LOW_IMPACT` approval from step 3.2
+above -- none is a separate gate to skip. Only pass them when the user
+has said so in this conversation (e.g. "yes, include the injection
+checks too"); never add them on your own initiative just because
+they're available.
+
+### Passive recon now covers more than subdomains/CVEs
+
+`bbhunter recon` (no approval needed, always safe) also now runs: TLS
+certificate posture (expired/self-signed/weak-signature/hostname-not-
+in-SAN, via the `openssl` binary), SPF/DMARC/DKIM email-spoofing
+misconfig and dangling-CNAME checks (via `dnspython`, a hard dependency
+now), and JS harvesting (hardcoded secrets, exposed source maps,
+internal-API-path references in linked JS). None of this needs a
+conversation gate -- it's the same passive floor as subdomain enum and
+CVE-keyword matching, just more of it. An optional GitHub code-search
+source (`recon/github_dork.py`) also runs automatically if the user has
+set `GITHUB_API_TOKEN` in `.env` -- skipped silently otherwise, nothing
+to ask permission for either way since it's still passive.
 
 ### AI/LLM endpoint testing (`bbhunter test-ai`) -- its own approval, not covered by step 3
 
