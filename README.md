@@ -31,24 +31,31 @@ submit.
 5. Never automate against a program that requires prior written
    authorization (`requires_authorization_request`) until that
    authorization has actually been granted and recorded.
-6. **The `--injection` and `--nuclei` flags on `test-active` are not a
-   separate or higher permission tier.** Both still require
-   `RulesOfEngagement.permits(TestType.ACTIVE_LOW_IMPACT)`, i.e. the same
-   human-recorded `approve-active` decision as every other active check
-   -- `--injection`/`--nuclei` only choose whether to *include* that
-   request shape, they grant no new access on their own. Both stay
-   within the "safe XSS/SQLi probes... no data modification" scope
+6. **The `--injection`, `--nuclei`, and `--cloud-buckets` flags on
+   `test-active` are not a separate or higher permission tier.** All
+   three still require `RulesOfEngagement.permits(TestType.ACTIVE_LOW_IMPACT)`,
+   i.e. the same human-recorded `approve-active` decision as every other
+   active check -- they only choose whether to *include* that request
+   shape, they grant no new access on their own. All three stay within
+   the "safe XSS/SQLi probes... no data modification" scope
    `TestType.ACTIVE_LOW_IMPACT` already defines in `models.py`:
    `--injection` sends at most one canary/signature per query parameter
-   (no boolean/time-based blind techniques, no extraction, no follow-
-   through past detection) and `--nuclei` runs only
-   misconfig/exposure/tech/cve/cors/ssrf/jwt/graphql/takeover/ssti/xxe/
-   host-header/prototype-pollution/redirect-tagged templates, with
-   rce/sqli/dos/intrusive/fuzz/bruteforce/hijack/default-login/
+   per class -- reflected-XSS, SQL-error, NoSQL-error, and a benign
+   `echo`-only command-injection canary (no boolean/time-based blind
+   techniques, no extraction, no follow-through past detection, no
+   command beyond a no-op `echo`) -- `--nuclei` runs only
+   misconfig/exposure/tech/cve/ssl/cache/cors/ssrf/jwt/graphql/takeover/
+   ssti/xxe/host-header/prototype-pollution/redirect-tagged templates,
+   with rce/sqli/dos/intrusive/fuzz/bruteforce/hijack/default-login/
    authentication-bypass tags explicitly excluded, rate-limited to 1
-   req/s. Neither is ever turned on by the `/bbhunter` skill on its own
-   judgment -- see its SKILL.md. See "Vulnerability class coverage"
-   below for what this does and doesn't cover against OWASP Top 10 and
+   req/s, and `--cloud-buckets` checks a small, fixed set of S3/GCS/
+   Azure bucket-name variations derived only from the program's own
+   in-scope domains (never an invented/unrelated name) for a publicly-
+   listable bucket, every finding landing at "info" severity with an
+   explicit ownership-verification caveat. None is ever turned on by the
+   `/bbhunter` skill on its own judgment -- see its SKILL.md. See
+   "Vulnerability class coverage" below for what this does and doesn't
+   cover against OWASP Top 10 and
    common bug bounty vuln classes.
 7. **AI/LLM safety probes (`bbhunter test-ai`) have no passive-floor
    exception.** Every other TestType has some request-free/always-allowed

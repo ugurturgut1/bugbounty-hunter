@@ -105,6 +105,69 @@ def test_sql_signature_already_present_in_baseline_is_not_flagged():
     assert [h for h in hits if h["kind"] == "sql-error-signature"] == []
 
 
+def test_nosql_error_signature_flagged_only_when_absent_from_baseline():
+    client = MagicMock()
+
+    def fake_get(url, timeout=15, follow_redirects=True):
+        if "%27%7C%7C%27" in url or "'||'1'=='1" in url:
+            return _FakeResponse("MongoError: unterminated string in JSON")
+        return _FakeResponse("normal search results page")
+
+    client.get.side_effect = fake_get
+    with patch("bbhunter.testing.active.time.sleep"):
+        hits = _check_injection_signals(client, "https://example.com/search?q=x")
+
+    nosqli_hits = [h for h in hits if h["kind"] == "nosql-error-signature"]
+    assert len(nosqli_hits) == 1
+    assert "mongoerror" in nosqli_hits[0]["evidence"].lower()
+
+
+def test_nosql_signature_already_present_in_baseline_is_not_flagged():
+    client = MagicMock()
+    client.get.return_value = _FakeResponse("docs page that always mentions MongoError for some reason")
+    with patch("bbhunter.testing.active.time.sleep"):
+        hits = _check_injection_signals(client, "https://example.com/search?q=x")
+    assert [h for h in hits if h["kind"] == "nosql-error-signature"] == []
+
+
+def test_command_injection_flagged_when_marker_echoed_back():
+    client = MagicMock()
+
+    def fake_get(url, timeout=15, follow_redirects=True):
+        from urllib.parse import parse_qsl, urlsplit
+        value = dict(parse_qsl(urlsplit(url).query)).get("q", "")
+        if "BBHCMD" in value:
+            marker = value.split("echo ", 1)[-1].split(" ")[0]
+            return _FakeResponse(f"command output: {marker}\n")
+        return _FakeResponse("normal search results page")
+
+    client.get.side_effect = fake_get
+    with patch("bbhunter.testing.active.time.sleep"):
+        hits = _check_injection_signals(client, "https://example.com/search?q=x")
+
+    cmdi_hits = [h for h in hits if h["kind"] == "command-injection-candidate"]
+    assert len(cmdi_hits) == 1
+    assert cmdi_hits[0]["severity"] == "critical"
+
+
+def test_command_injection_no_hit_when_marker_not_echoed():
+    client = MagicMock()
+    client.get.return_value = _FakeResponse("nothing echoed back at all")
+    with patch("bbhunter.testing.active.time.sleep"):
+        hits = _check_injection_signals(client, "https://example.com/search?q=x")
+    assert [h for h in hits if h["kind"] == "command-injection-candidate"] == []
+
+
+def test_check_injection_signals_makes_five_requests_per_parameter():
+    """baseline + xss + sqli + nosqli + cmdi -- one parameter should
+    cost exactly 5 requests, never more."""
+    client = MagicMock()
+    client.get.return_value = _FakeResponse("nothing interesting")
+    with patch("bbhunter.testing.active.time.sleep"):
+        _check_injection_signals(client, "https://example.com/search?q=x")
+    assert client.get.call_count == 5
+
+
 def test_check_injection_signals_returns_empty_for_url_with_no_query_params():
     client = MagicMock()
     hits = _check_injection_signals(client, "https://example.com/no-params-here")

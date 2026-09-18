@@ -4,12 +4,16 @@ The original checks here are read-only misconfig/exposed-file probes --
 no injection payloads, no state-changing requests. A second, opt-in
 class added later (`injection=True`) still only ever sends single-request,
 signature-based detection probes (an HTML-special-char canary for
-reflected XSS, a single quote for a SQL-error signature) against
-Wayback-discovered URLs that already carry query parameters -- never a
+reflected XSS, a single quote for a SQL-error signature, a JS-string-
+breakout probe for a NoSQL/driver-error signature, and a benign
+`echo <marker>` shell-canary for command injection) against Wayback-
+discovered URLs that already carry query parameters -- never a
 boolean/time-based blind technique, never more than one marker per
-request, never any follow-through past detection. This is the
-"safe XSS/SQLi probes" class TestType.ACTIVE_LOW_IMPACT's own docstring
-in models.py already scopes for -- it is not a new permission level.
+request per class, never any follow-through past detection (the
+command-injection probe only ever runs a no-op `echo`, nothing that
+reads, writes, or changes anything). This is the "safe XSS/SQLi probes"
+class TestType.ACTIVE_LOW_IMPACT's own docstring in models.py already
+scopes for -- it is not a new permission level.
 
 Everything in this module only runs when
 RulesOfEngagement.permits(TestType.ACTIVE_LOW_IMPACT) is True, which
@@ -107,7 +111,7 @@ NUCLEI_RUN_TIMEOUT_SECONDS = 900  # whole-run cap across every host handed to a 
 REQUEST_DELAY_SECONDS = 1.5
 MAX_HOSTS_PER_PROGRAM = 40
 MAX_SUBDOMAINS_PER_WILDCARD_SEED = 5  # keeps one large wildcard seed from eating the whole per-program budget
-MAX_INJECTION_URLS_PER_PROGRAM = 30  # each URL costs 3 requests (baseline + xss + sqli probe) at REQUEST_DELAY_SECONDS pacing
+MAX_INJECTION_URLS_PER_PROGRAM = 30  # each URL costs 5 requests (baseline + xss + sqli + nosqli + cmdi probe) at REQUEST_DELAY_SECONDS pacing
 
 _SQL_ERROR_SIGNATURES = [
     "sql syntax",
@@ -124,6 +128,20 @@ _SQL_ERROR_SIGNATURES = [
     "syntax error in sql statement",
     "npgsql.postgresexception",
     "system.data.sqlclient.sqlexception",
+]
+
+# NoSQL drivers/ODMs surface a JS-eval or query-parse error rather than a SQL
+# dialect error -- these come from MongoDB's $where JS evaluator, the driver
+# itself, or Mongoose's schema validation, triggered by the same "break out of
+# the value's string context" probe idea as the SQLi single-quote check above.
+_NOSQL_ERROR_SIGNATURES = [
+    "mongoerror",
+    "mongoserverexception",
+    "mongoserverselectionerror",
+    "bsonerror",
+    "syntaxerror: unexpected token",
+    "unterminated string in json",
+    "e11000 duplicate key",
 ]
 
 # path -> (title, signature substrings that must appear in the body for a real hit, severity)
@@ -496,8 +514,9 @@ def _replace_param(parts, params: list[tuple[str, str]], index: int, new_value: 
 
 def _check_injection_signals(client: httpx.Client, url: str) -> list[dict]:
     """One baseline request plus, per query parameter, one reflected-XSS
-    probe and one SQL-error-signature probe -- three requests total per
-    parameter-bearing path, never more. Returns a list of hit dicts;
+    probe, one SQL-error-signature probe, one NoSQL-error-signature
+    probe, and one command-injection canary probe -- five requests total
+    per parameter-bearing path, never more. Returns a list of hit dicts;
     empty if nothing fired or the URL couldn't be parsed/fetched."""
     hits: list[dict] = []
     parts = urlsplit(url)
@@ -560,6 +579,56 @@ def _check_injection_signals(client: httpx.Client, url: str) -> list[dict]:
                         ),
                     }
                 )
+
+        nosqli_url = _replace_param(parts, params, i, value + "'||'1'=='1")
+        try:
+            resp = client.get(nosqli_url, timeout=15, follow_redirects=True)
+        except httpx.HTTPError:
+            resp = None
+        time.sleep(REQUEST_DELAY_SECONDS)
+        if resp is not None:
+            body_lower = resp.text.lower()
+            sig = next((s for s in _NOSQL_ERROR_SIGNATURES if s in body_lower and s not in baseline_body), None)
+            if sig:
+                hits.append(
+                    {
+                        "kind": "nosql-error-signature",
+                        "param": name,
+                        "url": str(resp.url),
+                        "severity": "high",
+                        "evidence": (
+                            f"GET {resp.url} -> appending a JS-string-breakout probe to parameter '{name}' "
+                            f"produced NoSQL/driver-error signature '{sig}' in the response body, absent "
+                            "from the unmutated baseline request. Signature-only probe, no extraction "
+                            "attempted; verify manually and check whether the program's policy permits "
+                            "going further."
+                        ),
+                    }
+                )
+
+        cmdi_marker = f"BBHCMD{secrets.token_hex(4)}"
+        cmdi_url = _replace_param(parts, params, i, f"{value}; echo {cmdi_marker} #")
+        try:
+            resp = client.get(cmdi_url, timeout=15, follow_redirects=True)
+        except httpx.HTTPError:
+            resp = None
+        time.sleep(REQUEST_DELAY_SECONDS)
+        if resp is not None and cmdi_marker in resp.text:
+            hits.append(
+                {
+                    "kind": "command-injection-candidate",
+                    "param": name,
+                    "url": str(resp.url),
+                    "severity": "critical",
+                    "evidence": (
+                        f"GET {resp.url} -> parameter '{name}' echoed marker '{cmdi_marker}' back verbatim "
+                        "after appending a single benign shell command-separator probe "
+                        f"('; echo {cmdi_marker} #'). Only a no-op `echo` was ever attempted -- verify "
+                        "manually before treating as confirmed, and never escalate to a more impactful "
+                        "command without the program's explicit go-ahead."
+                    ),
+                }
+            )
 
     return hits
 

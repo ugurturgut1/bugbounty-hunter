@@ -429,9 +429,10 @@ def test_active_cmd(
     key: str,
     injection: bool = typer.Option(
         False, "--injection",
-        help="Also run single-request, signature-based reflected-XSS and SQL-error probes against "
-             "Wayback-discovered param URLs. Same permits(ACTIVE_LOW_IMPACT) gate as everything else "
-             "here -- this flag only decides whether to include that check class, it grants no new access.",
+        help="Also run single-request, signature-based reflected-XSS, SQL-error, NoSQL-error, and "
+             "command-injection (benign echo-canary only) probes against Wayback-discovered param URLs. "
+             "Same permits(ACTIVE_LOW_IMPACT) gate as everything else here -- this flag only decides "
+             "whether to include that check class, it grants no new access.",
     ),
     nuclei: bool = typer.Option(
         False, "--nuclei",
