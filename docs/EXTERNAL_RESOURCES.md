@@ -67,6 +67,31 @@ philosophy as the checks already there:
    canary matching this project's existing command-injection probe
    philosophy exactly.
 
+A separate, higher-risk tier (README.md Guardrail 9, added 2026-09-20 at
+the user's explicit request, each with its own `TestType` and its own
+`approve-active --i-understand-the-risk` decision -- see cli.py's
+`_RISK_WARNINGS`):
+
+7. **ffuf + arjun** (`testing/aggressive_discovery.py`,
+   `bbhunter test-discovery`, `TestType.AGGRESSIVE_DISCOVERY`) --
+   awesome-bugbounty-tools § Recon → Content Discovery / Parameters.
+8. **sqlmap** (`testing/sqli_exploit.py`, `bbhunter test-sqli`,
+   `TestType.SQLI_EXPLOITATION`) -- awesome-bugbounty-tools §
+   Miscellaneous → Vulnerability Scanners (sqlmap itself isn't in that
+   list by name, but is the canonical tool for this category); real
+   confirmation/bounded extraction past bugbounty-cheatsheet's own
+   `sqli.md` (which is otherwise just external blog links, no unique
+   technique worth distilling into `VULN_TECHNIQUE_NOTES.md`).
+9. **A hand-written bounded credential tester** (`testing/credential_testing.py`,
+   `bbhunter test-credentials`, `TestType.CREDENTIAL_TESTING`) -- NOT
+   awesome-bugbounty-tools' listed brute-force tools (`hydra`-style),
+   deliberately: this project only ever tests a small, explicit,
+   user-supplied credential list, never a wordlist/username-list brute
+   force. See the risk warning cli.py prints for why.
+10. **commix** (`testing/exploit_framework.py`, `bbhunter test-exploit`,
+    `TestType.EXPLOITATION_FRAMEWORK`) -- awesome-bugbounty-tools §
+    Exploitation → Command Injection.
+
 Nothing else from these three was pulled directly into automated code --
 see the per-class mapping below for why.
 
@@ -79,7 +104,7 @@ manual-input-driven, this is where a human should actually go.
 | Class | bbhunter coverage | Manual toolbox (awesome-bugbounty-tools § ) | Further reading (Awesome-Bugbounty-Writeups) |
 |---|---|---|---|
 | Subdomain enum / recon | Good (crt.sh + Certspotter + subfinder + assetfinder + Wayback, dnsx-filtered) | Recon → Subdomain Enumeration, Content Discovery, Screenshots | -- |
-| A03 Injection (XSS/SQLi/command) | Partial (single-request signature probes only) | Exploitation → XSS Injection, SQL Injection, Command Injection | Cross Site Scripting (XSS), SQL injection |
+| A03 Injection (XSS/SQLi/command) | Partial (signature) + opt-in real confirmation for SQLi (`test-sqli`) and command injection (`test-exploit`) | Exploitation → XSS Injection, SQL Injection, Command Injection | Cross Site Scripting (XSS), SQL injection |
 | CRLF injection / response splitting | Good (added 2026-09-20, `--injection`) | Exploitation → CRLF Injection | -- |
 | RCE -- Shellshock (CVE-2014-6271) | Good (added 2026-09-20, `--injection`) | Exploitation → Command Injection | Remote Code Execution (RCE) |
 | A01/API1 IDOR / BOLA | Partial, manual-input-driven | Exploitation → Insecure Direct Object References | Insecure Direct Object Reference (IDOR) |
@@ -91,25 +116,38 @@ manual-input-driven, this is where a human should actually go.
 | SSTI | Good (nuclei `ssti` tag, signature-based) | Exploitation → Template Injection | -- |
 | LFI / path traversal | **Not automated** (any real traversal probe risks reading a file) | Exploitation → Directory Traversal, File Inclusion | Local File Inclusion (LFI) |
 | CSV/formula injection | **Not automated** (client-side risk, not server-probable) | -- | -- |
-| A07 Auth bypass / brute force | **Missing by design** (guardrail: no credential brute-forcing) | Exploitation → CSRF | Authentication Bypass, 2FA Related issues |
+| A07 Auth bypass / brute force | Open-ended brute-forcing **Missing by design**; bounded credential testing opt-in (`test-credentials`) | Exploitation → CSRF | Authentication Bypass, 2FA Related issues |
+| Content discovery / hidden parameters | Opt-in (`test-discovery`, ffuf + arjun) | Recon → Content Discovery, Parameters, Fuzzing | -- |
 | Business logic / race conditions | **Missing** (not generically automatable) | Exploitation → Race Condition | Race Condition |
 | Secret/credential leakage | Good (`js_harvest.py`, `github_dork.py`) | Recon → Links (LinkFinder-style JS scanners), Miscellaneous → Secrets, Git | -- |
 | Cloud storage buckets | Good, opt-in (`testing/cloud_storage.py`) | Miscellaneous → Buckets | -- |
 | JWT weaknesses | Good (nuclei `jwt` tag) | Miscellaneous → JSON Web Token | -- |
 | GraphQL introspection | Good (nuclei `graphql` tag) | Exploitation → GraphQL Injection | -- |
 | Clickjacking | Not covered | -- | Clickjacking (UI Redressing Attack) |
-| RCE (post-exploitation, other than Shellshock) | **Out of scope by guardrail** (no follow-through past detection) | Exploitation → Insecure Deserialization, File Inclusion | Remote Code Execution (RCE) |
+| RCE (real confirmation, other than Shellshock) | Opt-in, added 2026-09-20 (`test-exploit`, commix, single benign `--os-cmd echo` only) | Exploitation → Insecure Deserialization, File Inclusion | Remote Code Execution (RCE) |
 
-## Why the rest stays a human reference, not code
+## Why the rest still stays a human reference, not code
 
-The bulk of awesome-bugbounty-tools (fuzzers, brute-forcers, exploitation
-frameworks, WAF-evasion tooling) and of bugbounty-cheatsheet's per-class
-pages (raw XSS/SQLi/SSTI payload lists) is exactly the class of technique
-README.md's guardrails keep this project away from automating: no
-boolean/time-based blind injection, no brute-forcing, no follow-through
-past detection, no state-changing requests outside the one deliberate
-`test-mass-assignment` exception. Those stay useful as a human's own
-toolbox once `bbhunter` has flagged a candidate and the human is doing
-manual verification/exploitation themselves -- which is also exactly when
-Awesome-Bugbounty-Writeups' real examples are worth reading, and why this
-file exists as reference material instead of another dependency.
+Even after the higher-risk tier above, most of awesome-bugbounty-tools
+(WAF-evasion tooling, request-smuggling/deserialization exploit
+generators like `ysoserial`, full wordlist-based username/password
+brute-forcers like `hydra`) and most of bugbounty-cheatsheet's raw
+XSS/SQLi/SSTI payload lists stay out, on purpose:
+- Anything that would mean generating/sending a real, unbounded exploit
+  payload (persistent shells, `--os-shell`, deserialization RCE gadget
+  chains) rather than a single bounded confirmation.
+- Anything that means open-ended guessing at scale against real user
+  accounts (`hydra`-style brute-forcing) -- this project's own
+  `credential_testing.py` deliberately only tests a small, explicit list
+  the user already has, never a wordlist.
+- LFI/path-traversal and XSLT/CSV-injection payload technique --
+  reading a real file or executing a real formula-injection payload has
+  no bounded "confirm only" middle ground the way sqlmap's `--banner`
+  or commix's single `--os-cmd echo` do.
+
+Those stay useful as a human's own toolbox once `bbhunter` has flagged a
+candidate and the human is doing manual verification/exploitation
+themselves beyond what even the higher-risk tier automates -- which is
+also exactly when Awesome-Bugbounty-Writeups' real examples are worth
+reading, and why this file exists as reference material instead of
+another dependency.

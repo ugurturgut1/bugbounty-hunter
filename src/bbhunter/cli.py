@@ -22,9 +22,13 @@ from bbhunter.reporting import (
     submit_report,
 )
 from bbhunter.testing import run_active_checks
+from bbhunter.testing.aggressive_discovery import run_aggressive_discovery
 from bbhunter.testing.ai_safety import run_ai_safety_probes
+from bbhunter.testing.credential_testing import MAX_CREDENTIALS_PER_RUN, run_credential_test
+from bbhunter.testing.exploit_framework import run_exploit_framework_check
 from bbhunter.testing.idor import run_bfla_check, run_idor_check
 from bbhunter.testing.mass_assignment import run_mass_assignment_check
+from bbhunter.testing.sqli_exploit import SQLMAP_DUMP_ROW_LIMIT, run_sqli_exploitation
 from bbhunter.state import (
     get_ai_endpoint,
     get_finding,
@@ -208,11 +212,54 @@ def review_rules_cmd(key: str):
         console.print("[yellow]Not yet human-reviewed.[/yellow] Use `bbhunter approve-active` to record a decision.")
 
 
+_RISK_WARNINGS: dict[TestType, str] = {
+    TestType.AGGRESSIVE_DISCOVERY: (
+        "Content-discovery/parameter fuzzing sends a HIGH VOLUME of requests (hundreds-thousands) -- "
+        "unlike every other check in this project (single-request/low-volume). Confirm the policy's "
+        "rate-limit and testing-hours notes are compatible with that volume, and that 'automated "
+        "scanners' language in the policy actually covers high-volume fuzzing, not just occasional "
+        "low-rate requests."
+    ),
+    TestType.SQLI_EXPLOITATION: (
+        "sqlmap can extract REAL DATA from the target's database once run past confirmation mode. "
+        "Pulling more than the minimum needed to prove impact (e.g. current DB name, banner) may "
+        "itself violate a program's data-handling policy even when SQLi itself is in scope. Confirm "
+        "the policy explicitly permits extraction (not just detection), and that you will handle any "
+        "extracted data per the program's disclosure requirements -- delete it after reporting, never "
+        "keep or share it beyond what the report needs."
+    ),
+    TestType.CREDENTIAL_TESTING: (
+        "Login/credential testing is one of the MOST COMMONLY EXPLICITLY PROHIBITED techniques across "
+        "bug bounty programs, even ones that otherwise welcome automated scanning -- it risks locking "
+        "out real user accounts (a denial of service to actual users, not just the target company). "
+        "This project only ever tests a small, explicit credential list you supply yourself -- never an "
+        "open-ended wordlist brute force. Confirm the policy explicitly names credential/login testing "
+        "as permitted (not just 'active testing' in general), and that every credential you're about to "
+        "test is either your own test account or one the program has explicitly provided."
+    ),
+    TestType.EXPLOITATION_FRAMEWORK: (
+        "This tier aims to ACTUALLY confirm command execution (a real, minimal command like `id`/"
+        "`whoami`), not just a benign detection signature -- carrying real legal/operational risk even "
+        "under an authorized program, since a real exploit chain means real access to potentially "
+        "sensitive systems. Confirm the policy explicitly permits proof-of-concept exploitation to this "
+        "depth. Keep any interaction to the absolute minimum needed to prove impact, and stop "
+        "immediately and report if you gain more access than expected -- never escalate, pivot, or "
+        "leave anything persistent on the target."
+    ),
+}
+
+
 @app.command(name="approve-active")
 def approve_active_cmd(
     key: str,
     test_types: list[str] = typer.Option(..., "--test-type", help="TestType(s) to allow, e.g. active_low_impact"),
     note: str = typer.Option(..., "--note", help="Why -- cite the specific policy language that justifies this"),
+    i_understand_the_risk: bool = typer.Option(
+        False, "--i-understand-the-risk",
+        help="Required in addition to --note for any of the higher-risk tiers (aggressive_discovery, "
+             "sqli_exploitation, credential_testing, exploitation_framework) -- run once without it first "
+             "to see the specific risk warning for what you're about to approve.",
+    ),
 ):
     """Record an explicit human decision that a program's policy allows
     active testing. This is the only way RulesOfEngagement.confidence
@@ -227,6 +274,19 @@ def approve_active_cmd(
         parsed_types = {TestType(t) for t in test_types}
     except ValueError as e:
         console.print(f"[red]invalid test type[/red]: {e}. Valid: {[t.value for t in TestType]}")
+        raise typer.Exit(1)
+
+    risky = parsed_types & set(_RISK_WARNINGS)
+    if risky and not i_understand_the_risk:
+        console.print(f"[red]stopping before recording approval for: {sorted(t.value for t in risky)}[/red]")
+        for t in sorted(risky, key=lambda t: t.value):
+            console.print(f"\n[bold red]RISK[/bold red] ({t.value}):")
+            console.print(f"  {_RISK_WARNINGS[t]}")
+        console.print(
+            "\n[yellow]Re-run this exact command with --i-understand-the-risk once you've confirmed the "
+            "policy text actually covers this specific technique, not just 'automated testing' in "
+            "general.[/yellow]"
+        )
         raise typer.Exit(1)
 
     program.rules.human_reviewed = True
@@ -857,6 +917,182 @@ def test_mass_assignment_cmd(
     else:
         console.print("[green]no candidate[/green] -- the field was rejected, didn't stick, or the baseline "
                        "request itself didn't succeed (check --owner-header/the URL)")
+
+
+@app.command(name="test-discovery")
+def test_discovery_cmd(key: str):
+    """High-volume content discovery (`ffuf`) + hidden-parameter fuzzing
+    (`arjun`) -- hundreds to low-thousands of requests, unlike every
+    other check in this project. Requires its own
+    `approve-active --test-type aggressive_discovery --i-understand-the-risk`
+    decision, separate from every other active-testing tier."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+
+    if not program.rules.permits(TestType.AGGRESSIVE_DISCOVERY):
+        console.print(
+            f"[red]blocked[/red]: {key} does not permit aggressive discovery. Run `bbhunter review-rules` "
+            "then `bbhunter approve-active --test-type aggressive_discovery --i-understand-the-risk "
+            "--note \"...\"` if the policy actually allows high-volume automated fuzzing -- this is "
+            "separate from active_low_impact approval."
+        )
+        raise typer.Exit(1)
+
+    recon_result = get_recon_result(key)
+    console.print(f"[yellow]warning[/yellow]: this sends hundreds-thousands of requests to {key}'s in-scope hosts...")
+    new_findings = run_aggressive_discovery(program, recon_result)
+    for finding in new_findings:
+        upsert_finding(finding)
+    _log_test_run(key, TestType.AGGRESSIVE_DISCOVERY, len(new_findings), "ffuf content discovery + arjun param fuzzing")
+    if new_findings:
+        console.print(f"[red]{len(new_findings)} candidate(s) found[/red] -- see `bbhunter findings`")
+    else:
+        console.print("[green]no candidates[/green] (or ffuf/arjun aren't installed -- see README.md Setup)")
+
+
+@app.command(name="test-sqli")
+def test_sqli_cmd(
+    key: str,
+    url: str = typer.Option(..., "--url", help="A parameter-bearing URL to run sqlmap against, e.g. https://target/search?q=1"),
+    dump: bool = typer.Option(
+        False, "--dump",
+        help=f"Also extract up to {SQLMAP_DUMP_ROW_LIMIT} row(s) of real data (sqlmap --dump, capped). "
+             "Without this flag, sqlmap only confirms the injection + pulls the DB banner/current-db name -- "
+             "no application data is extracted.",
+    ),
+):
+    """sqlmap-driven confirmation (and, with --dump, bounded extraction)
+    of a SQL injection -- past `test-active --injection`'s own single-
+    quote signature probe. Requires its own
+    `approve-active --test-type sqli_exploitation --i-understand-the-risk`
+    decision."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+
+    if not program.rules.permits(TestType.SQLI_EXPLOITATION):
+        console.print(
+            f"[red]blocked[/red]: {key} does not permit SQLi exploitation. Run `bbhunter review-rules` then "
+            "`bbhunter approve-active --test-type sqli_exploitation --i-understand-the-risk --note \"...\"` "
+            "if the policy actually allows this -- separate from active_low_impact approval."
+        )
+        raise typer.Exit(1)
+
+    console.print(f"[yellow]warning[/yellow]: running sqlmap against {url}{' with --dump' if dump else ''}...")
+    new_findings = run_sqli_exploitation(program, url, dump=dump)
+    for finding in new_findings:
+        upsert_finding(finding)
+    _log_test_run(key, TestType.SQLI_EXPLOITATION, len(new_findings), f"sqlmap against {url}" + (" (--dump)" if dump else ""))
+    if new_findings:
+        console.print("[red]confirmed[/red] -- see `bbhunter findings`, read the evidence before doing anything else")
+    else:
+        console.print("[green]nothing confirmed[/green] (or sqlmap isn't installed -- see README.md Setup)")
+
+
+@app.command(name="test-credentials")
+def test_credentials_cmd(
+    key: str,
+    login_url: str = typer.Option(..., "--login-url", help="The login endpoint to POST credentials to"),
+    username_field: str = typer.Option(..., "--username-field", help="Form field name for the username, e.g. 'email'"),
+    password_field: str = typer.Option(..., "--password-field", help="Form field name for the password"),
+    credential: list[str] = typer.Option(
+        ..., "--credential",
+        help="One 'username:password' pair to test, repeatable, capped at "
+             f"{MAX_CREDENTIALS_PER_RUN}. Must be your own test account(s) or ones the program explicitly "
+             "provided -- never invented/guessed.",
+    ),
+    success_signature: str | None = typer.Option(
+        None, "--success-signature", help="A string that only appears on a successful-login response, e.g. 'dashboard'"
+    ),
+    failure_signature: str | None = typer.Option(
+        None, "--failure-signature", help="A string that only appears on a failed-login response, e.g. 'invalid password'"
+    ),
+):
+    """Tests a small, explicit credential list against a login endpoint
+    -- never an open-ended wordlist brute force. Requires its own
+    `approve-active --test-type credential_testing --i-understand-the-risk`
+    decision. Stops immediately on any lockout/rate-limit signal."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+
+    if not program.rules.permits(TestType.CREDENTIAL_TESTING):
+        console.print(
+            f"[red]blocked[/red]: {key} does not permit credential testing. Run `bbhunter review-rules` then "
+            "`bbhunter approve-active --test-type credential_testing --i-understand-the-risk --note \"...\"` "
+            "if the policy explicitly names credential/login testing as permitted."
+        )
+        raise typer.Exit(1)
+
+    try:
+        pairs = []
+        for c in credential:
+            if ":" not in c:
+                raise typer.BadParameter(f"expected 'username:password', got {c!r}")
+            username, _, password = c.partition(":")
+            pairs.append((username, password))
+    except typer.BadParameter as e:
+        console.print(f"[red]invalid --credential[/red]: {e}")
+        raise typer.Exit(1)
+
+    console.print(f"[yellow]warning[/yellow]: testing {len(pairs)} credential pair(s) against {login_url}...")
+    try:
+        new_findings = run_credential_test(
+            program, login_url, username_field, password_field, pairs,
+            success_signature=success_signature, failure_signature=failure_signature,
+        )
+    except ValueError as e:
+        console.print(f"[red]refused[/red]: {e}")
+        raise typer.Exit(1)
+    for finding in new_findings:
+        upsert_finding(finding)
+    _log_test_run(key, TestType.CREDENTIAL_TESTING, len(new_findings), f"credential test on {login_url} ({len(pairs)} pair(s))")
+    if new_findings:
+        console.print("[red]result(s) found[/red] -- see `bbhunter findings`, verify manually before drafting a PoC")
+    else:
+        console.print("[green]no hits[/green] -- none of the tested credentials looked successful")
+
+
+@app.command(name="test-exploit")
+def test_exploit_cmd(
+    key: str,
+    url: str = typer.Option(..., "--url", help="A parameter-bearing URL to run commix against, e.g. https://target/ping?host=1"),
+):
+    """commix-driven command-execution confirmation -- a single benign
+    `echo <marker>` via `--os-cmd`, never an interactive/persistent
+    shell. Requires its own
+    `approve-active --test-type exploitation_framework --i-understand-the-risk`
+    decision."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+
+    if not program.rules.permits(TestType.EXPLOITATION_FRAMEWORK):
+        console.print(
+            f"[red]blocked[/red]: {key} does not permit exploitation-framework testing. Run "
+            "`bbhunter review-rules` then `bbhunter approve-active --test-type exploitation_framework "
+            "--i-understand-the-risk --note \"...\"` if the policy actually allows proof-of-concept "
+            "exploitation to this depth."
+        )
+        raise typer.Exit(1)
+
+    console.print(f"[yellow]warning[/yellow]: running commix against {url} (single benign echo command only)...")
+    new_findings = run_exploit_framework_check(program, url)
+    for finding in new_findings:
+        upsert_finding(finding)
+    _log_test_run(key, TestType.EXPLOITATION_FRAMEWORK, len(new_findings), f"commix against {url}")
+    if new_findings:
+        console.print(
+            "[red]command execution confirmed[/red] -- see `bbhunter findings`. Stop here, do not "
+            "escalate -- report what was confirmed."
+        )
+    else:
+        console.print("[green]nothing confirmed[/green] (or commix isn't installed -- see README.md Setup)")
 
 
 @app.command()

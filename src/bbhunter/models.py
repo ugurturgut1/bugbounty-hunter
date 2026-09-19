@@ -54,6 +54,31 @@ class TestType(StrEnum):
     SOCIAL_ENGINEERING = "social_engineering"
     PHYSICAL = "physical"
 
+    # Higher-risk tier, added 2026-09-20 at the user's explicit request ("if allowed by the
+    # company which I will decide... flag for me before starting"). Each of these is its OWN
+    # TestType, never folded into ACTIVE_LOW_IMPACT or the older, still-unused ACTIVE_INTRUSIVE
+    # placeholder above -- deliberately fine-grained so approving one never silently grants
+    # another. `cli.py approve_active_cmd` refuses to record any of these without
+    # `--i-understand-the-risk`, printing a category-specific risk warning first (see
+    # `_RISK_WARNINGS` there) -- the "flag potential issues" step the user asked for. Once
+    # approved for a given program, the corresponding check runs to the full depth described
+    # below -- no further per-finding confirmation -- per the user's explicit answer ("once I
+    # approve you can do everything abiding the rules I approved").
+    AGGRESSIVE_DISCOVERY = "aggressive_discovery"    # high-volume content-discovery (ffuf) + hidden-parameter
+                                                      # fuzzing (Arjun) -- hundreds-thousands of requests, unlike
+                                                      # every single-request/low-volume check elsewhere in this
+                                                      # project. See testing/aggressive_discovery.py.
+    SQLI_EXPLOITATION = "sqli_exploitation"          # sqlmap-driven confirmation/extraction past the existing
+                                                      # single-quote signature probe -- can pull real data if run
+                                                      # past --batch confirmation mode. See testing/sqli_exploit.py.
+    CREDENTIAL_TESTING = "credential_testing"        # tests a small, explicit, user-supplied credential list
+                                                      # against a login endpoint -- deliberately NOT an open-ended
+                                                      # wordlist brute force (real risk of locking out real users).
+                                                      # See testing/credential_testing.py.
+    EXPLOITATION_FRAMEWORK = "exploitation_framework"  # commix, aiming for actual (but minimal, non-destructive)
+                                                      # command confirmation rather than a detection signature only.
+                                                      # See testing/exploit_framework.py.
+
 
 class RulesOfEngagement(BaseModel):
     """Structured, conservative read of a program's policy. `confidence`

@@ -16,9 +16,10 @@ exists to enforce, not just describe.
 gates just because it can run commands autonomously.** Every gate below
 is a point where you stop and get the user's explicit, informed decision
 in the chat -- not a formality to click through. Never invoke
-`approve-active`, `approve-poc`, `approve-report`, or a non-`--manual`
-`submit` on your own judgment. Those commands only ever run with an
-argument the user just gave you in this conversation.
+`approve-active` (including its `--i-understand-the-risk` flag, see the
+high-risk-tier section below), `approve-poc`, `approve-report`, or a
+non-`--manual` `submit` on your own judgment. Those commands only ever
+run with an argument the user just gave you in this conversation.
 
 ## 1. Sync + pick a target
 
@@ -166,6 +167,48 @@ you'd use for any other hard-to-reverse action:
    a best-effort revert that is NOT guaranteed to succeed. After running
    it, always show them the finding's evidence (it states the revert
    outcome explicitly) rather than just reporting "done."
+
+### The high-risk tier -- `test-discovery`/`test-sqli`/`test-credentials`/`test-exploit`
+
+Four commands wrap real fuzzers/brute-forcers/exploitation tooling
+(ffuf+arjun, sqlmap, a bounded credential tester, commix) -- added at
+the user's own explicit request, but each is a materially bigger risk
+than everything above (real data extraction, real command execution,
+real login attempts against real accounts). Treat every step here with
+MORE caution than the gates above, never less:
+
+1. **Never pass `--i-understand-the-risk` yourself, ever, for any
+   reason.** Run `approve-active --test-type <type>` WITHOUT that flag
+   first and show the user the risk warning it prints verbatim -- don't
+   summarize or soften it. Only after the user has read that warning and
+   explicitly says to proceed do you re-run the same command with
+   `--i-understand-the-risk` added, exactly as you would relay any other
+   approval decision in this skill.
+2. **Ask specifically whether the program's policy covers this
+   technique, not just "active testing" in general** -- the risk warning
+   itself says why (most bug bounty programs' "automated scanning is
+   welcome" language does not automatically cover high-volume fuzzing,
+   real data extraction, login attempts, or real exploitation). If the
+   user is unsure, don't proceed -- suggest they re-read the policy or
+   ask the program directly.
+3. **`test-sqli --dump` and any credential/exploit run need a second,
+   specific go-ahead beyond the approval**, the same way
+   `test-mass-assignment` does -- confirm the exact URL/target
+   immediately before running, not just once at the start of the
+   session.
+4. **`test-credentials` needs the user's own credential pairs**
+   (`--credential user:pass`, repeatable, capped at 10) -- their own test
+   account(s) or ones the program explicitly provided. Never invent,
+   guess, or suggest common/default passwords yourself.
+5. **`test-exploit` only ever runs a single benign `echo` via commix --
+   if it confirms command execution, tell the user to stop and report,
+   not to explore further.** The finding's own evidence says this too;
+   don't add follow-up exploitation steps of your own on top of it.
+6. If the user says "just run all of these" without having specifically
+   discussed each category's risk, that's exactly the ambiguous case to
+   pause on -- these categories have very different risk profiles (see
+   README.md Guardrail 9), so get their read on each one, don't treat a
+   blanket "yes" as covering all four with no further discussion.
 4. Never invent the `--field` value or pick the resource yourself --
    both come from the user.
 

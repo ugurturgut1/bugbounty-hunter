@@ -69,16 +69,40 @@ submit.
    to do anything with real-world impact -- see `testing/ai_safety.py`'s
    module docstring for what each of the 4 probes actually checks and why
    LLM10 (unbounded consumption) is deliberately never probed.
-8. **`bbhunter test-mass-assignment` is the one check in this project that sends a real,
-   state-changing request** -- every other check anywhere in this codebase is read-only by design;
-   this is a deliberate, isolated exception, not a precedent for anything else. It requires its own
-   `TestType.MASS_ASSIGNMENT_PROBE` approval (separate from `active_low_impact`, whose own definition
-   explicitly says "no data modification"), its own explicit `--confirm-disposable` flag on top of
-   that, and only ever attempts one field on one resource the user confirms they own/control. It
-   captures a baseline first and attempts a best-effort revert, but that revert is never guaranteed --
-   read the finding's evidence for the actual outcome, every time. If this project's read-only posture
-   is ever revisited, this is the one check that already crossed that line, not a reason to assume
-   others should too.
+8. **`bbhunter test-mass-assignment` is the one check in the original narrow tier that sends a real,
+   state-changing request** -- every check under `active_low_impact` is read-only by design; this was
+   a deliberate, isolated exception when added, not a precedent to assume everything else should follow
+   -- see Guardrail 9 for where a further exception was later added deliberately, not by drift. It
+   requires its own `TestType.MASS_ASSIGNMENT_PROBE` approval (separate from `active_low_impact`, whose
+   own definition explicitly says "no data modification"), its own explicit `--confirm-disposable` flag
+   on top of that, and only ever attempts one field on one resource the user confirms they own/control.
+   It captures a baseline first and attempts a best-effort revert, but that revert is never guaranteed
+   -- read the finding's evidence for the actual outcome, every time.
+9. **A separate, higher-risk tier exists, added 2026-09-20 at the user's explicit request, for tools
+   this project previously kept out entirely: fuzzers, brute-forcers, and exploitation frameworks.**
+   This is NOT a loosening of Guardrails 1-8 above -- every check in this tier still requires scope
+   (`Program.in_scope`) and the base three approval gates exactly as before, PLUS its own dedicated
+   `TestType` (`aggressive_discovery` / `sqli_exploitation` / `credential_testing` /
+   `exploitation_framework`, never folded into `active_low_impact` or into each other), PLUS
+   `approve-active --i-understand-the-risk` on top of the usual `--note` -- `cli.py`'s
+   `_RISK_WARNINGS` prints a category-specific risk warning (what could go wrong, what to check in the
+   actual policy text before approving) and the command refuses to record the approval without that
+   flag. **The skill is never permitted to pass `--i-understand-the-risk` on its own judgment, same as
+   every other approval in this project** -- it must be the user's own explicit decision, relayed
+   verbatim, every time. Once approved for a program, each check runs to the depth described below --
+   no further per-finding confirmation -- per the user's explicit instruction ("once I approve you can
+   do everything abiding the rules I approved"), but every check keeps its own hard technical bound
+   regardless of approval, never open-ended: `aggressive_discovery` (`bbhunter test-discovery`, `ffuf` +
+   `arjun`) is high-volume but still capped/rate-limited, never DoS-adjacent; `sqli_exploitation`
+   (`bbhunter test-sqli`, `sqlmap`) only extracts real data if `--dump` is separately passed, and even
+   then caps at `SQLMAP_DUMP_ROW_LIMIT` (5) rows -- never a full dump; `credential_testing`
+   (`bbhunter test-credentials`) only ever tests a small, explicit, user-supplied credential list
+   (`MAX_CREDENTIALS_PER_RUN`, 10 pairs, enforced in code) -- never a wordlist/username-list brute
+   force, and stops immediately on any lockout/rate-limit signal; `exploitation_framework`
+   (`bbhunter test-exploit`, `commix`) only ever runs a single benign `echo <marker>` via `--os-cmd`,
+   never `--os-shell`'s interactive/persistent shell, and its own finding evidence explicitly tells the
+   user to stop and report rather than explore further. See `docs/EXTERNAL_RESOURCES.md` for the full
+   reasoning on what got wired in here vs. what still deliberately hasn't.
 
 ## Status
 
@@ -258,15 +282,17 @@ what it covers.
 | Cache poisoning/deception | Good (added 2026-09-18) | nuclei `cache` tag -- generic + Next.js cache-poisoning detection templates |
 | Prototype pollution | Thin | nuclei `prototype-pollution` tag -- template count is small upstream |
 | A10 SSRF | Partial | nuclei `ssrf` tag (out-of-band/interactsh-based, detection only) |
-| A03 Injection (XSS/SQLi/NoSQLi/command) | Partial, broader as of 2026-09-20 | custom single-request reflected-XSS, SQL-error, NoSQL-error, CRLF/header-injection, and benign-echo command-injection signature checks (`--injection`, 6 requests/param); no SSTI/XXE beyond nuclei above, no LDAP injection |
+| A03 Injection (XSS/SQLi/NoSQLi/command) | Partial (signature detection) + opt-in real confirmation | signature checks as before (`--injection`, 6 requests/param); SQLi now has an opt-in deeper tier, `bbhunter test-sqli` (`sqlmap`, `TestType.SQLI_EXPLOITATION`, its own risk-flagged approval) for real confirmation/bounded extraction past the signature probe -- see Guardrail 9 |
 | CRLF injection / HTTP response splitting | Good (added 2026-09-20) | CRLF/header-injection canary probe, part of `--injection` -- see `docs/VULN_TECHNIQUE_NOTES.md` for manual follow-up once a candidate fires |
 | RCE (Shellshock, CVE-2014-6271) | Good (added 2026-09-20) | benign `echo`-canary `User-Agent` probe, part of `--injection`, one per host -- no brute-forcing, no command beyond the no-op echo |
+| RCE (real command-execution confirmation, other CVEs) | Opt-in, added 2026-09-20 | `bbhunter test-exploit` (`commix`, `TestType.EXPLOITATION_FRAMEWORK`, its own risk-flagged approval) -- single benign `--os-cmd echo` confirmation only, never `--os-shell` |
+| Content discovery / hidden parameters | Opt-in, added 2026-09-20 | `bbhunter test-discovery` (`ffuf` + `arjun`, `TestType.AGGRESSIVE_DISCOVERY`, its own risk-flagged approval) -- high-volume, capped/rate-limited |
 | A02 Cryptographic Failures | Good, up from Thin (2026-09-18) | `recon/passive.py`'s `tls_cert_info`/`tls_findings` (passive, always on: expired/soon-expiring, self-signed, weak SHA-1 signature, hostname not in SAN) + nuclei `ssl` tag (deprecated TLS versions, insecure cipher suites, cert revocation -- neither checked by the openssl-based passive check) |
 | Email spoofing (SPF/DMARC/DKIM misconfig) | Good (heuristic), added 2026-09-18 | `recon/dns_hygiene.py` -- passive, always on. `check_dkim` only ever reports a positive signal (a weak key found at a common selector), never "missing", since a domain's real selector isn't discoverable |
 | Secret/credential leakage (public JS, GitHub) | Good (heuristic), added 2026-09-18 | `recon/js_harvest.py` (passive, always on: hardcoded secrets + exposed source maps in linked JS) and `recon/github_dork.py` (passive, optional -- needs a free `GITHUB_API_TOKEN`) |
 | Cloud storage bucket exposure (S3/GCS/Azure) | Good (heuristic), opt-in, added 2026-09-18 | `testing/cloud_storage.py`, `test-active --cloud-buckets` -- bucket names derived only from the program's own in-scope domains, findings always at "info" severity pending manual ownership verification |
 | A01 Broken Access Control (IDOR) | Partial (manual-input-driven) | `testing/idor.py`, `bbhunter test-idor` -- needs a human-supplied resource URL + two real identities' credentials, see below |
-| A07 Auth Failures | **Missing by design** | guardrails exclude credential brute-forcing/default-login entirely |
+| A07 Auth Failures | **Open-ended brute-forcing still Missing by design**; bounded credential testing opt-in, added 2026-09-20 | `bbhunter test-credentials` (`TestType.CREDENTIAL_TESTING`, its own risk-flagged approval) tests only a small, explicit, user-supplied credential list (capped at 10 pairs, enforced in code), never a wordlist/username-list brute force -- see Guardrail 9 |
 | Business logic / race conditions | **Missing** | not generically automatable |
 | API1:2023 Broken Object Level Authorization (BOLA) | Partial (manual-input-driven) | same mechanism as A01/IDOR above -- `bbhunter test-idor` |
 | API5:2023 Broken Function Level Authorization (BFLA) | Partial (manual-input-driven) | `testing/idor.py`'s `check_bfla`, `bbhunter test-bfla` -- same mechanism pointed at an admin/privileged endpoint instead of a data object |
@@ -473,19 +499,52 @@ pushed separately:**
       `dnsx_resolve` (projectdiscovery's `dnsx -silent`, filters discovered subdomains to ones that
       still resolve via public DNS queries before spending `max_subdomains_per_seed`'s fingerprinting
       budget on stale crt.sh/Wayback entries). 9 new tests.
-    - Tools this pass deliberately did NOT wire in, and why: the remainder of awesome-bugbounty-tools is
-      overwhelmingly fuzzers, brute-forcers, and exploitation frameworks (dirsearch/ffuf/gobuster-style
-      content-discovery fuzzing, Arjun/x8 parameter brute-forcing, sqlmap-style extraction, WAF-evasion
-      tooling) -- exactly the technique class Guardrails #2/#6 keep this project's active testing away
-      from (no brute-forcing, no blind/boolean injection, no follow-through past detection). Wiring any
-      of those in would mean loosening a guardrail, not adding a tool within the existing one, so they
-      stay in `docs/EXTERNAL_RESOURCES.md` as the human's own manual toolbox instead.
+    - Tools this pass deliberately did NOT wire in: the remainder of awesome-bugbounty-tools is
+      overwhelmingly fuzzers, brute-forcers, and exploitation frameworks (ffuf/gobuster-style
+      content-discovery fuzzing, Arjun/x8 parameter brute-forcing, sqlmap-style extraction, credential
+      brute-forcing, commix-style exploitation) -- exactly the technique class Guardrails #2/#6 kept this
+      project's active testing away from at the time. See roadmap phase 17 immediately below: the user
+      explicitly asked for these too, on the condition that they personally flag and approve each
+      category first -- not something this pass assumed on its own.
 
-All of the above stayed within this project's existing guardrails throughout -- nothing in this
-round created a new permission tier, lowered the bar for `approve-active`, or let any heuristic
+Phases 1-16 above all stayed within this project's guardrails as they existed at the time -- nothing in
+those rounds created a new permission tier, lowered the bar for `approve-active`, or let any heuristic
 self-authorize active testing. The user was explicit about this going in ("I will be the one
 approving any active recon"): the goal was making the tool find more once a human has already said
 yes for a specific program, not changing who gets to say yes.
+
+17. *(done 2026-09-20)* Fuzzers/brute-forcers/exploitation frameworks, per the user's explicit follow-up
+    request ("we should use fuzzers/brute-forcers/exploitation frameworks if allowed by the company
+    which I will decide and you can flag for me before starting... I would like to automate that too" --
+    and, on how far automation should go once approved: "once I approve you can do everything abiding
+    the rules I approved"; and on the approval gate: "make sure to ask me and make me approve flagging
+    potential issues for these tools"). See Guardrail 9 above for the full mechanism
+    (`--i-understand-the-risk` + a dedicated `TestType` per category, never self-approved). Four new
+    modules, each its own CLI command and its own `TestType`:
+    - `testing/aggressive_discovery.py` (`bbhunter test-discovery`, `TestType.AGGRESSIVE_DISCOVERY`):
+      `ffuf` content discovery (small built-in wordlist, override via `BBHUNTER_FFUF_WORDLIST`) +
+      `arjun` hidden-parameter discovery, both optional binaries, same graceful-skip pattern as
+      subfinder/nuclei/ffuf's siblings elsewhere in this project.
+    - `testing/sqli_exploit.py` (`bbhunter test-sqli`, `TestType.SQLI_EXPLOITATION`): `sqlmap --batch`
+      at conservative `--risk 1 --level 1`, confirmation-only (DBMS banner + current-db name) by
+      default; `--dump` is a second, separate opt-in flag that additionally extracts up to
+      `SQLMAP_DUMP_ROW_LIMIT` (5) rows -- the finding's evidence reminds the user to delete extracted
+      data after reporting.
+    - `testing/credential_testing.py` (`bbhunter test-credentials`, `TestType.CREDENTIAL_TESTING`): a
+      deliberately hand-written, bounded implementation rather than wrapping `hydra` -- tests only a
+      small, explicit, user-supplied credential list (`MAX_CREDENTIALS_PER_RUN` = 10 pairs, enforced in
+      code as a `ValueError`, not just documented), stops immediately on any lockout/rate-limit
+      signature. This is intentionally narrower than open-ended wordlist brute-forcing, which the risk
+      warning itself explains is one of the most commonly explicitly-prohibited bug-bounty techniques
+      and risks locking out real users, not just testing the target.
+    - `testing/exploit_framework.py` (`bbhunter test-exploit`, `TestType.EXPLOITATION_FRAMEWORK`):
+      `commix --batch` restricted to a single `--os-cmd echo <marker>` confirmation, never
+      `--os-shell`'s interactive/persistent shell -- proves real command execution without establishing
+      or using any actual access beyond that one benign command.
+    - 28 new tests across the four modules (mocked subprocess/HTTP throughout -- none of these tests
+      shell out to a real binary or touch a real target). `docs/EXTERNAL_RESOURCES.md` updated to
+      reflect what's now wired in vs. what still isn't (business-logic/race-condition testing, and
+      anything genuinely destructive like `--os-shell` or an unbounded `--dump`, stay out on purpose).
 
 Longer-term ideas not yet scoped into a phase: broader business-logic/race-condition testing (not
 generically automatable, would need per-program custom logic), stateful (server-side conversation ID)
@@ -563,6 +622,25 @@ passive GitHub code-search recon needs a free GitHub personal access
 token (no scopes required) in `.env` as `GITHUB_API_TOKEN` -- see
 `.env.example`. Skipped silently if absent, same as everything else here.
 
+### Optional high-risk-tier tooling (Guardrail 9)
+
+These four are only ever invoked by `test-discovery`/`test-sqli`/
+`test-credentials`/`test-exploit`, and even then only after their own
+`approve-active --i-understand-the-risk` decision on top of the usual
+gates -- installing them changes nothing on its own. Same graceful-skip
+behavior as everything above if not installed.
+
+```bash
+go install github.com/ffuf/ffuf/v2@latest      # content discovery, `bbhunter test-discovery`
+pip install arjun                              # hidden-parameter discovery, `bbhunter test-discovery`
+pip install sqlmap                             # SQLi confirmation/extraction, `bbhunter test-sqli`
+pip install commix                             # command-execution confirmation, `bbhunter test-exploit`
+```
+
+`BBHUNTER_FFUF_WORDLIST` (env var, absolute path) overrides
+`aggressive_discovery.py`'s small built-in wordlist with your own,
+bigger one -- unset falls back to the built-in list.
+
 ## Full pipeline, one finding at a time
 
 ```bash
@@ -580,6 +658,12 @@ uv run bbhunter test-active <program-key>
 uv run bbhunter test-active <program-key> --injection --nuclei
 
 uv run bbhunter findings --status candidate
+
+# 2b. (further opt-in, only after its own separate risk-flagged approval -- see Guardrail 9)
+uv run bbhunter approve-active <program-key> --test-type sqli_exploitation --i-understand-the-risk --note "..."
+uv run bbhunter test-sqli <program-key> --url "https://target/search?q=1"   # add --dump to extract (capped) rows
+# same pattern for: test-discovery (aggressive_discovery), test-credentials (credential_testing),
+# test-exploit (exploitation_framework) -- each needs its own approve-active --test-type ... --i-understand-the-risk
 
 # 3. PoC: scaffold -> you fill in + personally verify -> approve
 uv run bbhunter draft-poc <finding-id>
