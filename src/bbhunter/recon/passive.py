@@ -42,6 +42,16 @@ required User-Agent or header (RulesOfEngagement.required_user_agent /
 required_request_header, as Intigriti exposes structurally), that is
 used instead of the default and is a hard requirement, not a suggestion.
 
+**Scope (Guardrail 1)**: fingerprinting -- and everything downstream of
+it that also touches the target (TLS handshake, dangling-CNAME check,
+JS harvesting, robots.txt/security.txt) -- only ever expands past the
+exact seed host when that seed's `AssetType` is `WILDCARD`. A plain
+`URL`-type seed only ever gets its own exact host fingerprinted, even
+when crt.sh/Certspotter/subfinder/assetfinder/Wayback surface a sibling
+subdomain under the same parent domain -- that subdomain isn't in scope
+just because it was discovered, mirroring exactly how
+`testing/active.py`'s `_select_hosts` already gates active testing.
+
 Each fingerprinted host also gets one raw TLS handshake to port 443 (via
 the `openssl` binary, see `tls_cert_info`) to read its certificate --
 the same information any browser already reads on every visit, no
@@ -1020,10 +1030,20 @@ def run_passive_recon(
                         )
                     )
 
-            _report(f"[{seed_index}/{seeds_total}] {host}: resolving discovered subdomains...")
-            resolvable = dnsx_resolve(discovered)
-            discovered_for_fingerprint = resolvable if resolvable is not None else discovered
-            hosts_to_fingerprint = [host] + sorted(discovered_for_fingerprint)[:max_subdomains_per_seed]
+            # Guardrail 1: a plain URL seed licenses testing exactly that host, never a sibling
+            # subdomain just because crt.sh/Certspotter/Wayback/etc. happened to surface one --
+            # only a WILDCARD-type seed actually covers its subdomains. This must gate the live
+            # fingerprint/TLS/dangling-CNAME requests below the same way testing/active.py's
+            # _select_hosts already gates active testing -- found missing here 2026-09-20 after a
+            # live recon run against a plain-URL-scoped program sent a real request to an
+            # undeclared subdomain (origin-<seed>-shaped host discovered via crt.sh).
+            if asset.asset_type == AssetType.WILDCARD:
+                _report(f"[{seed_index}/{seeds_total}] {host}: resolving discovered subdomains...")
+                resolvable = dnsx_resolve(discovered)
+                discovered_for_fingerprint = resolvable if resolvable is not None else discovered
+                hosts_to_fingerprint = [host] + sorted(discovered_for_fingerprint)[:max_subdomains_per_seed]
+            else:
+                hosts_to_fingerprint = [host]
 
             _report(
                 f"[{seed_index}/{seeds_total}] {host}: dangling-CNAME check "
