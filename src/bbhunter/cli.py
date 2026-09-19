@@ -22,7 +22,14 @@ from bbhunter.reporting import (
     submit_report,
 )
 from bbhunter.testing import run_active_checks
-from bbhunter.testing.aggressive_discovery import run_aggressive_discovery
+from bbhunter.testing.active import _select_hosts
+from bbhunter.testing.aggressive_discovery import (
+    FFUF_RATE_PER_SECOND,
+    MAX_DISCOVERY_HOSTS_PER_PROGRAM,
+    resolve_wordlist,
+    run_aggressive_discovery,
+    wordlist_line_count,
+)
 from bbhunter.testing.ai_safety import run_ai_safety_probes
 from bbhunter.testing.credential_testing import MAX_CREDENTIALS_PER_RUN, run_credential_test
 from bbhunter.testing.exploit_framework import run_exploit_framework_check
@@ -218,7 +225,14 @@ _RISK_WARNINGS: dict[TestType, str] = {
         "unlike every other check in this project (single-request/low-volume). Confirm the policy's "
         "rate-limit and testing-hours notes are compatible with that volume, and that 'automated "
         "scanners' language in the policy actually covers high-volume fuzzing, not just occasional "
-        "low-rate requests."
+        "low-rate requests. Wordlist choice controls this directly: `test-discovery --wordlist` can use "
+        "a cloned SecLists list (github.com/danielmiessler/SecLists, see README Setup) ranging from a "
+        "few thousand entries ('common') to hundreds of thousands ('large') -- request count (and "
+        "therefore run time and how much this looks like a scanning attack to the target) scales "
+        "linearly with wordlist size. `test-discovery` prints the resolved wordlist's actual entry "
+        "count and total request estimate before it starts -- read that number, and default to "
+        "'common'/the small built-in list rather than 'large' unless the program's policy is explicit "
+        "about welcoming exhaustive automated scanning."
     ),
     TestType.SQLI_EXPLOITATION: (
         "sqlmap can extract REAL DATA from the target's database once run past confirmation mode. "
@@ -920,7 +934,16 @@ def test_mass_assignment_cmd(
 
 
 @app.command(name="test-discovery")
-def test_discovery_cmd(key: str):
+def test_discovery_cmd(
+    key: str,
+    wordlist: str | None = typer.Option(
+        None, "--wordlist",
+        help="'small'/'common'/'medium'/'large' (SecLists shorthand, see README Setup for the clone "
+             "command), a SecLists-relative path, or an absolute path to your own wordlist. Defaults to "
+             "SecLists' common.txt if SecLists is cloned, else a small built-in list. Bigger wordlist = "
+             "more requests -- see the risk warning printed by `approve-active` for this tier.",
+    ),
+):
     """High-volume content discovery (`ffuf`) + hidden-parameter fuzzing
     (`arjun`) -- hundreds to low-thousands of requests, unlike every
     other check in this project. Requires its own
@@ -941,11 +964,21 @@ def test_discovery_cmd(key: str):
         raise typer.Exit(1)
 
     recon_result = get_recon_result(key)
-    console.print(f"[yellow]warning[/yellow]: this sends hundreds-thousands of requests to {key}'s in-scope hosts...")
-    new_findings = run_aggressive_discovery(program, recon_result)
+    hosts = _select_hosts(program, recon_result)[:MAX_DISCOVERY_HOSTS_PER_PROGRAM]
+    resolved_path, _ = resolve_wordlist(wordlist)
+    word_count = wordlist_line_count(resolved_path)
+    console.print(
+        f"[yellow]warning[/yellow]: wordlist {resolved_path} ({word_count} entries) against "
+        f"{len(hosts)} host(s) -- up to {word_count * len(hosts)} ffuf request(s) at "
+        f"{FFUF_RATE_PER_SECOND}/s, plus one arjun run per host..."
+    )
+    new_findings = run_aggressive_discovery(program, recon_result, wordlist=wordlist)
     for finding in new_findings:
         upsert_finding(finding)
-    _log_test_run(key, TestType.AGGRESSIVE_DISCOVERY, len(new_findings), "ffuf content discovery + arjun param fuzzing")
+    _log_test_run(
+        key, TestType.AGGRESSIVE_DISCOVERY, len(new_findings),
+        f"ffuf content discovery (wordlist: {resolved_path}, {word_count} entries) + arjun param fuzzing",
+    )
     if new_findings:
         console.print(f"[red]{len(new_findings)} candidate(s) found[/red] -- see `bbhunter findings`")
     else:

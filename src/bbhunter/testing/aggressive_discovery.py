@@ -19,6 +19,16 @@ Rate is capped well below both tools' own defaults
 the way a single canary request is, which is the entire reason it needs
 its own approval tier, but it isn't run at the tools' full, aggressive
 defaults either.
+
+Wordlist choice is the other big lever on request volume, alongside rate
+-- see `resolve_wordlist`: a small built-in list by default, SecLists
+(github.com/danielmiessler/SecLists, see README Setup for the clone
+command) if cloned locally, or an explicit path/shorthand. `cli.py`'s
+`test-discovery` prints the resolved wordlist's actual line count before
+running, and the `AGGRESSIVE_DISCOVERY` risk warning says explicitly
+that a bigger wordlist scales the risk linearly -- this is deliberately
+surfaced as part of the same risk-flagging step as everything else in
+this tier, not a separate, unflagged knob.
 """
 from __future__ import annotations
 
@@ -46,9 +56,23 @@ MAX_FFUF_RESULTS = 100
 ARJUN_TIMEOUT_SECONDS = 180
 ARJUN_THREADS = 5
 
+# Where `bbhunter recon`'s README-documented setup step clones SecLists to (see README Setup
+# "Optional high-risk-tier tooling") -- override with BBHUNTER_SECLISTS_DIR if cloned elsewhere.
+SECLISTS_DIR = os.environ.get("BBHUNTER_SECLISTS_DIR", os.path.expanduser("~/bugbounty-hunter/wordlists/SecLists"))
+
+# Shorthand -> path relative to SECLISTS_DIR, smallest to largest. "common" is the default once
+# SecLists is present -- a curated, general-purpose list, not the largest one available. Pass the
+# shorthand, or any other SecLists-relative (or absolute) path, to `--wordlist` on `test-discovery`.
+SECLISTS_SHORTHANDS = {
+    "small": "Discovery/Web-Content/raft-small-directories.txt",
+    "common": "Discovery/Web-Content/common.txt",
+    "medium": "Discovery/Web-Content/raft-medium-directories.txt",
+    "large": "Discovery/Web-Content/raft-large-directories.txt",
+}
+
 # A small, curated set of common paths -- not meant to be exhaustive (this is not SecLists).
-# Set BBHUNTER_FFUF_WORDLIST to an absolute path to use a bigger/custom wordlist instead;
-# falls back to this built-in list if unset or unreadable.
+# The floor when neither an explicit --wordlist/BBHUNTER_FFUF_WORDLIST nor a cloned SecLists is
+# available -- see `resolve_wordlist`.
 _DEFAULT_WORDLIST = [
     ".env", ".env.local", ".env.production", ".git/config", ".git/HEAD", ".svn/entries",
     ".DS_Store", ".htaccess", ".htpasswd", "web.config", "docker-compose.yml", "Dockerfile",
@@ -68,25 +92,51 @@ _DEFAULT_WORDLIST = [
 ]
 
 
-def _wordlist_path() -> tuple[str, bool]:
-    """Returns (path, is_temp_file) -- caller unlinks the file only when
-    `is_temp_file` is True. `BBHUNTER_FFUF_WORDLIST` lets a user point at
-    a bigger/custom list they already have; falls back to the small
-    built-in one above if unset or unreadable."""
-    custom = os.environ.get("BBHUNTER_FFUF_WORDLIST")
-    if custom and os.path.isfile(custom):
-        return custom, False
+def resolve_wordlist(wordlist: str | None = None) -> tuple[str, bool]:
+    """Resolution order: explicit `wordlist` argument (a
+    `SECLISTS_SHORTHANDS` key, a path relative to `SECLISTS_DIR`, or an
+    absolute path) -> `BBHUNTER_FFUF_WORDLIST` env var -> SecLists'
+    `common.txt` if SecLists is cloned at `SECLISTS_DIR` -> this
+    module's small built-in list. Returns `(path, is_temp_file)` --
+    caller unlinks the file only when `is_temp_file` is True."""
+    candidates: list[str] = []
+    if wordlist:
+        candidates.append(SECLISTS_SHORTHANDS.get(wordlist, wordlist))
+    env = os.environ.get("BBHUNTER_FFUF_WORDLIST")
+    if env:
+        candidates.append(env)
+    candidates.append(SECLISTS_SHORTHANDS["common"])
+
+    for candidate in candidates:
+        path = candidate if os.path.isabs(candidate) else os.path.join(SECLISTS_DIR, candidate)
+        if os.path.isfile(path):
+            return path, False
+
     fd, path = tempfile.mkstemp(suffix=".txt", prefix="bbhunter-wordlist-")
     with os.fdopen(fd, "w") as f:
         f.write("\n".join(_DEFAULT_WORDLIST))
     return path, True
 
 
+def wordlist_line_count(path: str) -> int:
+    """Best-effort line count for a resolved wordlist -- lets the CLI
+    tell the user how many requests a run is actually about to send
+    before it starts, instead of a vague "hundreds-thousands." Returns
+    0 if the file can't be read, never raises."""
+    try:
+        with open(path, "rb") as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
+
+
 def run_ffuf_discovery(
-    host: str, rules: RulesOfEngagement, *, timeout: float = FFUF_TIMEOUT_SECONDS
+    host: str, rules: RulesOfEngagement, *, wordlist: str | None = None, timeout: float = FFUF_TIMEOUT_SECONDS
 ) -> list[dict] | None:
     """One `ffuf` run against `https://{host}/FUZZ`, matching only the
-    status codes in `FFUF_MATCH_CODES`. Returns a list of hit dicts (kind/
+    status codes in `FFUF_MATCH_CODES`. `wordlist` is resolved via
+    `resolve_wordlist` -- a `SECLISTS_SHORTHANDS` key, a path, or `None`
+    for the default resolution order. Returns a list of hit dicts (kind/
     severity/evidence, same shape everything else in this project uses),
     or `None` if the binary is missing or the run failed -- callers must
     fall back accordingly, never treat `None` as "found nothing"."""
@@ -94,7 +144,7 @@ def run_ffuf_discovery(
     if not binary:
         return None
 
-    wordlist, wordlist_is_temp = _wordlist_path()
+    wordlist, wordlist_is_temp = resolve_wordlist(wordlist)
     out_fd, out_path = tempfile.mkstemp(suffix=".json", prefix="bbhunter-ffuf-")
     os.close(out_fd)
 
@@ -187,14 +237,17 @@ def run_arjun_discovery(url: str, *, timeout: float = ARJUN_TIMEOUT_SECONDS) -> 
     return sorted(params)
 
 
-def run_aggressive_discovery(program: Program, recon_result: ReconResult | None = None) -> list[Finding]:
+def run_aggressive_discovery(
+    program: Program, recon_result: ReconResult | None = None, *, wordlist: str | None = None
+) -> list[Finding]:
     """`bbhunter test-discovery` entry point. Requires
     `permits(TestType.AGGRESSIVE_DISCOVERY)` -- the same
     `approve-active --test-type aggressive_discovery --i-understand-the-risk`
     decision described in cli.py's `_RISK_WARNINGS`, never anything a
-    heuristic can grant itself. Runs `run_ffuf_discovery` against a
-    capped host list (`MAX_DISCOVERY_HOSTS_PER_PROGRAM`, narrower than
-    the low-impact checks' own host cap since each host here costs far
+    heuristic can grant itself. `wordlist` is passed straight through to
+    `run_ffuf_discovery` (see `resolve_wordlist`). Runs `run_ffuf_discovery`
+    against a capped host list (`MAX_DISCOVERY_HOSTS_PER_PROGRAM`, narrower
+    than the low-impact checks' own host cap since each host here costs far
     more requests), then `run_arjun_discovery` against the same hosts'
     root URL. Silently skips whichever tool isn't installed -- see each
     function's own docstring."""
@@ -208,7 +261,7 @@ def run_aggressive_discovery(program: Program, recon_result: ReconResult | None 
     findings: list[Finding] = []
 
     for host in hosts:
-        for hit in run_ffuf_discovery(host, program.rules) or []:
+        for hit in run_ffuf_discovery(host, program.rules, wordlist=wordlist) or []:
             digest = hashlib.sha256(f"{host}:{hit['url']}".encode()).hexdigest()[:12]
             findings.append(
                 Finding(

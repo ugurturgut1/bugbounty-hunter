@@ -6,7 +6,12 @@ import json
 from unittest.mock import MagicMock, patch
 
 from bbhunter.models import RulesOfEngagement
-from bbhunter.testing.aggressive_discovery import run_arjun_discovery, run_ffuf_discovery
+from bbhunter.testing.aggressive_discovery import (
+    resolve_wordlist,
+    run_arjun_discovery,
+    run_ffuf_discovery,
+    wordlist_line_count,
+)
 
 
 def _fake_run_writing_json(json_out_flag: str, payload):
@@ -56,6 +61,51 @@ def test_run_ffuf_discovery_uses_conservative_rate_and_match_codes():
     cmd = run.call_args.args[0]
     assert "-rate" in cmd and cmd[cmd.index("-rate") + 1] == "5"
     assert "-mc" in cmd
+
+
+def test_resolve_wordlist_falls_back_to_builtin_when_nothing_present():
+    with patch("bbhunter.testing.aggressive_discovery.SECLISTS_DIR", "/fake/seclists"), \
+         patch("bbhunter.testing.aggressive_discovery.os.path.isfile", return_value=False), \
+         patch.dict("os.environ", {}, clear=True):
+        path, is_temp = resolve_wordlist()
+    assert is_temp is True
+    with open(path) as f:
+        assert ".env" in f.read()  # a builtin-list entry
+
+
+def test_resolve_wordlist_shorthand_resolves_under_seclists_dir():
+    with patch("bbhunter.testing.aggressive_discovery.SECLISTS_DIR", "/fake/seclists"), \
+         patch("bbhunter.testing.aggressive_discovery.os.path.isfile", side_effect=lambda p: p == "/fake/seclists/Discovery/Web-Content/raft-medium-directories.txt"):
+        path, is_temp = resolve_wordlist("medium")
+    assert path == "/fake/seclists/Discovery/Web-Content/raft-medium-directories.txt"
+    assert is_temp is False
+
+
+def test_resolve_wordlist_explicit_absolute_path_wins():
+    with patch("bbhunter.testing.aggressive_discovery.SECLISTS_DIR", "/fake/seclists"), \
+         patch("bbhunter.testing.aggressive_discovery.os.path.isfile", side_effect=lambda p: p == "/my/custom.txt"):
+        path, is_temp = resolve_wordlist("/my/custom.txt")
+    assert path == "/my/custom.txt"
+    assert is_temp is False
+
+
+def test_resolve_wordlist_env_var_used_when_no_explicit_arg():
+    with patch("bbhunter.testing.aggressive_discovery.SECLISTS_DIR", "/fake/seclists"), \
+         patch("bbhunter.testing.aggressive_discovery.os.path.isfile", side_effect=lambda p: p == "/env/list.txt"), \
+         patch.dict("os.environ", {"BBHUNTER_FFUF_WORDLIST": "/env/list.txt"}):
+        path, is_temp = resolve_wordlist()
+    assert path == "/env/list.txt"
+    assert is_temp is False
+
+
+def test_wordlist_line_count_counts_real_file(tmp_path):
+    p = tmp_path / "words.txt"
+    p.write_text("a\nb\nc\n")
+    assert wordlist_line_count(str(p)) == 3
+
+
+def test_wordlist_line_count_returns_zero_for_missing_file():
+    assert wordlist_line_count("/does/not/exist.txt") == 0
 
 
 def test_run_arjun_discovery_returns_none_when_binary_missing():

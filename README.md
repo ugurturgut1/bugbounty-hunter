@@ -522,9 +522,17 @@ yes for a specific program, not changing who gets to say yes.
     (`--i-understand-the-risk` + a dedicated `TestType` per category, never self-approved). Four new
     modules, each its own CLI command and its own `TestType`:
     - `testing/aggressive_discovery.py` (`bbhunter test-discovery`, `TestType.AGGRESSIVE_DISCOVERY`):
-      `ffuf` content discovery (small built-in wordlist, override via `BBHUNTER_FFUF_WORDLIST`) +
-      `arjun` hidden-parameter discovery, both optional binaries, same graceful-skip pattern as
-      subfinder/nuclei/ffuf's siblings elsewhere in this project.
+      `ffuf` content discovery + `arjun` hidden-parameter discovery, both optional binaries, same
+      graceful-skip pattern as subfinder/nuclei/ffuf's siblings elsewhere in this project. Wordlist
+      resolution (`resolve_wordlist`, added right after this phase, per a follow-up request): small
+      built-in list by default, SecLists (github.com/danielmiessler/SecLists, cloned separately, see
+      README Setup) if present, `--wordlist small|common|medium|large` shorthand or any explicit path
+      to choose a specific SecLists list, `BBHUNTER_FFUF_WORDLIST`/`BBHUNTER_SECLISTS_DIR` env vars to
+      override the defaults. `test-discovery` prints the resolved wordlist's real entry count and a
+      request-count estimate before running, and the `aggressive_discovery` risk warning explains that
+      request volume scales directly with wordlist size -- wordlist choice is flagged as part of the
+      same risk-approval step as everything else in this tier, never a separate unflagged knob. 6 new
+      tests.
     - `testing/sqli_exploit.py` (`bbhunter test-sqli`, `TestType.SQLI_EXPLOITATION`): `sqlmap --batch`
       at conservative `--risk 1 --level 1`, confirmation-only (DBMS banner + current-db name) by
       default; `--dump` is a second, separate opt-in flag that additionally extracts up to
@@ -639,7 +647,34 @@ pip install commix                             # command-execution confirmation,
 
 `BBHUNTER_FFUF_WORDLIST` (env var, absolute path) overrides
 `aggressive_discovery.py`'s small built-in wordlist with your own,
-bigger one -- unset falls back to the built-in list.
+bigger one -- unset falls back to the built-in list, or to SecLists (see
+below) if it's cloned.
+
+**SecLists**, for `test-discovery --wordlist`: a much better set of
+content-discovery wordlists than this project's own small built-in one.
+Cloned as a plain git checkout, gitignored (`wordlists/` in
+`.gitignore`) -- it's reference data, not something this project's own
+git history should carry:
+
+```bash
+mkdir -p wordlists && git clone --depth 1 https://github.com/danielmiessler/SecLists.git wordlists/SecLists
+```
+
+`resolve_wordlist()` in `aggressive_discovery.py` looks for it at
+`~/bugbounty-hunter/wordlists/SecLists` by default (override with
+`BBHUNTER_SECLISTS_DIR`); if it's not there, `test-discovery` silently
+falls back to the small built-in list, same graceful-skip behavior as
+everything else optional in this project. Once cloned, pass
+`--wordlist small|common|medium|large` (shorthand for
+`Discovery/Web-Content/{common,raft-small,raft-medium,raft-large}-directories.txt`,
+`common` being the default once SecLists is present) or any other
+SecLists-relative/absolute path. **A bigger wordlist means proportionally
+more requests** -- `test-discovery` prints the resolved wordlist's real
+entry count and a request-count estimate before it starts; the
+`aggressive_discovery` risk warning (`approve-active
+--i-understand-the-risk`) says the same thing. Default to `common`
+unless the program's policy is explicit about welcoming exhaustive
+scanning.
 
 ## Full pipeline, one finding at a time
 

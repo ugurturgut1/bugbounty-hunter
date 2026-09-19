@@ -72,9 +72,13 @@ the user's explicit request, each with its own `TestType` and its own
 `approve-active --i-understand-the-risk` decision -- see cli.py's
 `_RISK_WARNINGS`):
 
-7. **ffuf + arjun** (`testing/aggressive_discovery.py`,
+7. **ffuf + arjun**, wordlists from **SecLists** (`testing/aggressive_discovery.py`,
    `bbhunter test-discovery`, `TestType.AGGRESSIVE_DISCOVERY`) --
    awesome-bugbounty-tools § Recon → Content Discovery / Parameters.
+   SecLists (github.com/danielmiessler/SecLists) is cloned separately
+   (see README Setup), gitignored, and referenced by path/shorthand
+   (`--wordlist small|common|medium|large`) rather than vendored into
+   this project's own repo -- it's multi-GB reference data, not code.
 8. **sqlmap** (`testing/sqli_exploit.py`, `bbhunter test-sqli`,
    `TestType.SQLI_EXPLOITATION`) -- awesome-bugbounty-tools §
    Miscellaneous → Vulnerability Scanners (sqlmap itself isn't in that
