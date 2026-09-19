@@ -13,6 +13,7 @@ from pathlib import Path
 
 from bbhunter.config import DATA_DIR
 from bbhunter.models import Finding, FindingStatus, Program
+from bbhunter.reporting.poc import poc_has_unfilled_todos
 
 REPORT_DIR = DATA_DIR / "reports"
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -56,15 +57,18 @@ def draft_report(finding: Finding, program: Program, *, severity: str | None = N
             raise ValueError(f"invalid severity {severity!r}; must be one of {sorted(_VALID_SEVERITIES)}")
         finding.severity = severity
 
-    poc_text = Path(finding.poc_path).read_text(encoding="utf-8")
-    steps = _extract_section(poc_text, "Reproduction steps")
-    impact = _extract_section(poc_text, "Impact")
-
-    if "TODO" in steps or "TODO" in impact:
+    # Belt-and-suspenders: approve_poc_cmd (cli.py) already refuses this at approval time via the
+    # same poc_has_unfilled_todos check, but re-check here too rather than trust that every path to
+    # POC_APPROVED went through it -- see poc_has_unfilled_todos's own docstring.
+    if poc_has_unfilled_todos(finding.poc_path):
         raise RuntimeError(
             f"{finding.id}: the approved PoC at {finding.poc_path} still has unfilled TODOs in "
             "Reproduction steps or Impact. Fill those in and re-approve before drafting a report."
         )
+
+    poc_text = Path(finding.poc_path).read_text(encoding="utf-8")
+    steps = _extract_section(poc_text, "Reproduction steps")
+    impact = _extract_section(poc_text, "Impact")
 
     path = report_path_for(finding.id)
     path.write_text(

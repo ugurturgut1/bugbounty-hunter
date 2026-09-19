@@ -19,6 +19,7 @@ from bbhunter.reporting import (
     draft_poc,
     draft_report,
     mark_submitted_manually,
+    poc_has_unfilled_todos,
     submit_report,
 )
 from bbhunter.testing import run_active_checks
@@ -1179,13 +1180,28 @@ def draft_poc_cmd(finding_id: str):
 
 @app.command(name="approve-poc")
 def approve_poc_cmd(finding_id: str, note: str = typer.Option(..., "--note", help="What you verified")):
-    """Record that you personally reproduced and verified this finding."""
+    """Record that you personally reproduced and verified this finding.
+    Refuses -- in code, not just by convention -- if the PoC file's
+    Reproduction steps or Impact section still has an unfilled TODO:
+    this is the actual anti-hallucination gate, not `draft-report`'s
+    later re-check of the same thing, since a finding could otherwise
+    sit at `POC_APPROVED` with nothing real ever written down."""
     finding = get_finding(finding_id)
     if not finding:
         console.print(f"[red]not found[/red]: {finding_id}")
         raise typer.Exit(1)
     if finding.status != FindingStatus.POC_DRAFTED:
         console.print(f"[red]blocked[/red]: status is {finding.status.value}, not poc_drafted")
+        raise typer.Exit(1)
+    if not finding.poc_path or not Path(finding.poc_path).exists():
+        console.print(f"[red]blocked[/red]: no PoC file on record at {finding.poc_path!r}")
+        raise typer.Exit(1)
+    if poc_has_unfilled_todos(finding.poc_path):
+        console.print(
+            f"[red]refusing[/red]: {finding.poc_path} still has an unfilled TODO in Reproduction "
+            "steps or Impact. Write the actual reproduction steps and impact -- based on real, "
+            "personal verification, not speculation -- before approving this."
+        )
         raise typer.Exit(1)
     finding.status = FindingStatus.POC_APPROVED
     finding.notes = f"{finding.notes} | PoC approved: {note}" if finding.notes else f"PoC approved: {note}"

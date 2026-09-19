@@ -76,6 +76,30 @@ def poc_path_for(finding_id: str) -> Path:
     return POC_DIR / f"{_slug(finding_id)}.md"
 
 
+def _extract_section(markdown: str, heading: str) -> str:
+    pattern = rf"^## {re.escape(heading)}\s*\n(.*?)(?=\n## |\Z)"
+    m = re.search(pattern, markdown, re.DOTALL | re.MULTILINE)
+    if not m:
+        return "(section not found in PoC file)"
+    body = m.group(1)
+    body = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
+    return body.strip() or "(empty)"
+
+
+def poc_has_unfilled_todos(poc_path: str) -> bool:
+    """True if the PoC markdown at `poc_path`'s Reproduction steps or
+    Impact section still contains a literal `TODO`. The single source of
+    truth for this check -- `approve_poc_cmd` (cli.py) enforces it BEFORE
+    a finding can become `POC_APPROVED` at all, and `draft_report`
+    enforces it again independently before drafting a report, so a
+    still-templated PoC can never slip past either gate no matter which
+    path something takes to get there."""
+    text = Path(poc_path).read_text(encoding="utf-8")
+    steps = _extract_section(text, "Reproduction steps")
+    impact = _extract_section(text, "Impact")
+    return "TODO" in steps or "TODO" in impact
+
+
 def draft_poc(finding: Finding, program: Program) -> Finding:
     if finding.status != FindingStatus.CANDIDATE:
         raise RuntimeError(
