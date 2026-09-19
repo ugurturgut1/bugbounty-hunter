@@ -554,9 +554,46 @@ yes for a specific program, not changing who gets to say yes.
       reflect what's now wired in vs. what still isn't (business-logic/race-condition testing, and
       anything genuinely destructive like `--os-shell` or an unbounded `--dump`, stay out on purpose).
 
+18. *(done 2026-09-20)* Recon speed: parallelized every per-seed lookup in `run_passive_recon` that
+    doesn't touch the target itself, per explicit user feedback that even a small target's recon took
+    "too much time." crt.sh, Certspotter, subfinder, assetfinder, Wayback subdomains, Wayback param
+    URLs, and SPF/DMARC/DKIM (9 independent calls, all third-party services or public DNS resolvers,
+    never the target) now run concurrently via a shared `ThreadPoolExecutor`
+    (`RECON_EXECUTOR_MAX_WORKERS`) instead of serially with individual courtesy sleeps between each --
+    collapses their sum into their max, replaced by one combined `PARALLEL_OSINT_DELAY_SECONDS` pause.
+    Dangling-CNAME resolution (also DNS-only, `check_dangling_cname`) is similarly pre-resolved in
+    parallel across every host about to be fingerprinted, ahead of -- and separate from -- the serial,
+    `FINGERPRINT_DELAY_SECONDS`-paced per-host loop that actually sends requests to the target.
+    **`FINGERPRINT_DELAY_SECONDS` itself, and every other pacing constant that governs requests to the
+    target's own infrastructure, is completely untouched** -- this optimization only removes wasted
+    serial wall-clock time waiting on third parties, it does not change request volume or rate against
+    any program's own assets, so it doesn't touch the "must never be reduced to make a run finish
+    faster" guardrail on `FINGERPRINT_DELAY_SECONDS`. A synthetic timing check (9 mocked 0.5s-latency
+    calls) measured ~3s versus what would have been ~7s serial -- real wall-clock improvement scales
+    with how slow the slowest single third-party call is (often `subfinder`, up to its own 15s timeout)
+    rather than the sum of all of them. `CRTSH_DELAY_SECONDS`/`CERTSPOTTER_DELAY_SECONDS`/
+    `WAYBACK_DELAY_SECONDS`/`DNS_DELAY_SECONDS` (the old per-call sleeps these replaced) were removed
+    rather than left as dead constants. Full suite (305 tests) still passing -- the existing
+    `KeyboardInterrupt`-preserves-partial-results behavior (tests/test_recon_interrupt.py) still holds
+    with the new executor, confirmed via the executor's own exception propagation through
+    `future.result()`, not a special case.
+
+19. *(done 2026-09-20)* `draft-poc` now embeds a real, matching section of `docs/VULN_TECHNIQUE_NOTES.md`
+    (`reporting/poc.py`'s `_technique_notes_for`, keyword-matched against the Finding's `vuln_class` --
+    e.g. `reflected-xss-candidate` -> the XSS section, `shellshock-candidate`/`command-injection-*` ->
+    RCE) directly into the drafted PoC markdown, verbatim, right above the reproduction-steps TODO --
+    so whoever's about to fill that in has the relevant manual-verification technique in front of them
+    instead of a blank page. Never fabricated, never a claim about the specific finding -- just the same
+    real file's content, and silently omitted (not guessed at) for a `vuln_class` with no matching
+    section. 7 new tests.
+
 Longer-term ideas not yet scoped into a phase: broader business-logic/race-condition testing (not
 generically automatable, would need per-program custom logic), stateful (server-side conversation ID)
-multi-turn AI APIs, and TLS/certificate weakness checks for A02.
+multi-turn AI APIs, and TLS/certificate weakness checks for A02. Also noted, not yet started: the
+active-testing/PoC/report side is the actual value driver for getting to a real submission (passive
+recon mostly just narrows where to look), so future speed/quality work should weight there first;
+possibly a cybersecurity-specialized LLM to triage findings and decide what's worth going deeper on
+(see conversation notes -- not scoped into a phase yet, needs its own design discussion first).
 
 ## Why HackerOne/Bugcrowd/Intigriti/YesWeHack connectors use official APIs, not scraping
 

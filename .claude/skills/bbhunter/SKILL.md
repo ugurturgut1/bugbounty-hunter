@@ -21,6 +21,23 @@ high-risk-tier section below), `approve-poc`, `approve-report`, or a
 non-`--manual` `submit` on your own judgment. Those commands only ever
 run with an argument the user just gave you in this conversation.
 
+**But once a gate IS passed, be thorough and confident on the other side
+of it, not cautious for its own sake.** Passive recon mostly narrows
+where to look; active testing (once approved) is what actually gets a
+program to a real, submittable finding, and that's where this pipeline's
+real value is. Once a test type is approved for a program: run the full
+depth of checks that approval covers, don't hold back or under-run out
+of an abundance of caution the user already resolved by approving it.
+Same for PoC drafting and report writing (steps 4-5 below) -- write a
+complete, technically clear explanation of the vulnerability, its
+mechanism, and its impact every time, drawing on
+`docs/VULN_TECHNIQUE_NOTES.md` for the class-specific detail. The one
+thing that never changes: you still never fabricate or assume the
+reproduction steps/impact were verified -- that's still the user's own
+confirmation at `approve-poc`, always. Confidence applies to the
+quality and thoroughness of the work you do, never to skipping the
+human verification a gate exists for.
+
 ## 1. Sync + pick a target
 
 ```bash

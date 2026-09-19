@@ -85,6 +85,7 @@ import re
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Callable
 from urllib.parse import urlparse
@@ -115,9 +116,6 @@ MAX_SUBDOMAINS_PER_SEED = 25
 MAX_PARAM_URLS_PER_SEED = 200
 FINGERPRINT_DELAY_SECONDS = 1.0
 NVD_DELAY_SECONDS = 6.0  # unauthenticated NVD rate limit is 5 requests / 30s
-CRTSH_DELAY_SECONDS = 0.5  # crt.sh is a free public service, not the target -- still worth not hammering
-CERTSPOTTER_DELAY_SECONDS = 0.5  # same courtesy as crt.sh -- the real limiting factor is Certspotter's own
-                                  # 10-requests/hour unauthenticated quota, which a per-request delay can't fix
 SUBFINDER_TIMEOUT_SECONDS = 15  # trimmed from 30 2026-09-18 -- live-tested 2026-09-17: unauthenticated
                                  # subfinder against a real domain can take several minutes across its ~30
                                  # sources with no API keys configured; 15s (vs. subfinder's own 60s
@@ -125,8 +123,29 @@ SUBFINDER_TIMEOUT_SECONDS = 15  # trimmed from 30 2026-09-18 -- live-tested 2026
                                  # run staying in the tens-of-minutes range on a medium/large program
                                  # instead of hours -- still returns whatever sources answered in time,
                                  # never treated as a hard failure unless nothing came back at all
-WAYBACK_DELAY_SECONDS = 0.5  # archive.org is a free public service, not the target
-DNS_DELAY_SECONDS = 0.3  # public DNS resolvers, not the target -- still worth pacing
+# CRTSH_DELAY_SECONDS/CERTSPOTTER_DELAY_SECONDS/WAYBACK_DELAY_SECONDS/DNS_DELAY_SECONDS were individual
+# per-call courtesy sleeps, replaced 2026-09-20 by PARALLEL_OSINT_DELAY_SECONDS below once those calls
+# started running concurrently instead of serially (see run_passive_recon) -- removed rather than left
+# as dead constants.
+PARALLEL_OSINT_DELAY_SECONDS = 0.5  # single combined courtesy pause after the whole parallel OSINT
+                                     # batch below (crt.sh/Certspotter/subfinder/assetfinder/Wayback x2/
+                                     # SPF/DMARC/DKIM), replacing what used to be 4 separate sequential
+                                     # sleeps -- every one of those calls hits a third-party service or a
+                                     # public DNS resolver, never the target itself (same reasoning the
+                                     # module docstring already gives for why none of them need the
+                                     # target's own rate limit respected), so running them concurrently
+                                     # collapses their sum into their max without touching
+                                     # FINGERPRINT_DELAY_SECONDS or anything else that actually paces
+                                     # requests to the target -- that stays untouched, still fully serial,
+                                     # below in the per-host fingerprinting loop.
+RECON_EXECUTOR_MAX_WORKERS = 12  # shared thread pool for every target-untouched, parallelizable batch
+                                  # below: per-seed OSINT gathering (crtsh + certspotter + subfinder +
+                                  # assetfinder + wayback_subdomains + wayback_param_urls + spf + dmarc +
+                                  # dkim, 9 tasks) and, separately, dangling-CNAME pre-resolution across
+                                  # every host_to_fingerprint (DNS-only, see check_dangling_cname's own
+                                  # docstring) -- the two batches never run concurrently with each other
+                                  # (each is awaited via .result() before the next phase starts), so one
+                                  # pool sized for the larger of the two is enough
 
 
 def _tool_path(name: str) -> str | None:
@@ -870,6 +889,11 @@ def run_passive_recon(
     seeds_processed = 0
     seed_durations: list[float] = []
 
+    # Shared across every seed -- see RECON_EXECUTOR_MAX_WORKERS. Not a context manager here
+    # (the seed loop's existing KeyboardInterrupt handling below would otherwise need re-indenting
+    # under a `with` block) -- shut down explicitly in `finally` instead, `wait=False` so an
+    # interrupt-triggered shutdown doesn't itself block on still-running (target-untouched) futures.
+    executor = ThreadPoolExecutor(max_workers=RECON_EXECUTOR_MAX_WORKERS)
     try:
         for seed_index, asset in enumerate(recon_assets, start=1):
             seed_start = time.monotonic()
@@ -878,43 +902,50 @@ def run_passive_recon(
                 seeds_processed += 1
                 continue
 
-            _report(f"[{seed_index}/{seeds_total}] {host}: crt.sh...")
-            discovered, crtsh_ok = crtsh_subdomains(host)
-            time.sleep(CRTSH_DELAY_SECONDS)
+            _report(
+                f"[{seed_index}/{seeds_total}] {host}: gathering crt.sh/Certspotter/subfinder/"
+                "assetfinder/Wayback subdomains + Wayback param URLs + DNS hygiene (SPF/DMARC/DKIM) "
+                "(parallel, third-party services only -- never the target itself)..."
+            )
+            email_domain = host[4:] if host.lower().startswith("www.") else host
+            crtsh_future = executor.submit(crtsh_subdomains, host)
+            certspotter_future = executor.submit(certspotter_subdomains, host)
+            subfinder_future = executor.submit(subfinder_subdomains, host)
+            assetfinder_future = executor.submit(assetfinder_subdomains, host)
+            wayback_future = executor.submit(wayback_subdomains, host)
+            wayback_param_future = executor.submit(wayback_param_urls, host)
+            spf_future = executor.submit(check_spf, email_domain)
+            dmarc_future = executor.submit(check_dmarc, email_domain)
+            dkim_future = executor.submit(check_dkim, email_domain)
+
+            discovered, crtsh_ok = crtsh_future.result()
             if not crtsh_ok:
                 crtsh_failures.append(host)
 
-            _report(f"[{seed_index}/{seeds_total}] {host}: certspotter...")
-            certspotter_names, certspotter_ok = certspotter_subdomains(host)
-            time.sleep(CERTSPOTTER_DELAY_SECONDS)
+            certspotter_names, certspotter_ok = certspotter_future.result()
             if not certspotter_ok:
                 certspotter_failures.append(host)
             discovered |= certspotter_names
 
-            _report(f"[{seed_index}/{seeds_total}] {host}: subfinder...")
-            subfinder_names, subfinder_ok = subfinder_subdomains(host)
+            subfinder_names, subfinder_ok = subfinder_future.result()
             if not subfinder_ok:
                 subfinder_failures.append(host)
             discovered |= subfinder_names
 
-            _report(f"[{seed_index}/{seeds_total}] {host}: assetfinder...")
-            assetfinder_names, assetfinder_ok = assetfinder_subdomains(host)
+            assetfinder_names, assetfinder_ok = assetfinder_future.result()
             if not assetfinder_ok:
                 assetfinder_failures.append(host)
             discovered |= assetfinder_names
 
-            _report(f"[{seed_index}/{seeds_total}] {host}: wayback...")
-            wayback_names, wayback_ok = wayback_subdomains(host)
-            time.sleep(WAYBACK_DELAY_SECONDS)
+            wayback_names, wayback_ok = wayback_future.result()
             if not wayback_ok:
                 wayback_failures.append(host)
             discovered |= wayback_names
 
             subdomains_by_seed[host] = sorted(discovered)
-            _report(f"[{seed_index}/{seeds_total}] {host}: {len(discovered)} subdomain(s) found, DNS hygiene...")
+            _report(f"[{seed_index}/{seeds_total}] {host}: {len(discovered)} subdomain(s) found")
 
-            email_domain = host[4:] if host.lower().startswith("www.") else host
-            for hit in [*check_spf(email_domain), *check_dmarc(email_domain), *check_dkim(email_domain)]:
+            for hit in [*spf_future.result(), *dmarc_future.result(), *dkim_future.result()]:
                 findings.append(
                     Finding(
                         id=f"{program.key}:{email_domain}:{hit['kind']}",
@@ -928,12 +959,12 @@ def run_passive_recon(
                         notes=f"severity guess: {hit['severity']} -- verify manually before drafting a PoC",
                     )
                 )
-            time.sleep(DNS_DELAY_SECONDS)
 
-            param_urls = wayback_param_urls(host)
-            time.sleep(WAYBACK_DELAY_SECONDS)
+            param_urls = wayback_param_future.result()
             if param_urls:
                 param_urls_by_seed[host] = param_urls
+
+            time.sleep(PARALLEL_OSINT_DELAY_SECONDS)
 
             _report(f"[{seed_index}/{seeds_total}] {host}: JS harvesting...")
             for hit in _harvest_js_for_host(host, program.rules):
@@ -991,9 +1022,17 @@ def run_passive_recon(
 
             _report(f"[{seed_index}/{seeds_total}] {host}: resolving discovered subdomains...")
             resolvable = dnsx_resolve(discovered)
-            time.sleep(DNS_DELAY_SECONDS)
             discovered_for_fingerprint = resolvable if resolvable is not None else discovered
             hosts_to_fingerprint = [host] + sorted(discovered_for_fingerprint)[:max_subdomains_per_seed]
+
+            _report(
+                f"[{seed_index}/{seeds_total}] {host}: dangling-CNAME check "
+                f"({len(hosts_to_fingerprint)} host(s), parallel, DNS-only)..."
+            )
+            cname_futures = {th: executor.submit(check_dangling_cname, th) for th in hosts_to_fingerprint}
+            cname_hits = {th: fut.result() for th, fut in cname_futures.items()}
+            time.sleep(PARALLEL_OSINT_DELAY_SECONDS)
+
             for host_index, target_host in enumerate(hosts_to_fingerprint, start=1):
                 if target_host in fingerprints:
                     continue
@@ -1002,8 +1041,7 @@ def run_passive_recon(
                     f"[{seed_index}/{seeds_total}] {host}: fingerprinting "
                     f"{host_index}/{len(hosts_to_fingerprint)} ({target_host})..."
                 )
-                cname_hit = check_dangling_cname(target_host)
-                time.sleep(DNS_DELAY_SECONDS)
+                cname_hit = cname_hits.get(target_host)
                 if cname_hit:
                     findings.append(
                         Finding(
@@ -1106,6 +1144,8 @@ def run_passive_recon(
         # back, just with seeds_processed < len(recon_assets) so it knows
         # this program wasn't fully covered and may be worth re-running.
         pass
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
     result = ReconResult(
         program_key=program.key,

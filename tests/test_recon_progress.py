@@ -46,7 +46,7 @@ def test_on_progress_called_with_seed_substeps():
 
     assert any("crt.sh" in m for m in messages)
     assert any("subfinder" in m for m in messages)
-    assert any("wayback" in m for m in messages)
+    assert any("Wayback" in m for m in messages)
     assert any("DNS hygiene" in m for m in messages)
     assert any("JS harvesting" in m for m in messages)
     assert any("fingerprinting" in m for m in messages)

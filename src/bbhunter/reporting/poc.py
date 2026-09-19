@@ -7,6 +7,16 @@ the actual reproduction narrative, verification, and impact assessment as
 explicit TODOs for a human. Nothing downstream (`draft_report`) reads
 this file's TODOs as if they were filled in; the approval gate in
 `approve-poc` is where a human confirms they actually did the work.
+
+One piece of head-start reference IS included automatically, never
+generated: `_technique_notes_for` best-effort-matches the Finding's
+`vuln_class` against a section heading in `docs/VULN_TECHNIQUE_NOTES.md`
+and embeds that section's real text verbatim, so whoever's about to
+write the reproduction steps below has the relevant manual-verification
+notes right there instead of a blank page. This is reference material to
+work from, not a substitute for actually reproducing the finding -- it
+never claims anything about this specific finding, only general
+technique for the vuln class.
 """
 from __future__ import annotations
 
@@ -18,6 +28,44 @@ from bbhunter.models import Finding, FindingStatus, Program
 
 POC_DIR = DATA_DIR / "pocs"
 POC_DIR.mkdir(parents=True, exist_ok=True)
+
+VULN_TECHNIQUE_NOTES_PATH = Path(__file__).resolve().parents[3] / "docs" / "VULN_TECHNIQUE_NOTES.md"
+
+# vuln_class substring (checked lowercase, first match wins) -> the exact "## " heading it maps to
+# in docs/VULN_TECHNIQUE_NOTES.md. Deliberately not exhaustive -- classes with no real notes there
+# (IDOR, cloud buckets, TLS findings, etc.) just get no technique-notes section, not a fabricated one.
+_TECHNIQUE_NOTE_KEYWORDS: list[tuple[str, str]] = [
+    ("shellshock", "RCE"),
+    ("command-injection", "RCE"),
+    ("crlf", "CRLF / HTTP response splitting"),
+    ("sql-injection", "SQL injection"),
+    ("sql-error", "SQL injection"),
+    ("nosql-error", "SQL injection"),
+    ("xss", "XSS"),
+    ("ssrf", "SSRF"),
+    ("xxe", "XXE"),
+    ("ssti", "Template injection (SSTI)"),
+    ("redirect", "Open redirect"),
+]
+
+
+def _technique_notes_for(vuln_class: str) -> tuple[str, str] | None:
+    """Returns `(heading, body)` for the `docs/VULN_TECHNIQUE_NOTES.md`
+    section matching `vuln_class`, or `None` if nothing matches or the
+    file can't be read -- callers must treat `None` as "no notes to
+    include," never an error."""
+    vuln_class_lower = vuln_class.lower()
+    heading = next((h for kw, h in _TECHNIQUE_NOTE_KEYWORDS if kw in vuln_class_lower), None)
+    if not heading:
+        return None
+    try:
+        text = VULN_TECHNIQUE_NOTES_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = re.search(rf"^## {re.escape(heading)}\n(.*?)(?=^## |\Z)", text, re.DOTALL | re.MULTILINE)
+    if not match:
+        return None
+    return heading, match.group(1).strip()
 
 
 def _slug(finding_id: str) -> str:
@@ -34,6 +82,16 @@ def draft_poc(finding: Finding, program: Program) -> Finding:
             f"{finding.id}: can only draft a PoC from status=candidate (currently {finding.status.value})"
         )
 
+    notes_match = _technique_notes_for(finding.vuln_class)
+    technique_section = (
+        f"\n## Technique notes ({notes_match[0]}, from docs/VULN_TECHNIQUE_NOTES.md)\n\n"
+        f"{notes_match[1]}\n\n"
+        "_Reference for how to approach reproduction/verification for this vuln class -- not a claim "
+        "about this specific finding._\n"
+        if notes_match
+        else ""
+    )
+
     path = poc_path_for(finding.id)
     path.write_text(
         f"""# PoC: {finding.title}
@@ -49,7 +107,7 @@ def draft_poc(finding: Finding, program: Program) -> Finding:
 {finding.evidence}
 
 {f"Automation notes: {finding.notes}" if finding.notes else ""}
-
+{technique_section}
 ## Reproduction steps
 
 <!-- TODO (human): verify the finding above yourself and write the exact,
