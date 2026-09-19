@@ -7,6 +7,9 @@ from unittest.mock import MagicMock, patch
 from bbhunter.recon.passive import (
     _tech_banner_candidates,
     _tool_path,
+    assetfinder_subdomains,
+    certspotter_subdomains,
+    dnsx_resolve,
     fingerprint,
     httpx_tech_detect,
     subfinder_subdomains,
@@ -75,6 +78,86 @@ def test_subfinder_subdomains_subprocess_error_is_not_ok():
 
 
 _CDX_HEADER = ["original"]
+
+
+def test_certspotter_subdomains_extracts_and_filters_dns_names():
+    entries = [
+        {"dns_names": ["example.com", "*.api.example.com", "www.other.com"]},
+        {"dns_names": ["sub.example.com"]},
+    ]
+    fake_resp = MagicMock()
+    fake_resp.raise_for_status.return_value = None
+    fake_resp.json.return_value = entries
+    with patch("bbhunter.recon.passive.httpx.get", return_value=fake_resp):
+        names, ok = certspotter_subdomains("example.com")
+    assert ok is True
+    assert names == {"example.com", "api.example.com", "sub.example.com"}  # www.other.com dropped, wildcard stripped
+
+
+def test_certspotter_subdomains_rate_limited_is_not_ok():
+    import httpx as real_httpx
+
+    fake_resp = MagicMock()
+    fake_resp.raise_for_status.side_effect = real_httpx.HTTPStatusError(
+        "429", request=MagicMock(), response=MagicMock(status_code=429)
+    )
+    with patch("bbhunter.recon.passive.httpx.get", return_value=fake_resp):
+        names, ok = certspotter_subdomains("example.com")
+    assert names == set()
+    assert ok is False  # rate-limited is "we don't know", never treated as "found nothing"
+
+
+def test_assetfinder_subdomains_returns_not_ok_when_binary_missing():
+    with patch("bbhunter.recon.passive._tool_path", return_value=None):
+        names, ok = assetfinder_subdomains("example.com")
+    assert names == set()
+    assert ok is False
+
+
+def test_assetfinder_subdomains_parses_stdout_and_filters_to_domain():
+    fake_proc = MagicMock(returncode=0, stdout="api.example.com\nsub.other.com\n\n", stderr="")
+    with patch("bbhunter.recon.passive._tool_path", return_value="/fake/assetfinder"), \
+         patch("bbhunter.recon.passive.subprocess.run", return_value=fake_proc) as run:
+        names, ok = assetfinder_subdomains("example.com")
+    assert ok is True
+    assert names == {"api.example.com"}  # sub.other.com dropped -- doesn't end with the queried domain
+    assert "--subs-only" in run.call_args.args[0]  # never pull in unrelated root domains
+
+
+def test_assetfinder_subdomains_nonzero_exit_with_no_output_is_a_failure():
+    fake_proc = MagicMock(returncode=1, stdout="", stderr="error")
+    with patch("bbhunter.recon.passive._tool_path", return_value="/fake/assetfinder"), \
+         patch("bbhunter.recon.passive.subprocess.run", return_value=fake_proc):
+        names, ok = assetfinder_subdomains("example.com")
+    assert names == set()
+    assert ok is False
+
+
+def test_dnsx_resolve_returns_empty_set_for_empty_input():
+    assert dnsx_resolve(set()) == set()
+
+
+def test_dnsx_resolve_returns_none_when_binary_missing():
+    with patch("bbhunter.recon.passive._tool_path", return_value=None):
+        result = dnsx_resolve({"a.example.com", "b.example.com"})
+    assert result is None
+
+
+def test_dnsx_resolve_filters_to_resolved_hosts_only():
+    fake_proc = MagicMock(returncode=0, stdout="a.example.com\n", stderr="")
+    with patch("bbhunter.recon.passive._tool_path", return_value="/fake/dnsx"), \
+         patch("bbhunter.recon.passive.subprocess.run", return_value=fake_proc):
+        result = dnsx_resolve({"a.example.com", "b.example.com"})
+    assert result == {"a.example.com"}
+
+
+def test_dnsx_resolve_returns_none_on_subprocess_error():
+    import subprocess as sp
+
+    with patch("bbhunter.recon.passive._tool_path", return_value="/fake/dnsx"), \
+         patch("bbhunter.recon.passive.subprocess.run", side_effect=sp.TimeoutExpired(cmd="dnsx", timeout=1)):
+        result = dnsx_resolve({"a.example.com"})
+    assert result is None
 
 
 def test_wayback_subdomains_extracts_hosts_under_domain():

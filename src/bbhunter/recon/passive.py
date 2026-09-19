@@ -3,17 +3,32 @@ which `RulesOfEngagement.permits()` always allows regardless of
 confidence (see models.py) -- it's the guardrail floor, not something
 gated per-program like active testing will be in Phase 3.
 
-Subdomain discovery merges three sources, none of which send a request
-to the target itself: certificate-transparency (crt.sh), the `subfinder`
-binary (projectdiscovery -- itself just a fan-out over ~30 passive OSINT
-sources: crt.sh, DNS aggregators, etc, never a direct probe of the
-target), and archive.org's Wayback CDX API (also surfaces historic URLs
+Subdomain discovery merges five sources, none of which send a request to
+the target itself: certificate-transparency via crt.sh and, as a second
+independent CT-log source, SSLMate's Certspotter API
+(`certspotter_subdomains` -- unauthenticated tier is capped at 10
+requests/hour per Certspotter's own `x-ratelimit-limit` header, so on a
+program with many seeds this source runs out mid-run; that's treated the
+same as any other source hitting its limit, `succeeded=False` and
+silently move on, never a hard failure of the whole run), the
+`subfinder` binary (projectdiscovery -- itself just a fan-out over ~30
+passive OSINT sources: crt.sh, DNS aggregators, etc, never a direct
+probe of the target), a fifth source `assetfinder` (tomnomnom,
+`--subs-only`, heavy overlap with subfinder but an independent source
+list), and archive.org's Wayback CDX API (also surfaces historic URLs
 with query strings, saved as `ReconResult.param_urls` -- the input set
 for testing/active.py's opt-in, still-gated injection-signature checks).
-CVE keyword search against NVD is likewise third-party-only. `subfinder`
-is optional: if the binary isn't installed, that source is silently
-skipped (see README for `go install` instructions) and everything else
-still works.
+CVE keyword search against NVD is likewise third-party-only.
+`subfinder`/`assetfinder` are optional: if a binary isn't installed,
+that source is silently skipped (see README for `go install`
+instructions) and everything else still works.
+
+Before fingerprinting, discovered subdomains are filtered through
+`dnsx_resolve` (the `dnsx` binary, also optional) -- public DNS queries
+only, never touching the target's HTTP surface -- so
+`max_subdomains_per_seed`'s cap is spent on hosts that actually resolve
+rather than a stale crt.sh/Wayback entry. Falls back to the unfiltered
+set if `dnsx` isn't installed.
 
 Fingerprinting is the one step that sends requests to the target itself
 -- one plain GET per discovered host, optionally enriched by the
@@ -54,6 +69,12 @@ public code-search API for the domain alongside a real secret-shaped
 pattern -- classic "GitHub recon" dorking, entirely third-party (never
 touches the target), skipped silently unless a free GitHub personal
 access token is configured (`GITHUB_API_TOKEN`, see .env.example).
+
+Per seed host, `recon/well_known.py` also fetches /robots.txt and
+/security.txt (RFC 9116 -- /.well-known/security.txt first, falling
+back to the legacy path) -- both are files a host publishes specifically
+to be read by any crawler/researcher, same request class as the plain
+GET `fingerprint()` already makes. See that module's docstring.
 """
 from __future__ import annotations
 
@@ -65,6 +86,7 @@ import shutil
 import subprocess
 import time
 from datetime import datetime
+from typing import Callable
 from urllib.parse import urlparse
 
 import httpx
@@ -81,8 +103,10 @@ from bbhunter.recon.js_harvest import (
     scan_js_internal_paths,
     scan_js_secrets,
 )
+from bbhunter.recon.well_known import check_robots_txt, check_security_txt
 
 CRTSH_URL = "https://crt.sh/"
+CERTSPOTTER_URL = "https://api.certspotter.com/v1/issuances"
 NVD_CVE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 WAYBACK_CDX_URL = "https://web.archive.org/cdx/search/cdx"
 DEFAULT_USER_AGENT = os.environ.get("BBHUNTER_USER_AGENT", "bbhunter-recon/0.1 (personal security research tool)")
@@ -92,10 +116,15 @@ MAX_PARAM_URLS_PER_SEED = 200
 FINGERPRINT_DELAY_SECONDS = 1.0
 NVD_DELAY_SECONDS = 6.0  # unauthenticated NVD rate limit is 5 requests / 30s
 CRTSH_DELAY_SECONDS = 0.5  # crt.sh is a free public service, not the target -- still worth not hammering
-SUBFINDER_TIMEOUT_SECONDS = 30  # live-tested 2026-09-17: unauthenticated subfinder against a real domain can take
-                                 # several minutes across its ~30 sources with no API keys configured -- 30s here
-                                 # (vs. subfinder's own 60s default) trades some source coverage for keeping a
-                                 # full multi-seed `bbhunter recon` run from taking hours on a large program
+CERTSPOTTER_DELAY_SECONDS = 0.5  # same courtesy as crt.sh -- the real limiting factor is Certspotter's own
+                                  # 10-requests/hour unauthenticated quota, which a per-request delay can't fix
+SUBFINDER_TIMEOUT_SECONDS = 15  # trimmed from 30 2026-09-18 -- live-tested 2026-09-17: unauthenticated
+                                 # subfinder against a real domain can take several minutes across its ~30
+                                 # sources with no API keys configured; 15s (vs. subfinder's own 60s
+                                 # default) trades more source coverage for a multi-seed `bbhunter recon`
+                                 # run staying in the tens-of-minutes range on a medium/large program
+                                 # instead of hours -- still returns whatever sources answered in time,
+                                 # never treated as a hard failure unless nothing came back at all
 WAYBACK_DELAY_SECONDS = 0.5  # archive.org is a free public service, not the target
 DNS_DELAY_SECONDS = 0.3  # public DNS resolvers, not the target -- still worth pacing
 
@@ -130,7 +159,7 @@ def _extract_host(identifier: str) -> str | None:
     return host.lstrip("*.") or None
 
 
-def crtsh_subdomains(domain: str, *, timeout: float = 30) -> tuple[set[str], bool]:
+def crtsh_subdomains(domain: str, *, timeout: float = 15) -> tuple[set[str], bool]:
     """Returns (discovered_names, succeeded). `succeeded=False` means the
     query itself errored (timeout, crt.sh rate-limiting, bad JSON) --
     distinct from a successful query that legitimately found nothing, so
@@ -157,6 +186,37 @@ def crtsh_subdomains(domain: str, *, timeout: float = 30) -> tuple[set[str], boo
     return names, True
 
 
+def certspotter_subdomains(domain: str, *, timeout: float = 15) -> tuple[set[str], bool]:
+    """SSLMate's Certspotter CT-log API -- a second, independent
+    certificate-transparency source alongside crt.sh (see
+    docs/EXTERNAL_RESOURCES.md). Never touches the target. Same
+    (names, succeeded) contract as crtsh_subdomains: `succeeded=False`
+    covers both a request error and the unauthenticated tier's own
+    10-requests/hour rate limit being exhausted (a 4xx from
+    `raise_for_status()`, caught below) -- either way this is "we don't
+    know", not "found nothing", so crt.sh staying the primary CT source
+    matters more here than usual."""
+    try:
+        resp = httpx.get(
+            CERTSPOTTER_URL,
+            params={"domain": domain, "include_subdomains": "true", "expand": "dns_names"},
+            timeout=timeout,
+            headers={"User-Agent": DEFAULT_USER_AGENT},
+        )
+        resp.raise_for_status()
+        entries = resp.json()
+    except (httpx.HTTPError, ValueError):
+        return set(), False
+
+    names: set[str] = set()
+    for entry in entries:
+        for name in entry.get("dns_names", []):
+            name = name.strip().lstrip("*.").lower()
+            if name and name.endswith(domain):
+                names.add(name)
+    return names, True
+
+
 def subfinder_subdomains(domain: str, *, timeout: float = SUBFINDER_TIMEOUT_SECONDS) -> tuple[set[str], bool]:
     """Shells out to the `subfinder` binary in its default passive mode
     (no active flags like `-active`/DNS-bruteforce are ever passed) --
@@ -173,7 +233,7 @@ def subfinder_subdomains(domain: str, *, timeout: float = SUBFINDER_TIMEOUT_SECO
             [binary, "-d", domain, "-silent", "-timeout", str(int(timeout))],
             capture_output=True,
             text=True,
-            timeout=timeout + 30,
+            timeout=timeout + 10,
         )
     except (subprocess.SubprocessError, OSError):
         return set(), False
@@ -184,6 +244,68 @@ def subfinder_subdomains(domain: str, *, timeout: float = SUBFINDER_TIMEOUT_SECO
     if proc.returncode != 0 and not names:
         return set(), False
     return {n for n in names if n.endswith(domain)}, True
+
+
+def assetfinder_subdomains(domain: str, *, timeout: float = 15) -> tuple[set[str], bool]:
+    """Shells out to the `assetfinder` binary (tomnomnom) with
+    `--subs-only` -- restricts output to actual subdomains of `domain`,
+    never the unrelated "related root domains" assetfinder can also
+    surface without that flag (those would be a scope violation to
+    silently start treating as in-scope). A fourth passive subdomain
+    source alongside crt.sh/Certspotter/subfinder/Wayback -- heavy
+    overlap with subfinder in practice, but a different, independent
+    source list, so worth the one extra optional binary. Same
+    (names, succeeded) contract and silent-skip-if-missing behavior as
+    every other optional source here."""
+    binary = _tool_path("assetfinder")
+    if not binary:
+        return set(), False
+    try:
+        proc = subprocess.run(
+            [binary, "--subs-only", domain],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return set(), False
+    names = {line.strip().lower() for line in proc.stdout.splitlines() if line.strip()}
+    if proc.returncode != 0 and not names:
+        return set(), False
+    return {n for n in names if n.endswith(domain)}, True
+
+
+def dnsx_resolve(hosts: set[str], *, timeout: float = 15) -> set[str] | None:
+    """Filters `hosts` down to the ones that actually resolve, via the
+    `dnsx` binary (projectdiscovery) in silent mode -- public DNS
+    queries only, never touches the target's own HTTP surface, same
+    request class as recon/dns_hygiene.py's lookups. Used to keep
+    `max_subdomains_per_seed`'s fingerprinting budget from being spent
+    on a crt.sh/Certspotter/subfinder/assetfinder/Wayback entry that no
+    longer resolves (a stale cert, an expired Wayback snapshot) ahead of
+    a live one. Returns None -- not "resolved nothing" -- if the binary
+    isn't installed or the run fails; callers must fall back to the
+    unfiltered set in that case, never silently drop every host just
+    because dnsx wasn't available."""
+    if not hosts:
+        return set()
+    binary = _tool_path("dnsx")
+    if not binary:
+        return None
+    try:
+        proc = subprocess.run(
+            [binary, "-silent"],
+            input="\n".join(sorted(hosts)),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    resolved = {line.strip().lower() for line in proc.stdout.splitlines() if line.strip()}
+    if proc.returncode != 0 and not resolved:
+        return None
+    return resolved & hosts
 
 
 def _wayback_cdx_query(params: dict, *, timeout: float) -> list[list[str]] | None:
@@ -201,7 +323,7 @@ def _wayback_cdx_query(params: dict, *, timeout: float) -> list[list[str]] | Non
     return rows[1:] if rows else []  # first row is the field-name header, not data
 
 
-def wayback_subdomains(domain: str, *, timeout: float = 30) -> tuple[set[str], bool]:
+def wayback_subdomains(domain: str, *, timeout: float = 15) -> tuple[set[str], bool]:
     """Archive.org's CDX API, queried for anything ever crawled under
     `*.domain/*`. Never sends a request to the target -- archive.org
     only. Same (names, succeeded) contract as crtsh_subdomains.
@@ -227,7 +349,7 @@ def wayback_subdomains(domain: str, *, timeout: float = 30) -> tuple[set[str], b
     return names, True
 
 
-def wayback_param_urls(domain: str, *, timeout: float = 30, limit: int = MAX_PARAM_URLS_PER_SEED) -> list[str]:
+def wayback_param_urls(domain: str, *, timeout: float = 15, limit: int = MAX_PARAM_URLS_PER_SEED) -> list[str]:
     """Historic URLs under `domain` that Wayback recorded with a query
     string -- the candidate set testing/active.py's opt-in
     injection-signature checks draw from, since those checks need a
@@ -258,7 +380,7 @@ def wayback_param_urls(domain: str, *, timeout: float = 30, limit: int = MAX_PAR
     return urls
 
 
-def httpx_tech_detect(host: str, rules: RulesOfEngagement, *, timeout: float = 15) -> dict | None:
+def httpx_tech_detect(host: str, rules: RulesOfEngagement, *, timeout: float = 8) -> dict | None:
     """Optional enrichment over `fingerprint_host` using the `httpx`
     binary (projectdiscovery) for its tech-stack signature database --
     far broader than this module's own Server/X-Powered-By header check.
@@ -280,7 +402,7 @@ def httpx_tech_detect(host: str, rules: RulesOfEngagement, *, timeout: float = 1
             + header_args,
             capture_output=True,
             text=True,
-            timeout=timeout + 15,
+            timeout=timeout + 8,
         )
     except (subprocess.SubprocessError, OSError):
         return None
@@ -493,7 +615,7 @@ def tls_findings(host: str, info: dict) -> list[dict]:
     return hits
 
 
-def fingerprint_host(host: str, rules: RulesOfEngagement, *, timeout: float = 15) -> dict | None:
+def fingerprint_host(host: str, rules: RulesOfEngagement, *, timeout: float = 8) -> dict | None:
     headers = _request_headers(rules)
     for scheme in ("https", "http"):
         try:
@@ -509,7 +631,7 @@ def fingerprint_host(host: str, rules: RulesOfEngagement, *, timeout: float = 15
     return None
 
 
-def fingerprint(host: str, rules: RulesOfEngagement, *, timeout: float = 15) -> dict | None:
+def fingerprint(host: str, rules: RulesOfEngagement, *, timeout: float = 8) -> dict | None:
     """One request per host, same as `fingerprint_host` alone -- when the
     `httpx` binary is installed this uses it directly (its tech-detect
     signature database is far broader than the plain Server/
@@ -647,7 +769,7 @@ def _harvest_js_for_host(host: str, rules: RulesOfEngagement) -> list[dict]:
     [] on any failure to fetch the page itself."""
     headers = _request_headers(rules)
     try:
-        resp = httpx.get(f"https://{host}", headers=headers, timeout=15, follow_redirects=True)
+        resp = httpx.get(f"https://{host}", headers=headers, timeout=8, follow_redirects=True)
     except httpx.HTTPError:
         return []
     if resp.status_code != 200:
@@ -685,8 +807,20 @@ def _harvest_js_for_host(host: str, rules: RulesOfEngagement) -> list[dict]:
     return hits
 
 
+def _check_well_known_for_host(host: str, rules: RulesOfEngagement) -> list[dict]:
+    """One GET to /robots.txt and up to two GETs for security.txt
+    (`.well-known/` then the legacy path) -- see recon/well_known.py.
+    Same required-User-Agent/header contract as every other request this
+    module makes against the target."""
+    headers = _request_headers(rules)
+    return check_robots_txt(host, headers) + check_security_txt(host, headers)
+
+
 def run_passive_recon(
-    program: Program, *, max_subdomains_per_seed: int = MAX_SUBDOMAINS_PER_SEED
+    program: Program,
+    *,
+    max_subdomains_per_seed: int = MAX_SUBDOMAINS_PER_SEED,
+    on_progress: Callable[[str], None] | None = None,
 ) -> tuple[ReconResult, list[Finding]]:
     """`max_subdomains_per_seed` only narrows *breadth* (how many
     crt.sh-discovered subdomains get fingerprinted per seed, 0 meaning
@@ -694,7 +828,25 @@ def run_passive_recon(
     pacing against the target (FINGERPRINT_DELAY_SECONDS), which is
     calibrated to programs' own stated rate-limit requirements (e.g.
     Visa's policy: "rate limit any... testing to 1 request per second or
-    longer") and must never be reduced to make a run finish faster."""
+    longer") and must never be reduced to make a run finish faster.
+
+    `on_progress`, if given, is called with a short human-readable status
+    string at each meaningful checkpoint (per-seed substeps, each host
+    fingerprinted, and an end-of-seed line with a heuristic ETA). The ETA
+    is deliberately simple: average duration of seeds completed so far,
+    times seeds remaining -- seeds vary a lot in how many subdomains they
+    expand to, so this is a rough estimate, not a precise one, and it
+    only becomes meaningful after the first seed or two complete. Never
+    raises on its own account -- a broken callback would abort a real
+    recon run over what's just a progress display."""
+    def _report(msg: str) -> None:
+        if on_progress is None:
+            return
+        try:
+            on_progress(msg)
+        except Exception:
+            pass
+
     if not program.rules.permits(TestType.PASSIVE_RECON):
         # Should be unreachable -- passive recon is always in the default
         # allowed set -- but fail loudly rather than silently proceed if
@@ -704,7 +856,9 @@ def run_passive_recon(
     subdomains_by_seed: dict[str, list[str]] = {}
     fingerprints: dict[str, dict] = {}
     crtsh_failures: list[str] = []
+    certspotter_failures: list[str] = []
     subfinder_failures: list[str] = []
+    assetfinder_failures: list[str] = []
     wayback_failures: list[str] = []
     param_urls_by_seed: dict[str, list[str]] = {}
     findings: list[Finding] = []
@@ -712,25 +866,44 @@ def run_passive_recon(
     github_creds = GitHubCreds()
 
     recon_assets = [a for a in program.in_scope if a.asset_type in (AssetType.URL, AssetType.WILDCARD)]
+    seeds_total = len(recon_assets)
     seeds_processed = 0
+    seed_durations: list[float] = []
 
     try:
-        for asset in recon_assets:
+        for seed_index, asset in enumerate(recon_assets, start=1):
+            seed_start = time.monotonic()
             host = _extract_host(asset.identifier)
             if not host:
                 seeds_processed += 1
                 continue
 
+            _report(f"[{seed_index}/{seeds_total}] {host}: crt.sh...")
             discovered, crtsh_ok = crtsh_subdomains(host)
             time.sleep(CRTSH_DELAY_SECONDS)
             if not crtsh_ok:
                 crtsh_failures.append(host)
 
+            _report(f"[{seed_index}/{seeds_total}] {host}: certspotter...")
+            certspotter_names, certspotter_ok = certspotter_subdomains(host)
+            time.sleep(CERTSPOTTER_DELAY_SECONDS)
+            if not certspotter_ok:
+                certspotter_failures.append(host)
+            discovered |= certspotter_names
+
+            _report(f"[{seed_index}/{seeds_total}] {host}: subfinder...")
             subfinder_names, subfinder_ok = subfinder_subdomains(host)
             if not subfinder_ok:
                 subfinder_failures.append(host)
             discovered |= subfinder_names
 
+            _report(f"[{seed_index}/{seeds_total}] {host}: assetfinder...")
+            assetfinder_names, assetfinder_ok = assetfinder_subdomains(host)
+            if not assetfinder_ok:
+                assetfinder_failures.append(host)
+            discovered |= assetfinder_names
+
+            _report(f"[{seed_index}/{seeds_total}] {host}: wayback...")
             wayback_names, wayback_ok = wayback_subdomains(host)
             time.sleep(WAYBACK_DELAY_SECONDS)
             if not wayback_ok:
@@ -738,6 +911,7 @@ def run_passive_recon(
             discovered |= wayback_names
 
             subdomains_by_seed[host] = sorted(discovered)
+            _report(f"[{seed_index}/{seeds_total}] {host}: {len(discovered)} subdomain(s) found, DNS hygiene...")
 
             email_domain = host[4:] if host.lower().startswith("www.") else host
             for hit in [*check_spf(email_domain), *check_dmarc(email_domain), *check_dkim(email_domain)]:
@@ -761,6 +935,7 @@ def run_passive_recon(
             if param_urls:
                 param_urls_by_seed[host] = param_urls
 
+            _report(f"[{seed_index}/{seeds_total}] {host}: JS harvesting...")
             for hit in _harvest_js_for_host(host, program.rules):
                 digest = hashlib.sha256(f"{host}:{hit['kind']}:{hit['evidence']}".encode()).hexdigest()[:12]
                 findings.append(
@@ -777,7 +952,25 @@ def run_passive_recon(
                     )
                 )
 
+            _report(f"[{seed_index}/{seeds_total}] {host}: robots.txt / security.txt...")
+            for hit in _check_well_known_for_host(host, program.rules):
+                digest = hashlib.sha256(f"{host}:{hit['kind']}:{hit['evidence']}".encode()).hexdigest()[:12]
+                findings.append(
+                    Finding(
+                        id=f"{program.key}:{host}:{digest}",
+                        program_key=program.key,
+                        asset=host,
+                        title=hit["kind"].replace("-", " "),
+                        vuln_class=hit["kind"],
+                        test_type=TestType.PASSIVE_RECON,
+                        evidence=hit["evidence"],
+                        status=FindingStatus.CANDIDATE,
+                        notes=f"severity guess: {hit['severity']} -- verify manually before drafting a PoC",
+                    )
+                )
+
             if github_creds.configured:
+                _report(f"[{seed_index}/{seeds_total}] {host}: GitHub code search...")
                 github_items = search_domain_mentions(email_domain, github_creds)
                 time.sleep(GITHUB_SEARCH_DELAY_SECONDS)
                 for hit in scan_github_results_for_secrets(email_domain, github_items):
@@ -796,11 +989,19 @@ def run_passive_recon(
                         )
                     )
 
-            hosts_to_fingerprint = [host] + sorted(discovered)[:max_subdomains_per_seed]
-            for target_host in hosts_to_fingerprint:
+            _report(f"[{seed_index}/{seeds_total}] {host}: resolving discovered subdomains...")
+            resolvable = dnsx_resolve(discovered)
+            time.sleep(DNS_DELAY_SECONDS)
+            discovered_for_fingerprint = resolvable if resolvable is not None else discovered
+            hosts_to_fingerprint = [host] + sorted(discovered_for_fingerprint)[:max_subdomains_per_seed]
+            for host_index, target_host in enumerate(hosts_to_fingerprint, start=1):
                 if target_host in fingerprints:
                     continue
 
+                _report(
+                    f"[{seed_index}/{seeds_total}] {host}: fingerprinting "
+                    f"{host_index}/{len(hosts_to_fingerprint)} ({target_host})..."
+                )
                 cname_hit = check_dangling_cname(target_host)
                 time.sleep(DNS_DELAY_SECONDS)
                 if cname_hit:
@@ -886,6 +1087,18 @@ def run_passive_recon(
                             )
                         )
             seeds_processed += 1
+            seed_durations.append(time.monotonic() - seed_start)
+            seeds_remaining = seeds_total - seeds_processed
+            if seeds_remaining > 0:
+                avg_seed_seconds = sum(seed_durations) / len(seed_durations)
+                eta_minutes = avg_seed_seconds * seeds_remaining / 60
+                _report(
+                    f"[{seed_index}/{seeds_total}] {host}: done in {seed_durations[-1]:.0f}s -- "
+                    f"heuristic est. {eta_minutes:.1f} min remaining ({seeds_remaining} seed(s) left, "
+                    f"avg {avg_seed_seconds:.0f}s/seed so far)"
+                )
+            else:
+                _report(f"[{seed_index}/{seeds_total}] {host}: done in {seed_durations[-1]:.0f}s -- last seed")
     except KeyboardInterrupt:
         # Stopping mid-run (Ctrl-C, or `kill -INT`/`pkill -INT` against a
         # backgrounded run) should save everything gathered so far rather
@@ -899,7 +1112,9 @@ def run_passive_recon(
         subdomains=subdomains_by_seed,
         fingerprints=fingerprints,
         crtsh_failures=crtsh_failures,
+        certspotter_failures=certspotter_failures,
         subfinder_failures=subfinder_failures,
+        assetfinder_failures=assetfinder_failures,
         wayback_failures=wayback_failures,
         param_urls=param_urls_by_seed,
         seeds_total=len(recon_assets),

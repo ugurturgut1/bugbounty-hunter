@@ -36,7 +36,8 @@ in-scope assets if they say "find me something."
 
 Passive recon (`TestType.PASSIVE_RECON` / `VERSION_CVE_MATCH`) never
 touches program infrastructure beyond one already-permitted fingerprint
-request and third-party lookups (crt.sh, NVD). Run it freely:
+request (plus robots.txt/security.txt) and third-party lookups (crt.sh,
+Certspotter, NVD). Run it freely:
 
 ```bash
 uv run bbhunter recon <program-key>
@@ -69,8 +70,9 @@ If the user is ambiguous, unsure, or the policy is silent: do not
 approve. Passive-only is always a safe default to fall back to.
 
 `test-active` has three opt-in flags, `--injection` (single-request
-reflected-XSS/SQL-error/NoSQL-error/benign-echo-command-injection
-signature probes, 5 requests per parameter), `--nuclei` (curated
+reflected-XSS/SQL-error/NoSQL-error/CRLF-header-injection/benign-echo-
+command-injection signature probes, 6 requests per parameter, plus one
+Shellshock/CVE-2014-6271 benign-echo probe per host), `--nuclei` (curated
 misconfig/exposure/tech/cve/ssl/cache/cors/ssrf/jwt/graphql/takeover/
 ssti/xxe/host-header/prototype-pollution/redirect nuclei templates,
 rce/sqli/dos/intrusive/fuzz/bruteforce/hijack/default-login/
@@ -92,8 +94,12 @@ they're available.
 certificate posture (expired/self-signed/weak-signature/hostname-not-
 in-SAN, via the `openssl` binary), SPF/DMARC/DKIM email-spoofing
 misconfig and dangling-CNAME checks (via `dnspython`, a hard dependency
-now), and JS harvesting (hardcoded secrets, exposed source maps,
-internal-API-path references in linked JS). None of this needs a
+now), JS harvesting (hardcoded secrets, exposed source maps,
+internal-API-path references in linked JS), and robots.txt/security.txt
+disclosure checks. Subdomain discovery now merges five passive sources
+(crt.sh, Certspotter, subfinder, assetfinder, Wayback), each optionally
+filtered through `dnsx` before fingerprinting to prioritize hosts that
+actually still resolve. None of this needs a
 conversation gate -- it's the same passive floor as subdomain enum and
 CVE-keyword matching, just more of it. An optional GitHub code-search
 source (`recon/github_dork.py`) also runs automatically if the user has
@@ -170,11 +176,17 @@ uv run bbhunter draft-poc <finding-id>
 ```
 
 This writes a markdown file with the automation's evidence and TODOs for
-reproduction steps/impact. Tell the user the file path and that they (or
-you, working interactively with them watching) need to actually reproduce
-the issue before it can be approved -- do not fill in the TODOs with
-speculation and immediately approve. Once the user confirms they've
-verified it:
+reproduction steps/impact. Before working on the reproduction steps with
+the user, read the relevant section of
+`~/bugbounty-hunter/docs/VULN_TECHNIQUE_NOTES.md` for the finding's vuln
+class (XSS, SQLi, SSRF, CRLF, open redirect, XXE, RCE, SSTI, etc.) -- it
+has concrete manual-verification technique for exactly this step (what
+to check next given which signature/context fired, common bypass
+shapes, what NOT to try automating further). Tell the user the file path
+and that they (or you, working interactively with them watching) need to
+actually reproduce the issue before it can be approved -- do not fill in
+the TODOs with speculation and immediately approve. Once the user
+confirms they've verified it:
 
 ```bash
 uv run bbhunter approve-poc <finding-id> --note "<what was actually verified, and how>"
@@ -234,3 +246,8 @@ uv run bbhunter approve-report <finding-id> --note "<confirmation>"
 - Data lives in `~/bugbounty-hunter/state/` (SQLite + PoC/report markdown
   files), gitignored -- nothing here is a git operation, so there's no
   commit/push gate to worry about on top of the ones above.
+- `docs/VULN_TECHNIQUE_NOTES.md` -- per-vuln-class manual-verification
+  technique notes, read the relevant section during GATE 2 (see step 4
+  above). `docs/EXTERNAL_RESOURCES.md` -- what community
+  tool/writeup/cheatsheet resources this project draws on and why the
+  rest stays manual reference rather than automated code.

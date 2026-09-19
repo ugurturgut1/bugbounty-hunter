@@ -5,15 +5,20 @@ no injection payloads, no state-changing requests. A second, opt-in
 class added later (`injection=True`) still only ever sends single-request,
 signature-based detection probes (an HTML-special-char canary for
 reflected XSS, a single quote for a SQL-error signature, a JS-string-
-breakout probe for a NoSQL/driver-error signature, and a benign
+breakout probe for a NoSQL/driver-error signature, a CRLF sequence
+followed by a canary header name for CRLF/header-injection, and a benign
 `echo <marker>` shell-canary for command injection) against Wayback-
-discovered URLs that already carry query parameters -- never a
-boolean/time-based blind technique, never more than one marker per
-request per class, never any follow-through past detection (the
-command-injection probe only ever runs a no-op `echo`, nothing that
-reads, writes, or changes anything). This is the "safe XSS/SQLi probes"
-class TestType.ACTIVE_LOW_IMPACT's own docstring in models.py already
-scopes for -- it is not a new permission level.
+discovered URLs that already carry query parameters, plus one
+CVE-2014-6271 (Shellshock) `User-Agent` probe per selected host -- also
+a benign `echo <marker>` canary, drawn from
+docs/EXTERNAL_RESOURCES.md's mapping of EdOverflow's bugbounty-
+cheatsheet per-class notes onto this project. Never a boolean/time-based
+blind technique, never more than one marker per request per class,
+never any follow-through past detection (every echo-based probe only
+ever runs a no-op `echo`, nothing that reads, writes, or changes
+anything). This is the "safe XSS/SQLi probes" class
+TestType.ACTIVE_LOW_IMPACT's own docstring in models.py already scopes
+for -- it is not a new permission level.
 
 Everything in this module only runs when
 RulesOfEngagement.permits(TestType.ACTIVE_LOW_IMPACT) is True, which
@@ -111,7 +116,8 @@ NUCLEI_RUN_TIMEOUT_SECONDS = 900  # whole-run cap across every host handed to a 
 REQUEST_DELAY_SECONDS = 1.5
 MAX_HOSTS_PER_PROGRAM = 40
 MAX_SUBDOMAINS_PER_WILDCARD_SEED = 5  # keeps one large wildcard seed from eating the whole per-program budget
-MAX_INJECTION_URLS_PER_PROGRAM = 30  # each URL costs 5 requests (baseline + xss + sqli + nosqli + cmdi probe) at REQUEST_DELAY_SECONDS pacing
+MAX_INJECTION_URLS_PER_PROGRAM = 30  # each URL costs 6 requests (baseline + xss + sqli + nosqli + cmdi + crlf probe) at
+                                      # REQUEST_DELAY_SECONDS pacing; separately, one Shellshock probe runs per selected host
 
 _SQL_ERROR_SIGNATURES = [
     "sql syntax",
@@ -515,9 +521,10 @@ def _replace_param(parts, params: list[tuple[str, str]], index: int, new_value: 
 def _check_injection_signals(client: httpx.Client, url: str) -> list[dict]:
     """One baseline request plus, per query parameter, one reflected-XSS
     probe, one SQL-error-signature probe, one NoSQL-error-signature
-    probe, and one command-injection canary probe -- five requests total
-    per parameter-bearing path, never more. Returns a list of hit dicts;
-    empty if nothing fired or the URL couldn't be parsed/fetched."""
+    probe, one command-injection canary probe, and one CRLF/header-
+    injection canary probe -- six requests total per parameter-bearing
+    path, never more. Returns a list of hit dicts; empty if nothing
+    fired or the URL couldn't be parsed/fetched."""
     hits: list[dict] = []
     parts = urlsplit(url)
     params = parse_qsl(parts.query, keep_blank_values=True)
@@ -630,7 +637,74 @@ def _check_injection_signals(client: httpx.Client, url: str) -> list[dict]:
                 }
             )
 
+        crlf_marker = f"bbhcrlf{secrets.token_hex(4)}"
+        crlf_url = _replace_param(parts, params, i, f"{value}\r\nX-{crlf_marker}: 1")
+        try:
+            resp = client.get(crlf_url, timeout=15, follow_redirects=True)
+        except httpx.HTTPError:
+            resp = None
+        time.sleep(REQUEST_DELAY_SECONDS)
+        if resp is not None and f"x-{crlf_marker}".lower() in {h.lower() for h in resp.headers}:
+            hits.append(
+                {
+                    "kind": "crlf-header-injection-candidate",
+                    "param": name,
+                    "url": str(resp.url),
+                    "severity": "high",
+                    "evidence": (
+                        f"GET {resp.url} -> parameter '{name}' with a CRLF sequence (\\r\\n) followed by "
+                        f"'X-{crlf_marker}: 1' appended caused that header to appear as a real response "
+                        "header, not just reflected in the body. Detection-only -- no attempt was made to "
+                        "inject Set-Cookie, split the response, or chain into XSS; verify manually before "
+                        "treating as confirmed."
+                    ),
+                }
+            )
+
     return hits
+
+
+def _check_shellshock(client: httpx.Client, host: str) -> list[dict]:
+    """One GET to `/` with a crafted `User-Agent` -- the classic
+    CVE-2014-6271 (Shellshock) test string, `() { :; }; echo <marker>`.
+    Same benign-echo-only philosophy as `_check_injection_signals`'s
+    command-injection probe: if a CGI/mod_cgi-backed endpoint passes
+    that header into a vulnerable bash, bash executes everything after
+    the function definition, so a no-op `echo` of a random marker is
+    enough to detect it without running anything that reads, writes, or
+    changes state. This one request necessarily overrides the program's
+    required User-Agent (see recon/passive.py's `_request_headers`) --
+    the malicious string IS the User-Agent for this specific, single,
+    well-known CVE-detection probe; the random marker embedded in it is
+    still traceable in server logs to this run. Returns a hit dict in a
+    list (for a uniform call-site shape with the per-param checks
+    above), or [] if nothing fired or the request failed."""
+    marker = f"BBHSHOCK{secrets.token_hex(4)}"
+    try:
+        resp = client.get(
+            f"https://{host}/",
+            headers={"User-Agent": f"() {{ :; }}; echo {marker}"},
+            timeout=15,
+            follow_redirects=True,
+        )
+    except httpx.HTTPError:
+        return []
+    if marker not in resp.text:
+        return []
+    return [
+        {
+            "kind": "shellshock-candidate",
+            "url": str(resp.url),
+            "severity": "critical",
+            "evidence": (
+                f"GET {resp.url} with User-Agent '() {{ :; }}; echo {marker}' (CVE-2014-6271 test string) "
+                f"echoed marker '{marker}' back in the response body -- consistent with a CGI/mod_cgi-backed "
+                "endpoint passing that header into a vulnerable bash. Only a no-op `echo` was ever "
+                "attempted -- verify manually before treating as confirmed, and never escalate to a more "
+                "impactful command without the program's explicit go-ahead."
+            ),
+        }
+    ]
 
 
 def run_nuclei_scan(
@@ -747,9 +821,11 @@ def run_active_checks(
     nuclei: bool = False,
     cloud_buckets: bool = False,
 ) -> list[Finding]:
-    """`injection=True` additionally runs the reflected-XSS/SQL-error-
-    signature checks (see module docstring) against Wayback-discovered
-    param URLs from `recon_result`. `nuclei=True` additionally runs the
+    """`injection=True` additionally runs the reflected-XSS/SQL-error/
+    NoSQL-error/command-injection/CRLF-header-injection signature checks
+    (see module docstring) against Wayback-discovered param URLs from
+    `recon_result`, plus one Shellshock (CVE-2014-6271) User-Agent probe
+    per selected host regardless of `recon_result`. `nuclei=True` additionally runs the
     curated nuclei template set (see `run_nuclei_scan`) against the same
     selected hosts, skipped silently if the binary isn't installed.
     `cloud_buckets=True` additionally checks a small set of S3/GCS/
@@ -797,6 +873,24 @@ def run_active_checks(
                         notes=f"severity guess: {hit['severity']} -- verify manually before drafting a PoC",
                     )
                 )
+
+        if injection:
+            for host in hosts:
+                for hit in _check_shellshock(client, host):
+                    digest = hashlib.sha256(f"{host}:{hit['kind']}".encode()).hexdigest()[:12]
+                    findings.append(
+                        Finding(
+                            id=f"{program.key}:{digest}",
+                            program_key=program.key,
+                            asset=host,
+                            title=hit["kind"],
+                            vuln_class=hit["kind"],
+                            test_type=TestType.ACTIVE_LOW_IMPACT,
+                            evidence=hit["evidence"],
+                            status=FindingStatus.CANDIDATE,
+                            notes=f"severity guess: {hit['severity']} -- verify manually before drafting a PoC",
+                        )
+                    )
 
         if injection and recon_result and recon_result.param_urls:
             injection_urls: list[str] = []

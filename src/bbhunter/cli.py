@@ -300,8 +300,12 @@ def report(key: str):
         failures = []
         if recon_result.crtsh_failures:
             failures.append(f"crt.sh failed for {len(recon_result.crtsh_failures)} seed(s)")
+        if recon_result.certspotter_failures:
+            failures.append(f"certspotter failed for {len(recon_result.certspotter_failures)} seed(s)")
         if recon_result.subfinder_failures:
             failures.append(f"subfinder failed for {len(recon_result.subfinder_failures)} seed(s)")
+        if recon_result.assetfinder_failures:
+            failures.append(f"assetfinder failed for {len(recon_result.assetfinder_failures)} seed(s)")
         if recon_result.wayback_failures:
             failures.append(f"Wayback failed for {len(recon_result.wayback_failures)} seed(s)")
         if failures:
@@ -373,7 +377,11 @@ def recon(
     console.print(f"[cyan]running passive recon[/cyan] on {key} ({recon_asset_count} seed asset(s))...")
     console.print("[dim]Ctrl-C (or `kill -INT`/`pkill -INT -f` on this process) stops cleanly and saves "
                    "whatever's been gathered so far -- nothing is lost.[/dim]")
-    result, findings = run_passive_recon(program, max_subdomains_per_seed=max_subdomains_per_seed)
+    result, findings = run_passive_recon(
+        program,
+        max_subdomains_per_seed=max_subdomains_per_seed,
+        on_progress=lambda msg: console.print(f"[dim]{msg}[/dim]"),
+    )
     upsert_recon_result(result)
     for finding in findings:
         upsert_finding(finding)
@@ -406,15 +414,31 @@ def recon(
             f"[yellow]warning[/yellow]: archive.org CDX query failed for {len(result.wayback_failures)} seed host(s) "
             f"({', '.join(result.wayback_failures)}) -- subdomain/param-URL results for those are incomplete"
         )
+    if result.certspotter_failures:
+        console.print(
+            f"[dim]note[/dim]: certspotter query failed/rate-limited for {len(result.certspotter_failures)} seed "
+            f"host(s) ({', '.join(result.certspotter_failures)}) -- expected on programs with many seeds, its "
+            "unauthenticated tier is capped at 10 requests/hour; crt.sh remains the primary CT-log source"
+        )
     if result.subfinder_failures and not _tool_path("subfinder"):
         console.print(
-            "[yellow]note[/yellow]: `subfinder` isn't installed -- subdomain coverage is crt.sh + archive.org only. "
-            "See README.md Setup for `go install ...subfinder@latest`."
+            "[yellow]note[/yellow]: `subfinder` isn't installed -- subdomain coverage is crt.sh + Certspotter + "
+            "archive.org only. See README.md Setup for `go install ...subfinder@latest`."
         )
     elif result.subfinder_failures:
         console.print(
             f"[yellow]warning[/yellow]: subfinder run failed for {len(result.subfinder_failures)} seed host(s) "
             f"({', '.join(result.subfinder_failures)})"
+        )
+    if result.assetfinder_failures and not _tool_path("assetfinder"):
+        console.print(
+            "[dim]note[/dim]: `assetfinder` isn't installed -- optional, see README.md Setup for "
+            "`go install github.com/tomnomnom/assetfinder@latest`."
+        )
+    elif result.assetfinder_failures:
+        console.print(
+            f"[yellow]warning[/yellow]: assetfinder run failed for {len(result.assetfinder_failures)} seed host(s) "
+            f"({', '.join(result.assetfinder_failures)})"
         )
     if result.param_urls:
         total_param_urls = sum(len(v) for v in result.param_urls.values())

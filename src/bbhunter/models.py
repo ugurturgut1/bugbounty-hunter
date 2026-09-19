@@ -157,7 +157,10 @@ class ReconResult(BaseModel):
     subdomains: dict[str, list[str]] = Field(default_factory=dict)   # seed host -> discovered subdomains (merged crt.sh + subfinder + wayback)
     fingerprints: dict[str, dict] = Field(default_factory=dict)      # host -> {status_code, server, powered_by, final_url, tech (optional, from projectdiscovery httpx)}
     crtsh_failures: list[str] = Field(default_factory=list)          # seed hosts whose crt.sh query errored (not: found nothing)
+    certspotter_failures: list[str] = Field(default_factory=list)    # seed hosts whose Certspotter CT-log query errored or hit its
+                                                                      # 10-requests/hour unauthenticated rate limit
     subfinder_failures: list[str] = Field(default_factory=list)      # seed hosts where the subfinder binary was missing or errored
+    assetfinder_failures: list[str] = Field(default_factory=list)    # seed hosts where the assetfinder binary was missing or errored
     wayback_failures: list[str] = Field(default_factory=list)        # seed hosts whose archive.org CDX query errored
     param_urls: dict[str, list[str]] = Field(default_factory=dict)   # seed host -> historic URLs (with query strings) found via Wayback CDX,
                                                                       # the input set for testing/active.py's opt-in injection-signature checks

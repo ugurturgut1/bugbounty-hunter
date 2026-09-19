@@ -16,7 +16,7 @@ from bbhunter.models import (
     ScopeAsset,
     TestType,
 )
-from bbhunter.testing.active import _check_injection_signals, run_active_checks, run_nuclei_scan
+from bbhunter.testing.active import _check_injection_signals, _check_shellshock, run_active_checks, run_nuclei_scan
 
 
 def _program(*, approved: bool = True) -> Program:
@@ -37,9 +37,10 @@ def _program(*, approved: bool = True) -> Program:
 
 
 class _FakeResponse:
-    def __init__(self, text: str, url: str = "https://example.com/search?q=x"):
+    def __init__(self, text: str, url: str = "https://example.com/search?q=x", headers: dict | None = None):
         self.text = text
         self.url = url
+        self.headers = headers or {}
 
 
 def test_reflected_xss_canary_flagged_only_when_unescaped_in_response():
@@ -158,14 +159,74 @@ def test_command_injection_no_hit_when_marker_not_echoed():
     assert [h for h in hits if h["kind"] == "command-injection-candidate"] == []
 
 
-def test_check_injection_signals_makes_five_requests_per_parameter():
-    """baseline + xss + sqli + nosqli + cmdi -- one parameter should
-    cost exactly 5 requests, never more."""
+def test_crlf_header_injection_flagged_when_injected_header_appears():
+    client = MagicMock()
+
+    # Flag whenever the URL carries the CRLF probe's characteristic
+    # '%0D%0AX-' sequence (case-insensitive), simulating a server that
+    # actually turned it into a real response header.
+    def fake_get(url, timeout=15, follow_redirects=True):
+        if "%0d%0ax-" in url.lower():
+            marker = url.lower().split("%0d%0ax-", 1)[1].split(":", 1)[0].split("%3a", 1)[0]
+            return _FakeResponse("normal page", headers={f"X-{marker}": "1"})
+        return _FakeResponse("normal page")
+
+    client.get.side_effect = fake_get
+    with patch("bbhunter.testing.active.time.sleep"):
+        hits = _check_injection_signals(client, "https://example.com/search?q=x")
+
+    crlf_hits = [h for h in hits if h["kind"] == "crlf-header-injection-candidate"]
+    assert len(crlf_hits) == 1
+    assert crlf_hits[0]["severity"] == "high"
+
+
+def test_crlf_no_hit_when_header_not_reflected():
+    client = MagicMock()
+    client.get.return_value = _FakeResponse("normal page")
+    with patch("bbhunter.testing.active.time.sleep"):
+        hits = _check_injection_signals(client, "https://example.com/search?q=x")
+    assert [h for h in hits if h["kind"] == "crlf-header-injection-candidate"] == []
+
+
+def test_check_injection_signals_makes_six_requests_per_parameter():
+    """baseline + xss + sqli + nosqli + cmdi + crlf -- one parameter
+    should cost exactly 6 requests, never more."""
     client = MagicMock()
     client.get.return_value = _FakeResponse("nothing interesting")
     with patch("bbhunter.testing.active.time.sleep"):
         _check_injection_signals(client, "https://example.com/search?q=x")
-    assert client.get.call_count == 5
+    assert client.get.call_count == 6
+
+
+def test_shellshock_flagged_when_marker_echoed_back():
+    client = MagicMock()
+
+    def fake_get(url, headers=None, timeout=15, follow_redirects=True):
+        ua = (headers or {}).get("User-Agent", "")
+        if "{ :; }" in ua:
+            marker = ua.split("echo ", 1)[-1]
+            return _FakeResponse(f"debug output: {marker}\n")
+        return _FakeResponse("normal page")
+
+    client.get.side_effect = fake_get
+    hits = _check_shellshock(client, "example.com")
+    assert len(hits) == 1
+    assert hits[0]["kind"] == "shellshock-candidate"
+    assert hits[0]["severity"] == "critical"
+
+
+def test_shellshock_no_hit_when_marker_not_echoed():
+    client = MagicMock()
+    client.get.return_value = _FakeResponse("normal page")
+    assert _check_shellshock(client, "example.com") == []
+
+
+def test_shellshock_no_hit_on_request_error():
+    import httpx as real_httpx
+
+    client = MagicMock()
+    client.get.side_effect = real_httpx.ConnectTimeout("timeout")
+    assert _check_shellshock(client, "example.com") == []
 
 
 def test_check_injection_signals_returns_empty_for_url_with_no_query_params():
@@ -188,11 +249,43 @@ def test_run_active_checks_injection_respects_host_scope():
     )
     with patch("bbhunter.testing.active._check_host", return_value=[]), \
          patch("bbhunter.testing.active._check_injection_signals", return_value=[]) as check_injection, \
+         patch("bbhunter.testing.active._check_shellshock", return_value=[]), \
          patch("bbhunter.testing.active.run_nuclei_scan", return_value=None):
         run_active_checks(program, recon_result, injection=True)
 
     tested_urls = [call.args[1] for call in check_injection.call_args_list]
     assert tested_urls == ["https://example.com/search?q=1"]
+
+
+def test_run_active_checks_runs_shellshock_probe_per_host_when_injection_enabled():
+    program = _program()
+    with patch("bbhunter.testing.active._check_host", return_value=[]), \
+         patch("bbhunter.testing.active._check_injection_signals", return_value=[]), \
+         patch("bbhunter.testing.active._check_shellshock", return_value=[]) as check_shellshock, \
+         patch("bbhunter.testing.active.run_nuclei_scan", return_value=None):
+        run_active_checks(program, None, injection=True)
+    assert check_shellshock.call_count == 1
+    assert check_shellshock.call_args.args[1] == "example.com"
+
+
+def test_run_active_checks_maps_shellshock_hit_to_a_finding():
+    program = _program()
+    fake_hit = {
+        "kind": "shellshock-candidate",
+        "url": "https://example.com/",
+        "severity": "critical",
+        "evidence": "test evidence",
+    }
+    with patch("bbhunter.testing.active._check_host", return_value=[]), \
+         patch("bbhunter.testing.active._check_injection_signals", return_value=[]), \
+         patch("bbhunter.testing.active._check_shellshock", return_value=[fake_hit]), \
+         patch("bbhunter.testing.active.run_nuclei_scan", return_value=None):
+        findings = run_active_checks(program, None, injection=True)
+
+    shellshock_findings = [f for f in findings if f.vuln_class == "shellshock-candidate"]
+    assert len(shellshock_findings) == 1
+    assert shellshock_findings[0].asset == "example.com"
+    assert shellshock_findings[0].evidence == "test evidence"
 
 
 def test_run_active_checks_injection_off_by_default():

@@ -32,7 +32,9 @@ def test_interrupt_mid_loop_returns_partial_result_not_nothing():
         return set(), True
 
     with patch("bbhunter.recon.passive.crtsh_subdomains", side_effect=fake_crtsh), \
+         patch("bbhunter.recon.passive.certspotter_subdomains", return_value=(set(), True)), \
          patch("bbhunter.recon.passive.subfinder_subdomains", return_value=(set(), False)), \
+         patch("bbhunter.recon.passive.assetfinder_subdomains", return_value=(set(), False)), \
          patch("bbhunter.recon.passive.wayback_subdomains", return_value=(set(), True)), \
          patch("bbhunter.recon.passive.wayback_param_urls", return_value=[]), \
          patch("bbhunter.recon.passive.fingerprint", return_value=None), \
@@ -42,6 +44,8 @@ def test_interrupt_mid_loop_returns_partial_result_not_nothing():
          patch("bbhunter.recon.passive.check_dkim", return_value=[]), \
          patch("bbhunter.recon.passive.check_dangling_cname", return_value=None), \
          patch("bbhunter.recon.passive._harvest_js_for_host", return_value=[]), \
+         patch("bbhunter.recon.passive._check_well_known_for_host", return_value=[]), \
+         patch("bbhunter.recon.passive.dnsx_resolve", return_value=None), \
          patch("bbhunter.recon.passive.GitHubCreds") as mock_gh_creds, \
          patch("bbhunter.recon.passive.time.sleep"):
         mock_gh_creds.return_value.configured = False
@@ -64,7 +68,9 @@ def test_max_subdomains_per_seed_zero_skips_subdomain_expansion():
         return None
 
     with patch("bbhunter.recon.passive.crtsh_subdomains", return_value=({"sub.seed.example.com"}, True)), \
+         patch("bbhunter.recon.passive.certspotter_subdomains", return_value=(set(), True)), \
          patch("bbhunter.recon.passive.subfinder_subdomains", return_value=(set(), False)), \
+         patch("bbhunter.recon.passive.assetfinder_subdomains", return_value=(set(), False)), \
          patch("bbhunter.recon.passive.wayback_subdomains", return_value=(set(), True)), \
          patch("bbhunter.recon.passive.wayback_param_urls", return_value=[]), \
          patch("bbhunter.recon.passive.fingerprint", side_effect=fake_fingerprint), \
@@ -74,6 +80,8 @@ def test_max_subdomains_per_seed_zero_skips_subdomain_expansion():
          patch("bbhunter.recon.passive.check_dkim", return_value=[]), \
          patch("bbhunter.recon.passive.check_dangling_cname", return_value=None), \
          patch("bbhunter.recon.passive._harvest_js_for_host", return_value=[]), \
+         patch("bbhunter.recon.passive._check_well_known_for_host", return_value=[]), \
+         patch("bbhunter.recon.passive.dnsx_resolve", return_value=None), \
          patch("bbhunter.recon.passive.GitHubCreds") as mock_gh_creds, \
          patch("bbhunter.recon.passive.time.sleep"):
         mock_gh_creds.return_value.configured = False
@@ -86,7 +94,9 @@ def test_full_run_reports_complete():
     program = _program_with_seeds("only.example.com")
 
     with patch("bbhunter.recon.passive.crtsh_subdomains", return_value=(set(), True)), \
+         patch("bbhunter.recon.passive.certspotter_subdomains", return_value=(set(), True)), \
          patch("bbhunter.recon.passive.subfinder_subdomains", return_value=(set(), False)), \
+         patch("bbhunter.recon.passive.assetfinder_subdomains", return_value=(set(), False)), \
          patch("bbhunter.recon.passive.wayback_subdomains", return_value=(set(), True)), \
          patch("bbhunter.recon.passive.wayback_param_urls", return_value=[]), \
          patch("bbhunter.recon.passive.fingerprint", return_value=None), \
@@ -96,6 +106,8 @@ def test_full_run_reports_complete():
          patch("bbhunter.recon.passive.check_dkim", return_value=[]), \
          patch("bbhunter.recon.passive.check_dangling_cname", return_value=None), \
          patch("bbhunter.recon.passive._harvest_js_for_host", return_value=[]), \
+         patch("bbhunter.recon.passive._check_well_known_for_host", return_value=[]), \
+         patch("bbhunter.recon.passive.dnsx_resolve", return_value=None), \
          patch("bbhunter.recon.passive.GitHubCreds") as mock_gh_creds, \
          patch("bbhunter.recon.passive.time.sleep"):
         mock_gh_creds.return_value.configured = False

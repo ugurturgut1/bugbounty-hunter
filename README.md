@@ -40,10 +40,12 @@ submit.
    the "safe XSS/SQLi probes... no data modification" scope
    `TestType.ACTIVE_LOW_IMPACT` already defines in `models.py`:
    `--injection` sends at most one canary/signature per query parameter
-   per class -- reflected-XSS, SQL-error, NoSQL-error, and a benign
-   `echo`-only command-injection canary (no boolean/time-based blind
-   techniques, no extraction, no follow-through past detection, no
-   command beyond a no-op `echo`) -- `--nuclei` runs only
+   per class -- reflected-XSS, SQL-error, NoSQL-error, CRLF/header-
+   injection, and a benign `echo`-only command-injection canary (no
+   boolean/time-based blind techniques, no extraction, no follow-through
+   past detection, no command beyond a no-op `echo`) -- plus one benign
+   `echo`-only Shellshock (CVE-2014-6271) `User-Agent` probe per host,
+   same no-follow-through rule -- `--nuclei` runs only
    misconfig/exposure/tech/cve/ssl/cache/cors/ssrf/jwt/graphql/takeover/
    ssti/xxe/host-header/prototype-pollution/redirect-tagged templates,
    with rce/sqli/dos/intrusive/fuzz/bruteforce/hijack/default-login/
@@ -138,12 +140,17 @@ passive recon -> gated active testing -> PoC drafting -> report drafting
       Findings land as `Finding(status=CANDIDATE)`, explicitly labeled
       as coarse keyword matches needing manual verification, not
       confirmed vulnerabilities.
-      Subdomain enum now merges three sources -- crt.sh, archive.org's
-      Wayback CDX API (`wayback_subdomains`, also never touches the
-      target), and the optional `subfinder` binary (`subfinder_subdomains`,
-      itself just a fan-out over ~30 further passive OSINT sources) --
-      silently skipping whichever of these isn't installed/reachable
-      rather than failing the whole run. Wayback also surfaces historic
+      Subdomain enum now merges five sources -- crt.sh, Certspotter
+      (`certspotter_subdomains`, a second independent CT-log source, see
+      roadmap phase 15 below), archive.org's Wayback CDX API
+      (`wayback_subdomains`, also never touches the target), and the
+      optional `subfinder` and `assetfinder` binaries (`subfinder_subdomains`/
+      `assetfinder_subdomains`, see roadmap phase 16 below) -- silently skipping
+      whichever of these isn't installed/reachable/rate-limited rather
+      than failing the whole run. Discovered subdomains are then optionally
+      filtered through the `dnsx` binary (`dnsx_resolve`, roadmap phase 16)
+      to prioritize ones that actually still resolve before spending the
+      fingerprinting budget on them. Wayback also surfaces historic
       URLs with query strings (`ReconResult.param_urls`), the input set
       for `test-active --injection` (see Phase 3). Fingerprinting now
       prefers the optional `httpx` binary's tech-detect signature
@@ -251,7 +258,9 @@ what it covers.
 | Cache poisoning/deception | Good (added 2026-09-18) | nuclei `cache` tag -- generic + Next.js cache-poisoning detection templates |
 | Prototype pollution | Thin | nuclei `prototype-pollution` tag -- template count is small upstream |
 | A10 SSRF | Partial | nuclei `ssrf` tag (out-of-band/interactsh-based, detection only) |
-| A03 Injection (XSS/SQLi/NoSQLi/command) | Partial, broader as of 2026-09-18 | custom single-request reflected-XSS, SQL-error, NoSQL-error, and benign-echo command-injection signature checks (`--injection`, 5 requests/param); no SSTI/XXE beyond nuclei above, no LDAP injection |
+| A03 Injection (XSS/SQLi/NoSQLi/command) | Partial, broader as of 2026-09-20 | custom single-request reflected-XSS, SQL-error, NoSQL-error, CRLF/header-injection, and benign-echo command-injection signature checks (`--injection`, 6 requests/param); no SSTI/XXE beyond nuclei above, no LDAP injection |
+| CRLF injection / HTTP response splitting | Good (added 2026-09-20) | CRLF/header-injection canary probe, part of `--injection` -- see `docs/VULN_TECHNIQUE_NOTES.md` for manual follow-up once a candidate fires |
+| RCE (Shellshock, CVE-2014-6271) | Good (added 2026-09-20) | benign `echo`-canary `User-Agent` probe, part of `--injection`, one per host -- no brute-forcing, no command beyond the no-op echo |
 | A02 Cryptographic Failures | Good, up from Thin (2026-09-18) | `recon/passive.py`'s `tls_cert_info`/`tls_findings` (passive, always on: expired/soon-expiring, self-signed, weak SHA-1 signature, hostname not in SAN) + nuclei `ssl` tag (deprecated TLS versions, insecure cipher suites, cert revocation -- neither checked by the openssl-based passive check) |
 | Email spoofing (SPF/DMARC/DKIM misconfig) | Good (heuristic), added 2026-09-18 | `recon/dns_hygiene.py` -- passive, always on. `check_dkim` only ever reports a positive signal (a weak key found at a common selector), never "missing", since a domain's real selector isn't discoverable |
 | Secret/credential leakage (public JS, GitHub) | Good (heuristic), added 2026-09-18 | `recon/js_harvest.py` (passive, always on: hardcoded secrets + exposed source maps in linked JS) and `recon/github_dork.py` (passive, optional -- needs a free `GITHUB_API_TOKEN`) |
@@ -428,6 +437,49 @@ pushed separately:**
     same-named bucket can legitimately belong to an unrelated third party.
 14. *(done)* NoSQL-error-signature and benign-echo command-injection probes added to
     `_check_injection_signals` (`--injection`, now 5 requests/parameter instead of 3).
+15. *(done 2026-09-20)* Two small additions drawn from three community resources the user asked to
+    incorporate -- see `docs/EXTERNAL_RESOURCES.md` for the full mapping and why the rest of those
+    resources stays a human reference rather than code: a second independent CT-log source,
+    `certspotter_subdomains` (SSLMate's Certspotter API, same `(names, succeeded)` contract as
+    `crtsh_subdomains`; its unauthenticated tier caps at 10 requests/hour, so it degrades gracefully
+    like every other optional source rather than being a hard requirement), and a new
+    `recon/well_known.py` for robots.txt `Disallow`-path disclosure (aggregated into one informational
+    finding per host, same pattern as `js_harvest.py`'s internal-API-path aggregation) and RFC 9116
+    security.txt presence (recorded for reference, never treated as a vulnerability). Both passive,
+    always on, one GET (security.txt: up to two) per seed host. 12 new tests.
+16. *(done 2026-09-20)* A second, deeper pass at the same three resources, per explicit follow-up
+    request ("all functionality... both as cheatsheets and tips/tricks for the analysis that the tool
+    does with AI help... and also all tools and useful technical things they provide"):
+    - **New `docs/VULN_TECHNIQUE_NOTES.md`**: per-vuln-class manual-verification technique notes
+      distilled from EdOverflow's bugbounty-cheatsheet per-class pages (XSS, SQLi, SSRF, CRLF, open
+      redirect, XXE, RCE, LFI, CSV injection, SSTI, XSLT, crypto, content injection), explicitly scoped
+      as GATE 2/3 (PoC review / report drafting) reference for the human+AI manual-verification step the
+      `/bbhunter` skill already does -- not new automated capability. The skill now points here from its
+      PoC step. The bulk of both payload-list resources is exploitation technique this project's
+      guardrails deliberately keep out of automation (blind/boolean injection, brute-forcing,
+      follow-through past detection) -- this file is where that knowledge legitimately lives instead:
+      informing a human's manual next step once `bbhunter` has already surfaced a candidate.
+    - **Two new narrow, benign, single-canary `--injection` probe classes** (`testing/active.py`), same
+      six-requests-per-parameter/one-canary-per-class philosophy as the existing four: a CRLF/header-
+      injection probe (`\r\n` + a canary header name appended to a parameter, flagged only if it comes
+      back as a real response header) and a Shellshock/CVE-2014-6271 probe (`_check_shellshock`, a
+      crafted `User-Agent` with a benign `echo <marker>` payload, one per selected host, flagged only if
+      the marker echoes back). Both purely detection-only, no follow-through past the no-op `echo`/header
+      check, both gated by the exact same `permits(ACTIVE_LOW_IMPACT)` + `--injection` opt-in as
+      everything else in this class. 8 new tests.
+    - **Two more optional external-tool recon sources** (`recon/passive.py`), same
+      `_tool_path`/graceful-skip pattern as subfinder/httpx/nuclei: `assetfinder_subdomains`
+      (tomnomnom's `assetfinder --subs-only`, a fifth independent passive subdomain source) and
+      `dnsx_resolve` (projectdiscovery's `dnsx -silent`, filters discovered subdomains to ones that
+      still resolve via public DNS queries before spending `max_subdomains_per_seed`'s fingerprinting
+      budget on stale crt.sh/Wayback entries). 9 new tests.
+    - Tools this pass deliberately did NOT wire in, and why: the remainder of awesome-bugbounty-tools is
+      overwhelmingly fuzzers, brute-forcers, and exploitation frameworks (dirsearch/ffuf/gobuster-style
+      content-discovery fuzzing, Arjun/x8 parameter brute-forcing, sqlmap-style extraction, WAF-evasion
+      tooling) -- exactly the technique class Guardrails #2/#6 keep this project's active testing away
+      from (no brute-forcing, no blind/boolean injection, no follow-through past detection). Wiring any
+      of those in would mean loosening a guardrail, not adding a tool within the existing one, so they
+      stay in `docs/EXTERNAL_RESOURCES.md` as the human's own manual toolbox instead.
 
 All of the above stayed within this project's existing guardrails throughout -- nothing in this
 round created a new permission tier, lowered the bar for `approve-active`, or let any heuristic
@@ -454,6 +506,15 @@ fetching their real OpenAPI specs directly (`docs.bugcrowd.com` /
 `api.intigriti.com`) rather than guessing endpoints, and both were
 live-tested against real accounts.
 
+## External references
+
+`docs/EXTERNAL_RESOURCES.md` maps three community resources (a curated
+tool list, a curated writeups archive, and a bug-bounty cheat sheet) onto
+this project's own coverage table and guardrails -- what got adopted into
+code (small, passive, single-request additions, see roadmap phase 15
+below) versus what's kept as human reference for the phases this project
+deliberately doesn't automate.
+
 ## Setup
 
 ```bash
@@ -475,19 +536,21 @@ uv run bbhunter report <program-key>      # full audit trail: scope/approval sta
 ### Optional external recon tooling
 
 `bbhunter recon` and `bbhunter test-active` work fully without any of
-this -- crt.sh, archive.org, NVD, and the plain-GET checks are pure
-Python/HTTP and always on. `dnspython` (SPF/DMARC/DKIM/dangling-CNAME
-checks) is a regular pip dependency, already installed by `uv sync`,
-nothing extra to set up. `openssl` (TLS cert posture checks) is
-virtually always present on Linux/macOS already; both are skipped
+this -- crt.sh, Certspotter, archive.org, NVD, and the plain-GET checks
+are pure Python/HTTP and always on. `dnspython` (SPF/DMARC/DKIM/
+dangling-CNAME checks) is a regular pip dependency, already installed by
+`uv sync`, nothing extra to set up. `openssl` (TLS cert posture checks)
+is virtually always present on Linux/macOS already; both are skipped
 silently, same as everything below, if genuinely absent. Installing
-these three [projectdiscovery](https://github.com/projectdiscovery) Go
-binaries widens coverage; every integration point checks for the binary
-first and silently falls back (or skips that source/flag) if it's
-missing:
+these Go binaries (four from [projectdiscovery](https://github.com/projectdiscovery),
+one from [tomnomnom](https://github.com/tomnomnom)) widens coverage;
+every integration point checks for the binary first and silently falls
+back (or skips that source/flag) if it's missing:
 
 ```bash
-go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest  # extra passive subdomain source, merged with crt.sh + Wayback
+go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest  # extra passive subdomain source, merged with crt.sh + Certspotter + Wayback
+go install github.com/tomnomnom/assetfinder@latest                        # fifth passive subdomain source (--subs-only), independent source list from subfinder
+go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest               # filters discovered subdomains to ones that actually resolve before fingerprinting
 go install github.com/projectdiscovery/httpx/cmd/httpx@latest             # richer tech-stack fingerprinting than the built-in Server/X-Powered-By check
 go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest        # curated template scan, see Guardrails -- opt-in via `test-active --nuclei`
 nuclei -update-templates
