@@ -275,6 +275,17 @@ def approve_active_cmd(
              "sqli_exploitation, credential_testing, exploitation_framework) -- run once without it first "
              "to see the specific risk warning for what you're about to approve.",
     ),
+    required_user_agent: str | None = typer.Option(
+        None, "--required-user-agent",
+        help="Set/correct the policy's required User-Agent string if the rules-engine heuristic missed "
+             "it in review-rules's raw policy text -- e.g. a program that wants "
+             "'toolresearcher_<your-h1-username>'. Read the actual policy text yourself first; this is "
+             "never guessed or invented.",
+    ),
+    required_header: str | None = typer.Option(
+        None, "--required-header",
+        help="Set/correct a required 'Key: Value' request header the same way, if the policy names one.",
+    ),
 ):
     """Record an explicit human decision that a program's policy allows
     active testing. This is the only way RulesOfEngagement.confidence
@@ -304,13 +315,25 @@ def approve_active_cmd(
         )
         raise typer.Exit(1)
 
+    if required_header is not None and ":" not in required_header:
+        console.print(f"[red]invalid --required-header[/red]: {required_header!r} (expected 'Key: Value')")
+        raise typer.Exit(1)
+
     program.rules.human_reviewed = True
     program.rules.confidence = "high"
     program.rules.reviewed_at = datetime.utcnow()
     program.rules.review_notes = note
     program.rules.allowed_test_types = program.rules.allowed_test_types | parsed_types
+    if required_user_agent is not None:
+        program.rules.required_user_agent = required_user_agent
+    if required_header is not None:
+        program.rules.required_request_header = required_header
     upsert_program(program)
     console.print(f"[green]recorded[/green]: {key} now permits {sorted(t.value for t in parsed_types)}")
+    if required_user_agent is not None:
+        console.print(f"[dim]required User-Agent set to '{required_user_agent}' for all future requests to this program[/dim]")
+    if required_header is not None:
+        console.print(f"[dim]required header set to '{required_header}' for all future requests to this program[/dim]")
 
 
 @app.command()
@@ -467,18 +490,26 @@ def recon(
     )
 
     total_hosts = len(result.fingerprints)
+    cve_count = sum(1 for f in findings if f.test_type == TestType.VERSION_CVE_MATCH)
+    other_count = len(findings) - cve_count
+    findings_summary = (
+        f"{len(findings)} candidate finding(s) ({cve_count} CVE-keyword match(es), {other_count} other -- "
+        "TLS/DNS/JS/disclosure/etc.)"
+        if findings
+        else "0 candidate findings"
+    )
     if result.complete:
-        console.print(f"[green]done[/green] -- {total_hosts} host(s) fingerprinted, {len(findings)} CVE-keyword candidate(s)")
+        console.print(f"[green]done[/green] -- {total_hosts} host(s) fingerprinted, {findings_summary}")
     else:
         console.print(
             f"[yellow]stopped early[/yellow] -- covered {result.seeds_processed}/{result.seeds_total} seed asset(s) "
-            f"before being interrupted, {total_hosts} host(s) fingerprinted, {len(findings)} CVE-keyword candidate(s) "
+            f"before being interrupted, {total_hosts} host(s) fingerprinted, {findings_summary} "
             f"so far. Re-run `bbhunter recon {key}` to pick up where a fresh full pass would start (it doesn't "
             "resume mid-scope, it restarts, but nothing gathered this run is lost)."
         )
     if findings:
-        console.print("[yellow]note[/yellow]: these are coarse keyword matches, not confirmed vulnerabilities -- "
-                       "review with `bbhunter findings` before doing anything else with them")
+        console.print("[yellow]note[/yellow]: every one of these is a coarse automated signal, not a confirmed "
+                       "vulnerability -- review with `bbhunter findings` before doing anything else with them")
     if result.crtsh_failures:
         console.print(
             f"[yellow]warning[/yellow]: crt.sh query failed for {len(result.crtsh_failures)} seed host(s) "
