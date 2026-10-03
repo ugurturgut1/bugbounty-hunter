@@ -40,6 +40,7 @@ from bbhunter.testing.credential_testing import MAX_CREDENTIALS_PER_RUN, run_cre
 from bbhunter.testing.exploit_framework import run_exploit_framework_check
 from bbhunter.testing.auth_logic import run_session_valid_check, run_token_leak_check
 from bbhunter.testing.authlogic_plan import build_plan
+from bbhunter.testing.jwt_check import analyze_jwt
 from bbhunter.testing.takeover import run_takeover_check
 from bbhunter.audit import append_audit, export_markdown, read_audit
 from bbhunter.disclosures import add_disclosure, load_disclosures, match_disclosures
@@ -1107,6 +1108,23 @@ def killswitch_cmd(action: str = typer.Argument("status", help="on | off | statu
     else:
         console.print(f"[red]invalid action[/red]: {action!r}. Use on | off | status")
         raise typer.Exit(1)
+
+
+@app.command(name="test-jwt")
+def test_jwt_cmd(token: str = typer.Option(..., "--token", help="A JWT you hold (your own session token) to analyze")):
+    """Offline structural analysis of a JWT you already hold: flags
+    alg=none, symmetric algs, missing expiry, and over-long lifetimes. No
+    network, no signature cracking -- so no approve-active needed."""
+    try:
+        issues = analyze_jwt(token)
+    except ValueError as e:
+        console.print(f"[red]invalid JWT[/red]: {e}")
+        raise typer.Exit(1)
+    if not issues:
+        console.print("[green]no structural weaknesses found[/green] (signature strength not checked here)")
+        return
+    for i in issues:
+        console.print(f"  [yellow]{i['severity']}[/yellow] {i['kind']}: {i['detail']}")
 
 
 @app.command(name="cvss")

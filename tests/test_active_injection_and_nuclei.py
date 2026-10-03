@@ -188,14 +188,23 @@ def test_crlf_no_hit_when_header_not_reflected():
     assert [h for h in hits if h["kind"] == "crlf-header-injection-candidate"] == []
 
 
-def test_check_injection_signals_makes_six_requests_per_parameter():
-    """baseline + xss + sqli + nosqli + cmdi + crlf -- one parameter
-    should cost exactly 6 requests, never more."""
+def test_check_injection_signals_request_count_per_parameter():
+    """A non-redirect parameter costs exactly 7 requests:
+    baseline + xss + sqli + nosqli + cmdi + crlf + ssti -- never more."""
     client = MagicMock()
     client.get.return_value = _FakeResponse("nothing interesting")
     with patch("bbhunter.testing.active.time.sleep"):
         _check_injection_signals(client, "https://example.com/search?q=x")
-    assert client.get.call_count == 6
+    assert client.get.call_count == 7
+
+
+def test_check_injection_signals_adds_open_redirect_probe_for_redirect_params():
+    """A redirect-looking parameter costs one more (the open-redirect probe): 8."""
+    client = MagicMock()
+    client.get.return_value = _FakeResponse("nothing interesting")
+    with patch("bbhunter.testing.active.time.sleep"):
+        _check_injection_signals(client, "https://example.com/login?next=x")
+    assert client.get.call_count == 8
 
 
 def test_shellshock_flagged_when_marker_echoed_back():

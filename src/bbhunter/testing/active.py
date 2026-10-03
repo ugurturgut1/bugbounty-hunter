@@ -421,6 +421,11 @@ def _landed_off_host(resp: httpx.Response, host: str) -> bool:
 
 
 _CORS_PROBE_ORIGIN = "https://bbhunter-cors-probe.example"
+# Parameter names that commonly carry a redirect target -- only these get the
+# open-redirect probe, so we never send an extra request to an unrelated param.
+_REDIRECT_PARAM_NAMES = {"next", "url", "redirect", "redirect_uri", "redirect_url", "return", "returnto",
+                         "return_to", "dest", "destination", "continue", "goto", "target", "redir", "u", "r"}
+_OPEN_REDIRECT_PROBE_HOST = "bbhunter-redirect-probe.example"
 
 
 def _check_cors(client: httpx.Client, host: str) -> dict | None:
@@ -727,6 +732,60 @@ def _check_injection_signals(client: httpx.Client, url: str) -> list[dict]:
                     ),
                 }
             )
+
+        # SSTI: a distinctive arithmetic canary. If the *product* shows up in the
+        # response but the literal expression doesn't, a template engine evaluated
+        # it. Random operands make the product unlikely to occur naturally.
+        a, b = secrets.randbelow(900) + 100, secrets.randbelow(900) + 100
+        product = str(a * b)
+        ssti_url = _replace_param(parts, params, i, f"{value}{{{{{a}*{b}}}}}")
+        try:
+            resp = client.get(ssti_url, timeout=15, follow_redirects=True)
+        except httpx.HTTPError:
+            resp = None
+        time.sleep(REQUEST_DELAY_SECONDS)
+        if resp is not None and product in resp.text and f"{a}*{b}" not in resp.text and product not in baseline_body:
+            hits.append(
+                {
+                    "kind": "ssti-candidate",
+                    "param": name,
+                    "url": str(resp.url),
+                    "severity": "high",
+                    "evidence": (
+                        f"GET {resp.url} -> parameter '{name}' with a '{{{{{a}*{b}}}}}' template probe "
+                        f"returned the evaluated product '{product}' (the literal expression did not come "
+                        "back), consistent with server-side template evaluation. Arithmetic-only probe, no "
+                        "payload beyond a multiplication -- verify the engine/context manually before "
+                        "treating as exploitable."
+                    ),
+                }
+            )
+
+        # Open redirect: only for redirect-looking params, to avoid an extra
+        # request on every parameter. Send an external canary and see if the
+        # server 3xx-redirects straight to it.
+        if name.lower() in _REDIRECT_PARAM_NAMES:
+            redir_url = _replace_param(parts, params, i, f"https://{_OPEN_REDIRECT_PROBE_HOST}/")
+            try:
+                resp = client.get(redir_url, timeout=15, follow_redirects=False)
+            except httpx.HTTPError:
+                resp = None
+            time.sleep(REQUEST_DELAY_SECONDS)
+            if resp is not None and getattr(resp, "is_redirect", False) and _OPEN_REDIRECT_PROBE_HOST in resp.headers.get("location", ""):
+                hits.append(
+                    {
+                        "kind": "open-redirect-candidate",
+                        "param": name,
+                        "url": str(resp.url),
+                        "severity": "medium",
+                        "evidence": (
+                            f"GET {resp.url} -> parameter '{name}' set to an external URL caused a redirect "
+                            f"(Location: {resp.headers.get('location','')}) to the attacker-controlled host "
+                            f"'{_OPEN_REDIRECT_PROBE_HOST}'. Detection-only -- verify the redirect actually "
+                            "reaches an external origin (not a same-site path) before treating as exploitable."
+                        ),
+                    }
+                )
 
     return hits
 
