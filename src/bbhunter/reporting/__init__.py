@@ -1,3 +1,4 @@
+from bbhunter.reporting.cvss import base_score, score_and_rating, severity_rating
 from bbhunter.reporting.poc import draft_poc, poc_has_unfilled_todos
 from bbhunter.reporting.report import draft_report
 from bbhunter.reporting.submission import ManualSubmissionRequired, mark_submitted_manually, submit_report
@@ -9,4 +10,7 @@ __all__ = [
     "submit_report",
     "mark_submitted_manually",
     "ManualSubmissionRequired",
+    "base_score",
+    "score_and_rating",
+    "severity_rating",
 ]

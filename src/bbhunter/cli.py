@@ -21,6 +21,7 @@ from bbhunter.reporting import (
     ManualSubmissionRequired,
     draft_poc,
     draft_report,
+    score_and_rating,
     mark_submitted_manually,
     poc_has_unfilled_todos,
     submit_report,
@@ -1035,6 +1036,18 @@ def record_outcome_cmd(
     console.print(f"[green]recorded[/green]: {finding_id} -> {status}" + (f", bounty {bounty:.0f}" if bounty else ""))
 
 
+@app.command(name="cvss")
+def cvss_cmd(vector: str = typer.Argument(..., help="CVSS v3.1 vector, e.g. AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")):
+    """Compute a CVSS v3.1 base score + severity rating from a vector --
+    a defensible severity for a report instead of a guess."""
+    try:
+        score, rating = score_and_rating(vector)
+    except ValueError as e:
+        console.print(f"[red]invalid vector[/red]: {e}")
+        raise typer.Exit(1)
+    console.print(f"[bold]{score}[/bold] ({rating})")
+
+
 @app.command(name="stats")
 def stats_cmd():
     """Show the learned outcome signal: per-program and per-check-type
@@ -1691,12 +1704,24 @@ def reject_poc_cmd(finding_id: str, note: str = typer.Option(..., "--note", help
 @app.command(name="draft-report")
 def draft_report_cmd(
     finding_id: str,
-    severity: str = typer.Option(..., "--severity", help="none|low|medium|high|critical"),
+    severity: str | None = typer.Option(None, "--severity", help="none|low|medium|high|critical (or derive it with --cvss)"),
+    cvss: str | None = typer.Option(None, "--cvss", help="CVSS v3.1 vector, e.g. AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H -- derives severity"),
 ):
     """Phase 4 step 2: draft a disclosure report from an approved PoC.
     Runs after `approve-poc`, or again after `reject-report` to redraft --
     pulls reproduction steps and impact straight from the approved PoC
-    file."""
+    file. Pass --severity directly, or --cvss to derive a defensible
+    severity from a CVSS v3.1 vector."""
+    if bool(severity) == bool(cvss):
+        console.print("[red]error[/red]: pass exactly one of --severity or --cvss")
+        raise typer.Exit(1)
+    if cvss:
+        try:
+            score, severity = score_and_rating(cvss)
+        except ValueError as e:
+            console.print(f"[red]invalid --cvss[/red]: {e}")
+            raise typer.Exit(1)
+        console.print(f"[cyan]CVSS[/cyan] {cvss} -> base {score} ({severity})")
     finding = get_finding(finding_id)
     if not finding:
         console.print(f"[red]not found[/red]: {finding_id}")
