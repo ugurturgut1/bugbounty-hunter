@@ -64,3 +64,47 @@ def test_no_csp_header_produces_no_weak_csp_hit():
         hits = _check_host(client, "example.com", fingerprint=None)
 
     assert not any("Weak Content-Security-Policy" in h["title"] for h in hits)
+
+
+class _OffHostResponse(_FakeResponse):
+    """A 200 whose final URL is a different host -- i.e. the request was
+    redirected to an auth gateway's login page (Cloudflare Access etc.)."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.url = "https://sso.gateway.example.net/cdn-cgi/access/login/example.com"
+
+
+def test_exposed_file_behind_auth_gateway_is_not_flagged():
+    """Regression for a real false positive (gener8, 2026-10-03): every path on
+    a host behind Cloudflare Access 200'd as the login portal on a DIFFERENT
+    host, and /.env.local was flagged 'high'. An off-host landing is the
+    gateway's page, not the target's file -- it must not be reported."""
+    # mock an .env.local path that 200s but lands on the gateway host, with a
+    # body that would otherwise match a signature
+    def fake_get(url, timeout=15, follow_redirects=True):
+        return _OffHostResponse(content=b"SECRET_KEY=abc\nDB_PASSWORD=x", text="SECRET_KEY=abc\nDB_PASSWORD=x")
+
+    client = MagicMock()
+    client.get.side_effect = fake_get
+    with patch("bbhunter.testing.active.time.sleep"):
+        hits = _check_host(client, "example.com", fingerprint=None)
+
+    # nothing at all: the file checks skip off-host, and the root header block
+    # returns early because root also landed on the gateway
+    assert hits == []
+
+
+def test_headers_not_assessed_when_root_redirects_off_host():
+    def fake_get(url, timeout=15, follow_redirects=True):
+        if url.rstrip("/").endswith("example.com"):
+            return _OffHostResponse(headers={})  # root -> gateway
+        return _FakeResponse(status_code=404, content=b"nf", text="nf")
+
+    client = MagicMock()
+    client.get.side_effect = fake_get
+    with patch("bbhunter.testing.active.time.sleep"):
+        hits = _check_host(client, "example.com", fingerprint=None)
+
+    assert not any(h["title"].startswith("Missing security headers") for h in hits)
+    assert not any("rate-limit" in h["title"] for h in hits)

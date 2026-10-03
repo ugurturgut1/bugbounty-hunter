@@ -406,6 +406,19 @@ def _baseline(client: httpx.Client, host: str) -> tuple[int, int] | None:
         return None
 
 
+def _landed_off_host(resp: httpx.Response, host: str) -> bool:
+    """True if `resp` ended up on a host other than `host` after following
+    redirects -- almost always an SSO/auth-gateway interstitial (Cloudflare
+    Access, Okta, Azure AD, ...). Its HTTP 200 is the *login page*, not the
+    requested resource, so treating it as an exposed file or reading its
+    headers is a false positive. Observed live 2026-10-03:
+    alertmanager.gener8ads.com sits behind Cloudflare Access, so every probed
+    path 200'd as the login portal on gener8.cloudflareaccess.com -- including
+    /.env.local, which the scanner then flagged 'high'."""
+    landed = urlsplit(str(resp.url)).hostname
+    return bool(landed) and landed != host
+
+
 def _check_host(client: httpx.Client, host: str, fingerprint: dict | None = None) -> list[dict]:
     hits: list[dict] = []
     baseline = _baseline(client, host)
@@ -428,6 +441,8 @@ def _check_host(client: httpx.Client, host: str, fingerprint: dict | None = None
 
         if resp.status_code != 200:
             continue
+        if _landed_off_host(resp, host):
+            continue  # redirected to an auth gateway/other host -- not this host's own file
         if baseline and baseline[0] == 200 and abs(len(resp.content) - baseline[1]) < 32:
             continue  # looks like the same soft-404 page as the baseline probe
         body_lower = resp.text.lower()
@@ -446,6 +461,11 @@ def _check_host(client: httpx.Client, host: str, fingerprint: dict | None = None
 
     try:
         resp = client.get(f"https://{host}/", timeout=15, follow_redirects=True)
+        if _landed_off_host(resp, host):
+            # root redirected to an auth gateway -- these headers describe the
+            # gateway's login page, not the target, so every check below would
+            # be a false positive. We simply can't assess the target here.
+            return hits
         present = {k.lower() for k in resp.headers}
         missing = [h for h in _SECURITY_HEADERS if h not in present]
         if missing:
