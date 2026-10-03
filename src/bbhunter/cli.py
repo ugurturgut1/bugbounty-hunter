@@ -41,6 +41,7 @@ from bbhunter.testing.exploit_framework import run_exploit_framework_check
 from bbhunter.testing.auth_logic import run_session_valid_check, run_token_leak_check
 from bbhunter.testing.authlogic_plan import build_plan
 from bbhunter.testing.takeover import run_takeover_check
+from bbhunter.disclosures import add_disclosure, load_disclosures, match_disclosures
 from bbhunter.triage import flag_known_issues
 from bbhunter.testing.idor import run_bfla_batch, run_bfla_check, run_idor_batch, run_idor_check
 from bbhunter.testing.mass_assignment import run_mass_assignment_check
@@ -1114,6 +1115,45 @@ def whatsnew_cmd(
             console.print(f"  - {k}: +{nh} host(s), +{ns} subdomain(s)  (bbhunter whatsnew {k})")
     if not fresh_keys and not expanded_keys and not changed:
         console.print("[yellow]nothing new[/yellow] in the window")
+
+
+@app.command(name="add-disclosure")
+def add_disclosure_cmd(
+    key: str,
+    title: str = typer.Option(..., "--title", help="Title of an already-public disclosed report for this program"),
+    vuln_class: str | None = typer.Option(None, "--vuln-class", help="Optional vuln class of that report"),
+):
+    """Record a program's already-public disclosed report (from its
+    Hacktivity/disclosure feed) so `dedup-check` can warn you before you
+    submit a likely duplicate."""
+    if not get_program(key):
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+    total = add_disclosure(key, title, vuln_class)
+    console.print(f"[green]added[/green] -- {total} disclosure(s) on file for {key}")
+
+
+@app.command(name="dedup-check")
+def dedup_check_cmd(key: str):
+    """Flag candidate findings that look like a program's already-public
+    disclosed reports (same vuln class, or high title overlap), so you
+    don't burn reputation submitting a known duplicate. Populate the
+    disclosure list first with `add-disclosure`."""
+    if not get_program(key):
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+    disclosures = load_disclosures(key)
+    if not disclosures:
+        console.print(f"[yellow]no disclosures on file[/yellow] for {key} -- add some with `add-disclosure`")
+        raise typer.Exit(0)
+    candidates = [f for f in list_findings(status="candidate") if f.program_key == key]
+    flagged = match_disclosures(candidates, disclosures)
+    if not flagged:
+        console.print(f"[green]no likely duplicates[/green] among {len(candidates)} candidate(s) vs {len(disclosures)} disclosure(s)")
+        return
+    console.print(f"[yellow]{len(flagged)} candidate(s) look like known public disclosures:[/yellow]")
+    for f, reason in flagged:
+        console.print(f"  - {f.title}  [dim]on {f.asset}[/dim] -- {reason}")
 
 
 @app.command(name="triage")
