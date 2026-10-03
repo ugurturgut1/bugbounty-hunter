@@ -131,6 +131,11 @@ SUBFINDER_TIMEOUT_SECONDS = 15  # trimmed from 30 2026-09-18 -- live-tested 2026
                                  # sources with no API keys configured; 15s (vs. subfinder's own 60s
                                  # default) trades more source coverage for a multi-seed `bbhunter recon`
                                  # run staying in the tens-of-minutes range on a medium/large program
+# ^ that 15s is subfinder's *per-source* -timeout. The overall subprocess cap is separate: even with a
+# 15s per-source limit, subfinder's ~30 sources add up to 10-45s+ wall-clock on a real domain (measured
+# 2026-10-03). The old cap of SUBFINDER_TIMEOUT_SECONDS + 10 = 25s silently killed every slow run as a
+# "failure", dropping real subdomains. This is the real overall ceiling instead.
+SUBFINDER_SUBPROCESS_TIMEOUT_SECONDS = 90
                                  # instead of hours -- still returns whatever sources answered in time,
                                  # never treated as a hard failure unless nothing came back at all
 # CRTSH_DELAY_SECONDS/CERTSPOTTER_DELAY_SECONDS/WAYBACK_DELAY_SECONDS/DNS_DELAY_SECONDS were individual
@@ -194,17 +199,25 @@ def crtsh_subdomains(domain: str, *, timeout: float = 15) -> tuple[set[str], boo
     distinct from a successful query that legitimately found nothing, so
     callers can tell "no subdomains" apart from "we don't actually know"
     instead of silently treating both the same way."""
-    try:
-        resp = httpx.get(
-            CRTSH_URL,
-            params={"q": f"%.{domain}", "output": "json"},
-            timeout=timeout,
-            headers={"User-Agent": DEFAULT_USER_AGENT},
-        )
-        resp.raise_for_status()
-        entries = resp.json()
-    except (httpx.HTTPError, ValueError):
-        return set(), False
+    # crt.sh is notoriously flaky under load (502/503, truncated/non-JSON bodies). As the primary CT
+    # source, a single transient blip shouldn't silently drop it -- one retry recovers the common case.
+    entries = None
+    for attempt in range(2):
+        try:
+            resp = httpx.get(
+                CRTSH_URL,
+                params={"q": f"%.{domain}", "output": "json"},
+                timeout=timeout,
+                headers={"User-Agent": DEFAULT_USER_AGENT},
+            )
+            resp.raise_for_status()
+            entries = resp.json()
+            break
+        except (httpx.HTTPError, ValueError):
+            if attempt == 0:
+                time.sleep(2)  # ponytail: fixed 2s backoff, not exponential -- 2 attempts don't need it
+                continue
+            return set(), False
 
     names: set[str] = set()
     for entry in entries:
@@ -262,7 +275,7 @@ def subfinder_subdomains(domain: str, *, timeout: float = SUBFINDER_TIMEOUT_SECO
             [binary, "-d", domain, "-silent", "-timeout", str(int(timeout))],
             capture_output=True,
             text=True,
-            timeout=timeout + 10,
+            timeout=SUBFINDER_SUBPROCESS_TIMEOUT_SECONDS,
         )
     except (subprocess.SubprocessError, OSError):
         return set(), False
@@ -275,7 +288,7 @@ def subfinder_subdomains(domain: str, *, timeout: float = SUBFINDER_TIMEOUT_SECO
     return {n for n in names if n.endswith(domain)}, True
 
 
-def assetfinder_subdomains(domain: str, *, timeout: float = 15) -> tuple[set[str], bool]:
+def assetfinder_subdomains(domain: str, *, timeout: float = 30) -> tuple[set[str], bool]:
     """Shells out to the `assetfinder` binary (tomnomnom) with
     `--subs-only` -- restricts output to actual subdomains of `domain`,
     never the unrelated "related root domains" assetfinder can also
