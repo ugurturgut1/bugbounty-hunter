@@ -41,6 +41,7 @@ from bbhunter.testing.exploit_framework import run_exploit_framework_check
 from bbhunter.testing.auth_logic import run_session_valid_check, run_token_leak_check
 from bbhunter.testing.authlogic_plan import build_plan
 from bbhunter.testing.takeover import run_takeover_check
+from bbhunter.audit import append_audit, export_markdown, read_audit
 from bbhunter.disclosures import add_disclosure, load_disclosures, match_disclosures
 from bbhunter.safety import (
     KillSwitchEngaged,
@@ -82,6 +83,8 @@ def _log_test_run(key: str, test_type: TestType, findings_created: int, detail: 
         findings_created=findings_created,
         detail=detail,
     ))
+    # Mirror to the append-only audit log (good-faith-conduct record).
+    append_audit(key, test_type.value, detail)
 
 app = typer.Typer(help="Personal bug-bounty discovery/recon/reporting pipeline")
 console = Console()
@@ -1062,6 +1065,30 @@ def record_outcome_cmd(
         finding.bounty_amount = bounty
     upsert_finding(finding)
     console.print(f"[green]recorded[/green]: {finding_id} -> {status}" + (f", bounty {bounty:.0f}" if bounty else ""))
+
+
+@app.command(name="audit")
+def audit_cmd(
+    key: str | None = typer.Argument(None, help="Optional program key to filter to"),
+    export: str | None = typer.Option(None, "--export", help="Write the log as markdown to this path"),
+):
+    """Show (or export) the append-only audit log of every check run --
+    timestamp, program, check type, and what was targeted. A good-faith
+    record of your conduct to show a program if ever asked."""
+    records = read_audit(key)
+    if not records:
+        console.print("[yellow]no audit entries yet[/yellow]")
+        return
+    if export:
+        Path(export).write_text(export_markdown(key))
+        console.print(f"[green]exported[/green] {len(records)} entr(ies) -> {export}")
+        return
+    table = Table(title=f"Audit log{f' - {key}' if key else ''} ({len(records)})")
+    for col in ("Timestamp (UTC)", "Program", "Check", "Detail"):
+        table.add_column(col, no_wrap=(col != "Detail"))
+    for r in records[-200:]:
+        table.add_row(r.get("ts", "")[:19], r.get("program_key", ""), r.get("test_type", ""), r.get("detail", ""))
+    console.print(table)
 
 
 @app.command(name="killswitch")
