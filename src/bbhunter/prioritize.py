@@ -49,6 +49,8 @@ class PriorityScore:
     already_reconned: bool
     active_testing_ready: bool
     cve_match_discounted: bool
+    is_fresh: bool = False
+    recently_expanded: bool = False
     reasons: list[str] = field(default_factory=list)
 
 
@@ -61,7 +63,9 @@ def _cve_match_discounted(program: Program) -> bool:
     return any(phrase in text for phrase in CVE_MATCH_DISCOUNT_PHRASES)
 
 
-def score_program(program: Program, *, already_reconned: bool) -> PriorityScore | None:
+def score_program(
+    program: Program, *, already_reconned: bool, is_fresh: bool = False, recently_expanded: bool = False
+) -> PriorityScore | None:
     """Returns None for programs with nothing for recon to do (no
     URL/wildcard scope) -- there's nothing to rank."""
     eligible_seeds = _eligible_seed_count(program)
@@ -98,6 +102,17 @@ def score_program(program: Program, *, already_reconned: bool) -> PriorityScore 
         value *= 1.1
         reasons.append("explicit safe harbor (1.1x)")
 
+    # Freshness: brand-new programs and freshly-expanded scope are the
+    # least picked-over by other researchers -- where first-blood bugs and
+    # CVE-worthy findings actually come from, so they get the biggest
+    # boosts here.
+    if is_fresh:
+        value *= 1.6
+        reasons.append("newly-added program -- likely less picked-over (1.6x)")
+    if recently_expanded:
+        value *= 1.4
+        reasons.append("scope recently expanded -- fresh attack surface (1.4x)")
+
     if already_reconned:
         value *= 0.2
         reasons.append("already reconned once -- mostly marginal value now (0.2x)")
@@ -114,12 +129,29 @@ def score_program(program: Program, *, already_reconned: bool) -> PriorityScore 
         already_reconned=already_reconned,
         active_testing_ready=active_ready,
         cve_match_discounted=discounted,
+        is_fresh=is_fresh,
+        recently_expanded=recently_expanded,
         reasons=reasons,
     )
 
 
-def prioritize(programs: list[Program], reconned_keys: set[str]) -> list[PriorityScore]:
-    scored = [score_program(p, already_reconned=p.key in reconned_keys) for p in programs]
+def prioritize(
+    programs: list[Program],
+    reconned_keys: set[str],
+    fresh_keys: set[str] | None = None,
+    expanded_keys: set[str] | None = None,
+) -> list[PriorityScore]:
+    fresh_keys = fresh_keys or set()
+    expanded_keys = expanded_keys or set()
+    scored = [
+        score_program(
+            p,
+            already_reconned=p.key in reconned_keys,
+            is_fresh=p.key in fresh_keys,
+            recently_expanded=p.key in expanded_keys,
+        )
+        for p in programs
+    ]
     ranked = [s for s in scored if s is not None]
     ranked.sort(key=lambda s: s.score, reverse=True)
     return ranked

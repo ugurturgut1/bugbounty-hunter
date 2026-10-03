@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -10,9 +11,11 @@ from rich.console import Console
 from rich.table import Table
 
 from bbhunter.discovery import ALL_CONNECTORS
-from bbhunter.models import AIEndpointConfig, AssetType, FindingStatus, TestRun, TestType
+from bbhunter.models import AIEndpointConfig, AssetType, Finding, FindingStatus, ReconResult, TestRun, TestType
 from bbhunter.prioritize import prioritize
 from bbhunter.recon import run_passive_recon
+from bbhunter.recon.authed import discover_authed_endpoints
+from bbhunter.recon.passive import _extract_host as _host_of
 from bbhunter.recon.passive import _tool_path
 from bbhunter.reporting import (
     ManualSubmissionRequired,
@@ -23,7 +26,7 @@ from bbhunter.reporting import (
     submit_report,
 )
 from bbhunter.testing import run_active_checks
-from bbhunter.testing.active import _select_hosts
+from bbhunter.testing.active import _select_hosts, run_nuclei_cve_scan
 from bbhunter.testing.aggressive_discovery import (
     FFUF_RATE_PER_SECOND,
     MAX_DISCOVERY_HOSTS_PER_PROGRAM,
@@ -36,6 +39,8 @@ from bbhunter.testing.credential_testing import MAX_CREDENTIALS_PER_RUN, run_cre
 from bbhunter.testing.exploit_framework import run_exploit_framework_check
 from bbhunter.testing.auth_logic import run_session_valid_check, run_token_leak_check
 from bbhunter.testing.authlogic_plan import build_plan
+from bbhunter.testing.takeover import run_takeover_check
+from bbhunter.triage import flag_known_issues
 from bbhunter.testing.idor import run_bfla_batch, run_bfla_check, run_idor_batch, run_idor_check
 from bbhunter.testing.mass_assignment import run_mass_assignment_check
 from bbhunter.testing.sqli_exploit import SQLMAP_DUMP_ROW_LIMIT, run_sqli_exploitation
@@ -46,6 +51,7 @@ from bbhunter.state import (
     get_recon_result,
     list_findings,
     list_programs,
+    fresh_program_keys,
     list_reconned_program_keys,
     list_test_runs,
     record_test_run,
@@ -164,6 +170,12 @@ def prioritize_cmd(
     sort_by: str = typer.Option(
         "score", "--sort", help="score (default, effort-vs-payoff) | time (fastest first) | seeds (largest scope first)"
     ),
+    fresh_days: int = typer.Option(
+        14, "--fresh-days", help="Treat programs first-seen/scope-expanded within this many days as 'fresh' (boosts their score)"
+    ),
+    fresh_only: bool = typer.Option(
+        False, "--fresh-only", help="Show only newly-added or recently-scope-expanded programs"
+    ),
 ):
     """Browse synced programs with an estimated recon time for each, e.g.
     to decide which of several newly-uncovered large scopes is actually
@@ -175,9 +187,12 @@ def prioritize_cmd(
     those numbers directly."""
     programs = list_programs()
     reconned = list_reconned_program_keys()
-    ranked = prioritize(programs, reconned)
+    fresh_keys, expanded_keys = fresh_program_keys(fresh_days)
+    ranked = prioritize(programs, reconned, fresh_keys=fresh_keys, expanded_keys=expanded_keys)
     if not show_reconned:
         ranked = [r for r in ranked if not r.already_reconned]
+    if fresh_only:
+        ranked = [r for r in ranked if r.is_fresh or r.recently_expanded]
     if search:
         needle = search.lower()
         ranked = [r for r in ranked if needle in r.program_key.lower() or needle in r.name.lower()]
@@ -989,6 +1004,187 @@ def test_session_replay_cmd(
         console.print("[red]candidate found[/red] -- logged-out session still works; verify before drafting a PoC")
     else:
         console.print("[green]no candidate[/green] -- session appears properly invalidated")
+
+
+@app.command(name="triage")
+def triage_cmd(
+    key: str,
+):
+    """Flag candidate findings this program's own policy likely won't
+    accept -- out-of-scope assets, and low-value classes (SPF/DMARC,
+    missing security headers, rate-limit, source maps, ...) the policy
+    text names as excluded -- so you don't waste a report or burn
+    reputation on a known non-issue. Read-only; it labels, never deletes
+    or hides."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+    candidates = [f for f in list_findings(status="candidate") if f.program_key == key]
+    if not candidates:
+        console.print(f"[green]no candidates[/green] for {key}")
+        raise typer.Exit(0)
+    flagged = flag_known_issues(program, candidates)
+    flagged_ids = {f.id for f, _ in flagged}
+    worth = [f for f in candidates if f.id not in flagged_ids]
+    console.print(f"[bold]{len(candidates)} candidate(s)[/bold] for {key}: "
+                   f"{len(worth)} worth review, {len(flagged)} likely out-of-scope/noise")
+    if flagged:
+        console.print("\n[yellow]Likely out-of-scope / known non-issues (verify before reporting):[/yellow]")
+        for f, reason in flagged:
+            console.print(f"  - {f.title}  [dim]on {f.asset}[/dim] -- {reason}")
+    if worth:
+        console.print("\n[green]Worth a real look:[/green]")
+        for f in worth:
+            console.print(f"  - {f.title}  [dim]on {f.asset}[/dim]")
+
+
+@app.command(name="test-cve-confirm")
+def test_cve_confirm_cmd(
+    key: str,
+):
+    """Actively confirm the weak NVD keyword-CVE matches from passive
+    recon: for each host with VERSION_CVE_MATCH candidates, run nuclei
+    restricted to exactly those CVE template IDs. A nuclei hit turns a
+    'maybe affected' guess into an actually-fired finding (the real path
+    to a reportable CVE). Gated by `approve-active`; needs `nuclei`
+    installed; paced 1 req/s like every nuclei run here."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+    if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
+        console.print(
+            f"[red]blocked[/red]: {key} does not permit active testing. "
+            "Run `bbhunter review-rules` then `bbhunter approve-active` if the policy actually allows it."
+        )
+        raise typer.Exit(1)
+
+    by_host: dict[str, list[str]] = {}
+    for f in list_findings():
+        if f.program_key == key and f.test_type == TestType.VERSION_CVE_MATCH:
+            ids = re.findall(r"CVE-\d{4}-\d{4,7}", f"{f.id} {f.title}")
+            if ids:
+                by_host.setdefault(f.asset, []).extend(ids)
+    if not by_host:
+        console.print(f"[yellow]nothing to confirm[/yellow]: no VERSION_CVE_MATCH candidates for {key} -- run `bbhunter recon` first")
+        raise typer.Exit(0)
+
+    total = 0
+    for host, cve_ids in by_host.items():
+        console.print(f"[cyan]confirming[/cyan] {len(set(cve_ids))} CVE(s) on {host} via nuclei (1 req/s)...")
+        results = run_nuclei_cve_scan(host, cve_ids, program.rules)
+        if results is None:
+            console.print("[yellow]skip[/yellow]: nuclei not installed or run errored")
+            continue
+        for r in results:
+            tid = r.get("template-id", "cve")
+            finding = Finding(
+                id=f"{key}:cve-confirmed:{host}:{tid}",
+                program_key=key,
+                asset=host,
+                title=f"nuclei-confirmed {tid} on {host}",
+                vuln_class="confirmed-cve",
+                test_type=TestType.ACTIVE_LOW_IMPACT,
+                evidence=(
+                    f"nuclei template {tid} fired against https://{host} "
+                    f"({r.get('matched-at', host)}). Promotes the earlier NVD keyword match from a guess to "
+                    "an actually-fired check -- still verify the real impact manually before drafting a PoC."
+                ),
+                status=FindingStatus.CANDIDATE,
+                notes="severity guess: high -- nuclei-confirmed, verify impact before PoC",
+            )
+            upsert_finding(finding)
+            total += 1
+    _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, total, f"CVE confirmation across {len(by_host)} host(s)")
+    if total:
+        console.print(f"[red]{total} CVE(s) confirmed[/red] -- see `bbhunter findings`, verify impact before drafting a PoC")
+    else:
+        console.print("[green]none confirmed[/green] -- no targeted nuclei template fired")
+
+
+@app.command(name="test-takeover")
+def test_takeover_cmd(
+    key: str,
+):
+    """Check recon-discovered hosts for subdomain takeover: one GET per
+    host, flagging any that serve a known 'unclaimed resource' page
+    (GitHub Pages, S3, Heroku, ...). Complements the passive
+    dangling-CNAME check by catching the case where the CNAME target
+    resolves but is unclaimed. Gated by `approve-active`; read-only,
+    detection-only (never attempts to claim anything)."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+    if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
+        console.print(
+            f"[red]blocked[/red]: {key} does not permit active testing. "
+            "Run `bbhunter review-rules` then `bbhunter approve-active` if the policy actually allows it."
+        )
+        raise typer.Exit(1)
+    recon_result = get_recon_result(key)
+    if recon_result and recon_result.fingerprints:
+        hosts = sorted(recon_result.fingerprints.keys())
+    else:
+        hosts = sorted({h for a in program.in_scope if a.in_scope and (h := _host_of(a.identifier))})
+    if not hosts:
+        console.print(f"[yellow]no hosts[/yellow] to check for {key} -- run `bbhunter recon {key}` first")
+        raise typer.Exit(1)
+    console.print(f"[cyan]checking takeover[/cyan] on {len(hosts)} host(s) for {key} (paced <=1 RPS)...")
+    new_findings = run_takeover_check(program, hosts)
+    for finding in new_findings:
+        upsert_finding(finding)
+    _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, len(new_findings), f"takeover check on {len(hosts)} host(s)")
+    if new_findings:
+        console.print(f"[red]{len(new_findings)} candidate(s) found[/red] -- see `bbhunter findings`, verify + claim-test manually")
+    else:
+        console.print("[green]no candidate[/green] -- no unclaimed-service fingerprints seen")
+
+
+@app.command(name="authed-recon")
+def authed_recon_cmd(
+    key: str,
+    header: list[str] = typer.Option(..., "--header", help="'Key: Value' auth header for your own session, repeatable"),
+):
+    """With your own session, discover authenticated endpoints on the
+    program's hosts: fetch any OpenAPI/Swagger schema and probe GraphQL
+    introspection, then merge the declared endpoints into the stored
+    recon result so `authlogic-plan` can point you at real authenticated
+    surface. Active (requests the target's own schema), so gated by
+    `approve-active`; read-only, and the session is your own."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+    if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
+        console.print(
+            f"[red]blocked[/red]: {key} does not permit active testing. "
+            "Run `bbhunter review-rules` then `bbhunter approve-active` if the policy actually allows it."
+        )
+        raise typer.Exit(1)
+    recon_result = get_recon_result(key)
+    if recon_result and recon_result.fingerprints:
+        hosts = sorted(recon_result.fingerprints.keys())  # already scope-selected during recon
+    else:
+        hosts = sorted({h for a in program.in_scope if a.in_scope
+                        and (h := _host_of(a.identifier))})
+    if not hosts:
+        console.print(f"[yellow]no hosts[/yellow] to probe for {key} -- run `bbhunter recon {key}` first")
+        raise typer.Exit(1)
+    headers = _parse_headers(header)
+    console.print(f"[cyan]authed recon[/cyan] on {len(hosts)} host(s) for {key} (paced <=1 RPS)...")
+    endpoints, notes = discover_authed_endpoints(hosts, headers)
+    for n in notes:
+        console.print(f"  {n}")
+    if recon_result is None:
+        console.print("[yellow]note[/yellow]: no prior recon on file -- storing endpoints under a fresh recon record")
+        recon_result = ReconResult(program_key=key)
+    merged = list(dict.fromkeys([*recon_result.authed_endpoints, *endpoints]))
+    recon_result.authed_endpoints = merged
+    upsert_recon_result(recon_result)
+    console.print(f"[green]done[/green] -- {len(endpoints)} endpoint(s) this run, {len(merged)} total on file. "
+                   f"Next: `bbhunter authlogic-plan {key}`")
 
 
 @app.command(name="authlogic-plan")

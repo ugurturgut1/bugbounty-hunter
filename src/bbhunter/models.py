@@ -189,6 +189,8 @@ class ReconResult(BaseModel):
     wayback_failures: list[str] = Field(default_factory=list)        # seed hosts whose archive.org CDX query errored
     param_urls: dict[str, list[str]] = Field(default_factory=dict)   # seed host -> historic URLs (with query strings) found via Wayback CDX,
                                                                       # the input set for testing/active.py's opt-in injection-signature checks
+    authed_endpoints: list[str] = Field(default_factory=list)        # endpoint URLs discovered via `authed-recon` (OpenAPI/Swagger paths +
+                                                                      # GraphQL endpoints) using a human-supplied session -- fuel for authlogic-plan
     seeds_total: int = 0                                             # how many seed assets this run was scoped to cover
     seeds_processed: int = 0                                         # how many it actually got through before finishing/stopping
     last_run: datetime = Field(default_factory=datetime.utcnow)

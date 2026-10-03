@@ -49,6 +49,10 @@ def build_plan(program_key: str, recon: ReconResult) -> str:
     all_urls: list[str] = []
     for urls in recon.param_urls.values():
         all_urls.extend(urls)
+    # Authenticated endpoints from `authed-recon` are concrete API operations
+    # -- exactly the high-value surface for BOLA/BFLA, so fold them in too.
+    all_urls.extend(recon.authed_endpoints)
+    graphql = [u for u in recon.authed_endpoints if u.rstrip("/").endswith("graphql") or u.endswith("/query")]
     all_hosts = sorted(recon.fingerprints.keys())
 
     bola = sorted({u for u in all_urls if _is_object_ref(u)})
@@ -81,6 +85,13 @@ def build_plan(program_key: str, recon: ReconResult) -> str:
         "Enumerate object/function endpoints here by hand, then feed them to test-idor/test-bfla (or --urls-file).",
     ]
     lines += [f"- [ ] {h}" for h in api_hosts] or ["- (none obviously API-shaped)"]
+    if graphql:
+        lines += [
+            "",
+            f"## GraphQL endpoints with open introspection ({len(graphql)})",
+            "Enumerate types/fields by hand, then test field-level authz across your two accounts.",
+        ]
+        lines += [f"- [ ] {g}" for g in graphql]
     lines += [
         "",
         "## Reminders",

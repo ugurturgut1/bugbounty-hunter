@@ -830,6 +830,51 @@ def run_nuclei_scan(
     return results
 
 
+def run_nuclei_cve_scan(
+    host: str, cve_ids: list[str], rules: RulesOfEngagement, *, timeout: float = NUCLEI_RUN_TIMEOUT_SECONDS
+) -> list[dict] | None:
+    """Run nuclei restricted to specific CVE template IDs against one
+    host, to actively confirm the weak NVD-keyword matches passive recon
+    produced. nuclei's CVE templates are keyed by the CVE id, so `-id
+    CVE-2021-44228,...` selects exactly those -- turning a 'maybe this
+    version is affected' keyword guess into an actually-fired check. Same
+    conservative 1 req/s, single-connection pacing as run_nuclei_scan.
+    Returns None if nuclei isn't installed or the run errors (="skip"),
+    an empty list for 'ran, nothing fired'."""
+    binary = _tool_path("nuclei")
+    if not binary or not cve_ids:
+        return None
+    headers = _request_headers(rules)
+    header_args = []
+    for key, value in headers.items():
+        header_args += ["-H", f"{key}: {value}"]
+    try:
+        proc = subprocess.run(
+            [
+                binary, "-jsonl", "-silent",
+                "-id", ",".join(sorted(set(cve_ids))),
+                "-rate-limit", str(NUCLEI_RATE_LIMIT_PER_SECOND),
+                "-bulk-size", "1", "-c", "1", "-timeout", "15",
+            ]
+            + header_args,
+            input=f"https://{host}",
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    results: list[dict] = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if line:
+            try:
+                results.append(json.loads(line))
+            except ValueError:
+                continue
+    return results
+
+
 def _select_hosts(program: Program, recon_result: ReconResult | None) -> list[str]:
     """Exact hosts from in-scope URL/WILDCARD assets, plus -- only for
     WILDCARD-type assets -- a capped slice of subdomains a prior recon
