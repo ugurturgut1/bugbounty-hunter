@@ -106,6 +106,44 @@ def upsert_program(program: Program, db_path: Path = DB_PATH) -> None:
         )
 
 
+_TERMINAL_OUTCOMES = {"submitted", "resolved", "duplicate", "informative"}
+
+
+def program_outcome_stats(db_path: Path = DB_PATH) -> dict[str, dict]:
+    """Aggregate per-program submission outcomes from the findings table:
+    counts of submitted/resolved/duplicate/informative and total bounty.
+    Only findings that reached a terminal outcome are counted -- a fresh
+    DB with none simply returns {}."""
+    stats: dict[str, dict] = {}
+    for f in list_findings(db_path=db_path):
+        if f.status.value not in _TERMINAL_OUTCOMES:
+            continue
+        s = stats.setdefault(f.program_key, {
+            "submitted": 0, "resolved": 0, "duplicate": 0, "informative": 0, "bounty_total": 0.0,
+        })
+        s[f.status.value] = s.get(f.status.value, 0) + 1
+        if f.bounty_amount:
+            s["bounty_total"] += f.bounty_amount
+    return stats
+
+
+def check_outcome_stats(db_path: Path = DB_PATH) -> dict[str, dict]:
+    """Same aggregation but keyed by vuln_class -- the signal-to-noise of
+    each check type across every program (which classes get resolved vs.
+    closed duplicate/informative), so low-yield checks can be deprioritized."""
+    stats: dict[str, dict] = {}
+    for f in list_findings(db_path=db_path):
+        if f.status.value not in _TERMINAL_OUTCOMES:
+            continue
+        s = stats.setdefault(f.vuln_class, {
+            "submitted": 0, "resolved": 0, "duplicate": 0, "informative": 0, "bounty_total": 0.0,
+        })
+        s[f.status.value] = s.get(f.status.value, 0) + 1
+        if f.bounty_amount:
+            s["bounty_total"] += f.bounty_amount
+    return stats
+
+
 def fresh_program_keys(within_days: int = 14, db_path: Path = DB_PATH) -> tuple[set[str], set[str]]:
     """Return (newly_seen, recently_expanded) program keys within the
     window. 'Newly seen' = first_seen inside the window (an unpicked new

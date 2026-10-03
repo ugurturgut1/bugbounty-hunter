@@ -51,8 +51,10 @@ from bbhunter.state import (
     get_recon_result,
     list_findings,
     list_programs,
+    check_outcome_stats,
     fresh_program_keys,
     list_reconned_program_keys,
+    program_outcome_stats,
     list_test_runs,
     record_test_run,
     upsert_ai_endpoint,
@@ -188,7 +190,8 @@ def prioritize_cmd(
     programs = list_programs()
     reconned = list_reconned_program_keys()
     fresh_keys, expanded_keys = fresh_program_keys(fresh_days)
-    ranked = prioritize(programs, reconned, fresh_keys=fresh_keys, expanded_keys=expanded_keys)
+    ranked = prioritize(programs, reconned, fresh_keys=fresh_keys, expanded_keys=expanded_keys,
+                        outcome_stats=program_outcome_stats())
     if not show_reconned:
         ranked = [r for r in ranked if not r.already_reconned]
     if fresh_only:
@@ -1004,6 +1007,54 @@ def test_session_replay_cmd(
         console.print("[red]candidate found[/red] -- logged-out session still works; verify before drafting a PoC")
     else:
         console.print("[green]no candidate[/green] -- session appears properly invalidated")
+
+
+@app.command(name="record-outcome")
+def record_outcome_cmd(
+    finding_id: str,
+    status: str = typer.Option(..., "--status", help="submitted | resolved | duplicate | informative"),
+    bounty: float | None = typer.Option(None, "--bounty", help="Bounty amount paid, if any (feeds prioritize weighting)"),
+):
+    """Record what actually happened to a submitted finding. This is the
+    feedback loop: outcomes drive `prioritize` weighting (programs that
+    resolve/pay rank higher; dupe/informative-only rank lower) and the
+    per-check signal stats in `bbhunter stats`."""
+    valid = {"submitted", "resolved", "duplicate", "informative"}
+    if status not in valid:
+        console.print(f"[red]invalid --status[/red]: {status!r}. Valid: {', '.join(sorted(valid))}")
+        raise typer.Exit(1)
+    finding = get_finding(finding_id)
+    if not finding:
+        console.print(f"[red]not found[/red]: {finding_id}")
+        raise typer.Exit(1)
+    finding.status = FindingStatus(status)
+    if bounty is not None:
+        finding.bounty_amount = bounty
+    upsert_finding(finding)
+    console.print(f"[green]recorded[/green]: {finding_id} -> {status}" + (f", bounty {bounty:.0f}" if bounty else ""))
+
+
+@app.command(name="stats")
+def stats_cmd():
+    """Show the learned outcome signal: per-program and per-check-type
+    resolved/duplicate/informative counts and total bounty. This is what
+    `prioritize` now weights by -- use it to see which programs and which
+    check types are actually worth your time."""
+    prog = program_outcome_stats()
+    check = check_outcome_stats()
+    if not prog and not check:
+        console.print("[yellow]no outcomes recorded yet[/yellow] -- use `bbhunter record-outcome` after you submit")
+        return
+    for title, data in (("By program", prog), ("By check type", check)):
+        if not data:
+            continue
+        table = Table(title=title)
+        for col in ("Key", "Submitted", "Resolved", "Duplicate", "Informative", "Bounty"):
+            table.add_column(col)
+        for key, s in sorted(data.items(), key=lambda kv: (kv[1].get("resolved", 0), kv[1].get("bounty_total", 0)), reverse=True):
+            table.add_row(key, str(s.get("submitted", 0)), str(s.get("resolved", 0)),
+                          str(s.get("duplicate", 0)), str(s.get("informative", 0)), f"{s.get('bounty_total', 0):.0f}")
+        console.print(table)
 
 
 @app.command(name="triage")

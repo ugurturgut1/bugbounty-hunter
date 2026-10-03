@@ -171,6 +171,8 @@ class Finding(BaseModel):
     status: FindingStatus = FindingStatus.CANDIDATE
     created_at: datetime = Field(default_factory=datetime.utcnow)
     notes: str | None = None
+    bounty_amount: float | None = None  # set via `record-outcome` once a program pays out -- fuels the
+                                         # outcome feedback loop (prioritize weighting + per-check signal stats)
 
 
 class ReconResult(BaseModel):

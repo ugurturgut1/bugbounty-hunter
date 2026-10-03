@@ -63,8 +63,27 @@ def _cve_match_discounted(program: Program) -> bool:
     return any(phrase in text for phrase in CVE_MATCH_DISCOUNT_PHRASES)
 
 
+def outcome_multiplier(stat: dict | None) -> tuple[float, str | None]:
+    """Turn a program's historical submission outcomes into a score
+    multiplier: reward programs that have actually resolved/paid your
+    reports, penalize ones where everything so far closed
+    duplicate/informative. None/empty history is neutral (1.0)."""
+    if not stat:
+        return 1.0, None
+    resolved = stat.get("resolved", 0)
+    paid = stat.get("bounty_total", 0.0)
+    noise = stat.get("duplicate", 0) + stat.get("informative", 0)
+    if resolved or paid:
+        mult = min(2.0, 1.0 + 0.4 * resolved + (0.3 if paid else 0.0))
+        return mult, f"proven: {resolved} resolved, {paid:.0f} paid ({mult:.1f}x)"
+    if noise:
+        return 0.5, f"only dupes/informative so far ({noise}) (0.5x)"
+    return 1.0, None
+
+
 def score_program(
-    program: Program, *, already_reconned: bool, is_fresh: bool = False, recently_expanded: bool = False
+    program: Program, *, already_reconned: bool, is_fresh: bool = False, recently_expanded: bool = False,
+    outcome: dict | None = None,
 ) -> PriorityScore | None:
     """Returns None for programs with nothing for recon to do (no
     URL/wildcard scope) -- there's nothing to rank."""
@@ -113,6 +132,13 @@ def score_program(
         value *= 1.4
         reasons.append("scope recently expanded -- fresh attack surface (1.4x)")
 
+    # Learned signal: weight by what this program has actually done with
+    # your past reports (resolved/paid vs. closed dupe/informative).
+    out_mult, out_reason = outcome_multiplier(outcome)
+    if out_reason:
+        value *= out_mult
+        reasons.append(out_reason)
+
     if already_reconned:
         value *= 0.2
         reasons.append("already reconned once -- mostly marginal value now (0.2x)")
@@ -140,15 +166,18 @@ def prioritize(
     reconned_keys: set[str],
     fresh_keys: set[str] | None = None,
     expanded_keys: set[str] | None = None,
+    outcome_stats: dict[str, dict] | None = None,
 ) -> list[PriorityScore]:
     fresh_keys = fresh_keys or set()
     expanded_keys = expanded_keys or set()
+    outcome_stats = outcome_stats or {}
     scored = [
         score_program(
             p,
             already_reconned=p.key in reconned_keys,
             is_fresh=p.key in fresh_keys,
             recently_expanded=p.key in expanded_keys,
+            outcome=outcome_stats.get(p.key),
         )
         for p in programs
     ]
