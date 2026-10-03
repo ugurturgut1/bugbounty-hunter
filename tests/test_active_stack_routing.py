@@ -92,7 +92,7 @@ def test_check_host_with_wordpress_fingerprint_adds_wordpress_checks():
 def test_check_host_flags_a_real_wordpress_hit():
     client = MagicMock()
 
-    def fake_get(url, timeout=15, follow_redirects=True):
+    def fake_get(url, timeout=15, follow_redirects=True, **kwargs):
         if "wp-config.php.bak" in url:
             return _FakeResponse(status_code=200, content=b"x" * 500, text="<?php define('DB_NAME', 'wp');")
         return _FakeResponse()
@@ -110,7 +110,7 @@ def test_check_host_flags_a_real_wordpress_hit():
 def test_check_host_flags_exposed_werkzeug_debugger():
     client = MagicMock()
 
-    def fake_get(url, timeout=15, follow_redirects=True):
+    def fake_get(url, timeout=15, follow_redirects=True, **kwargs):
         if url.endswith("/console"):
             return _FakeResponse(status_code=200, content=b"x" * 500, text="Werkzeug Debugger -- Traceback")
         return _FakeResponse()
@@ -128,7 +128,7 @@ def test_check_host_flags_exposed_werkzeug_debugger():
 def test_check_host_flags_exposed_jenkins_api():
     client = MagicMock()
 
-    def fake_get(url, timeout=15, follow_redirects=True):
+    def fake_get(url, timeout=15, follow_redirects=True, **kwargs):
         if url.endswith("/api/json"):
             return _FakeResponse(status_code=200, content=b"x" * 500, text='{"jobs": [], "_class": "hudson.model.Hudson"}')
         return _FakeResponse()

@@ -16,7 +16,7 @@ class _FakeResponse:
 
 
 def _fake_get_factory(root_headers: dict):
-    def fake_get(url, timeout=15, follow_redirects=True):
+    def fake_get(url, timeout=15, follow_redirects=True, **kwargs):
         if url.rstrip("/").endswith("example.com"):
             return _FakeResponse(headers=root_headers)
         return _FakeResponse(status_code=404, content=b"not found", text="not found")
@@ -82,7 +82,7 @@ def test_exposed_file_behind_auth_gateway_is_not_flagged():
     gateway's page, not the target's file -- it must not be reported."""
     # mock an .env.local path that 200s but lands on the gateway host, with a
     # body that would otherwise match a signature
-    def fake_get(url, timeout=15, follow_redirects=True):
+    def fake_get(url, timeout=15, follow_redirects=True, **kwargs):
         return _OffHostResponse(content=b"SECRET_KEY=abc\nDB_PASSWORD=x", text="SECRET_KEY=abc\nDB_PASSWORD=x")
 
     client = MagicMock()
@@ -96,7 +96,7 @@ def test_exposed_file_behind_auth_gateway_is_not_flagged():
 
 
 def test_headers_not_assessed_when_root_redirects_off_host():
-    def fake_get(url, timeout=15, follow_redirects=True):
+    def fake_get(url, timeout=15, follow_redirects=True, **kwargs):
         if url.rstrip("/").endswith("example.com"):
             return _OffHostResponse(headers={})  # root -> gateway
         return _FakeResponse(status_code=404, content=b"nf", text="nf")

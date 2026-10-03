@@ -34,7 +34,9 @@ from bbhunter.testing.aggressive_discovery import (
 from bbhunter.testing.ai_safety import run_ai_safety_probes
 from bbhunter.testing.credential_testing import MAX_CREDENTIALS_PER_RUN, run_credential_test
 from bbhunter.testing.exploit_framework import run_exploit_framework_check
-from bbhunter.testing.idor import run_bfla_check, run_idor_check
+from bbhunter.testing.auth_logic import run_session_valid_check, run_token_leak_check
+from bbhunter.testing.authlogic_plan import build_plan
+from bbhunter.testing.idor import run_bfla_batch, run_bfla_check, run_idor_batch, run_idor_check
 from bbhunter.testing.mass_assignment import run_mass_assignment_check
 from bbhunter.testing.sqli_exploit import SQLMAP_DUMP_ROW_LIMIT, run_sqli_exploitation
 from bbhunter.state import (
@@ -79,6 +81,28 @@ def _parse_headers(raw: list[str]) -> dict[str, str]:
         key, _, value = h.partition(":")
         headers[key.strip()] = value.strip()
     return headers
+
+
+def _resolve_urls(url: str | None, urls_file: str | None) -> list[str]:
+    """Return the URL list for an access-control check: exactly one of a
+    single --url or a --urls-file (one URL per line, blank lines and
+    '#' comments ignored). Exits with a clear error if neither or both
+    are given, or the file is empty/unreadable."""
+    if bool(url) == bool(urls_file):
+        console.print("[red]error[/red]: pass exactly one of --url or --urls-file")
+        raise typer.Exit(1)
+    if url:
+        return [url]
+    try:
+        lines = Path(urls_file).read_text().splitlines()
+    except OSError as e:
+        console.print(f"[red]error[/red]: can't read {urls_file}: {e}")
+        raise typer.Exit(1)
+    urls = [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
+    if not urls:
+        console.print(f"[red]error[/red]: no URLs in {urls_file}")
+        raise typer.Exit(1)
+    return urls
 
 
 @app.command()
@@ -783,7 +807,10 @@ def test_ai_cmd(
 @app.command(name="test-idor")
 def test_idor_cmd(
     key: str,
-    url: str = typer.Option(..., "--url", help="A resource URL known to belong to the 'owner' identity, e.g. https://target/api/orders/12345"),
+    url: str | None = typer.Option(None, "--url", help="A resource URL known to belong to the 'owner' identity, e.g. https://target/api/orders/12345"),
+    urls_file: str | None = typer.Option(
+        None, "--urls-file", help="Path to a file of owner-URLs (one per line, # comments allowed) to batch-check instead of a single --url"
+    ),
     owner_header: list[str] = typer.Option(
         ..., "--owner-header", help="'Key: Value' auth header for the identity that owns the resource, repeatable"
     ),
@@ -794,11 +821,72 @@ def test_idor_cmd(
         None, "--owner-note", help="How you know this resource belongs to the owner identity, e.g. \"order 12345, created by test account A\""
     ),
 ):
-    """Check one resource URL for IDOR by fetching it once as its
-    confirmed owner and once as a second, unrelated identity -- exactly
-    two requests. Refuses unless `approve-active` has already recorded a
-    human decision permitting active testing (same gate as
-    `test-active`). Both identities' credentials must be real sessions
+    """Check resource URL(s) for IDOR by fetching each once as its
+    confirmed owner and once as a second, unrelated identity -- two
+    requests per URL. Pass --url for one, or --urls-file for a batch of
+    URLs you've curated (each is the same safe two-request diff, spaced
+    to stay under 1 RPS; no enumeration or ID guessing). Refuses unless
+    `approve-active` has already recorded a human decision permitting
+    active testing (same gate as `test-active`). Both identities'
+    credentials must be real sessions you (or the user directing this)
+    actually control -- never invented, guessed, or brute-forced."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+
+    if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
+        console.print(
+            f"[red]blocked[/red]: {key} does not permit active testing. "
+            "Run `bbhunter review-rules` then `bbhunter approve-active` if the policy actually allows it."
+        )
+        raise typer.Exit(1)
+
+    urls = _resolve_urls(url, urls_file)
+    owner_headers = _parse_headers(owner_header)
+    other_headers = _parse_headers(other_header)
+
+    if len(urls) == 1:
+        console.print(f"[cyan]checking IDOR[/cyan] on {urls[0]} for {key} (2 requests)...")
+        new_findings = run_idor_check(program, urls[0], owner_headers, other_headers, owner_note=owner_note)
+    else:
+        console.print(f"[cyan]checking IDOR[/cyan] on {len(urls)} URL(s) for {key} (2 requests each, paced <=1 RPS)...")
+        new_findings = run_idor_batch(program, urls, owner_headers, other_headers, owner_note=owner_note)
+    for finding in new_findings:
+        upsert_finding(finding)
+    _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, len(new_findings), f"IDOR check on {len(urls)} URL(s)")
+    if new_findings:
+        console.print(f"[red]{len(new_findings)} candidate(s) found[/red] -- see `bbhunter findings`, verify manually before drafting a PoC")
+    else:
+        console.print("[green]no candidate[/green] -- either properly denied, or the baseline request as the "
+                       "owner identity itself didn't succeed (check --owner-header/the URL)")
+
+
+@app.command(name="test-bfla")
+def test_bfla_cmd(
+    key: str,
+    url: str | None = typer.Option(None, "--url", help="An administrative/privileged function or endpoint URL, e.g. https://target/admin/users"),
+    urls_file: str | None = typer.Option(
+        None, "--urls-file", help="Path to a file of privileged-function URLs (one per line, # comments allowed) to batch-check instead of a single --url"
+    ),
+    authorized_header: list[str] = typer.Option(
+        ..., "--authorized-header", help="'Key: Value' auth header for an identity authorized to use this function, repeatable"
+    ),
+    other_header: list[str] = typer.Option(
+        ..., "--other-header", help="'Key: Value' auth header for a lower-privileged/unrelated identity, repeatable"
+    ),
+    authorized_note: str | None = typer.Option(
+        None, "--authorized-note", help="How you know this identity is authorized for this function, e.g. \"test account A has the admin role\""
+    ),
+):
+    """Check administrative/privileged function or endpoint URL(s) for
+    Broken Function Level Authorization (OWASP API5:2023) by fetching
+    each once as an authorized identity and once as a lower-privileged
+    one -- two requests per URL, same mechanism as `test-idor` pointed at
+    a function instead of a data object. Pass --url for one or
+    --urls-file for a batch (paced to stay under 1 RPS). Refuses unless
+    `approve-active` has already recorded a human decision permitting
+    active testing. Both identities' credentials must be real sessions
     you (or the user directing this) actually control -- never invented,
     guessed, or brute-forced."""
     program = get_program(key)
@@ -813,69 +901,120 @@ def test_idor_cmd(
         )
         raise typer.Exit(1)
 
-    owner_headers = _parse_headers(owner_header)
+    urls = _resolve_urls(url, urls_file)
+    authorized_headers = _parse_headers(authorized_header)
     other_headers = _parse_headers(other_header)
 
-    console.print(f"[cyan]checking IDOR[/cyan] on {url} for {key} (2 requests)...")
-    new_findings = run_idor_check(program, url, owner_headers, other_headers, owner_note=owner_note)
+    if len(urls) == 1:
+        console.print(f"[cyan]checking BFLA[/cyan] on {urls[0]} for {key} (2 requests)...")
+        new_findings = run_bfla_check(program, urls[0], authorized_headers, other_headers, authorized_note=authorized_note)
+    else:
+        console.print(f"[cyan]checking BFLA[/cyan] on {len(urls)} URL(s) for {key} (2 requests each, paced <=1 RPS)...")
+        new_findings = run_bfla_batch(program, urls, authorized_headers, other_headers, authorized_note=authorized_note)
     for finding in new_findings:
         upsert_finding(finding)
-    _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, len(new_findings), f"IDOR check on {url}")
+    _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, len(new_findings), f"BFLA check on {len(urls)} URL(s)")
     if new_findings:
-        console.print("[red]candidate found[/red] -- see `bbhunter findings`, verify manually before drafting a PoC")
+        console.print(f"[red]{len(new_findings)} candidate(s) found[/red] -- see `bbhunter findings`, verify manually before drafting a PoC")
     else:
         console.print("[green]no candidate[/green] -- either properly denied, or the baseline request as the "
-                       "owner identity itself didn't succeed (check --owner-header/the URL)")
+                       "authorized identity itself didn't succeed (check --authorized-header/the URL)")
 
 
-@app.command(name="test-bfla")
-def test_bfla_cmd(
+@app.command(name="test-token-leak")
+def test_token_leak_cmd(
     key: str,
-    url: str = typer.Option(..., "--url", help="An administrative/privileged function or endpoint URL, e.g. https://target/admin/users"),
-    authorized_header: list[str] = typer.Option(
-        ..., "--authorized-header", help="'Key: Value' auth header for an identity authorized to use this function, repeatable"
-    ),
-    other_header: list[str] = typer.Option(
-        ..., "--other-header", help="'Key: Value' auth header for a lower-privileged/unrelated identity, repeatable"
-    ),
-    authorized_note: str | None = typer.Option(
-        None, "--authorized-note", help="How you know this identity is authorized for this function, e.g. \"test account A has the admin role\""
-    ),
+    url: str = typer.Option(..., "--url", help="A URL to fetch with your own session, e.g. a page/endpoint reached after login"),
+    header: list[str] = typer.Option(..., "--header", help="'Key: Value' auth header for your own session, repeatable"),
+    token_value: str = typer.Option(..., "--token-value", help="The raw token/session value to look for leaking (your own, e.g. the cookie or bearer value)"),
+    note: str | None = typer.Option(None, "--note", help="Optional context recorded on any finding"),
 ):
-    """Check one administrative/privileged function or endpoint for
-    Broken Function Level Authorization (OWASP API5:2023) by fetching it
-    once as an authorized identity and once as a lower-privileged one --
-    exactly two requests, same mechanism as `test-idor` pointed at a
-    function instead of a data object. Refuses unless `approve-active`
-    has already recorded a human decision permitting active testing.
-    Both identities' credentials must be real sessions you (or the user
-    directing this) actually control -- never invented, guessed, or
-    brute-forced."""
+    """Check whether a resource leaks your own auth token into the final
+    URL, a redirect Location, or the response body (one GET, read-only).
+    Gated by `approve-active` like every active check. The token value is
+    your own session's -- this only looks for where it ends up, never
+    sends anything new."""
     program = get_program(key)
     if not program:
         console.print(f"[red]not found[/red]: {key}")
         raise typer.Exit(1)
-
     if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
         console.print(
             f"[red]blocked[/red]: {key} does not permit active testing. "
             "Run `bbhunter review-rules` then `bbhunter approve-active` if the policy actually allows it."
         )
         raise typer.Exit(1)
-
-    authorized_headers = _parse_headers(authorized_header)
-    other_headers = _parse_headers(other_header)
-
-    console.print(f"[cyan]checking BFLA[/cyan] on {url} for {key} (2 requests)...")
-    new_findings = run_bfla_check(program, url, authorized_headers, other_headers, authorized_note=authorized_note)
+    headers = _parse_headers(header)
+    console.print(f"[cyan]checking token leak[/cyan] on {url} for {key} (1 request)...")
+    new_findings = run_token_leak_check(program, url, headers, token_value, note=note)
     for finding in new_findings:
         upsert_finding(finding)
-    _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, len(new_findings), f"BFLA check on {url}")
+    _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, len(new_findings), f"token-leak check on {url}")
     if new_findings:
         console.print("[red]candidate found[/red] -- see `bbhunter findings`, verify manually before drafting a PoC")
     else:
-        console.print("[green]no candidate[/green] -- either properly denied, or the baseline request as the "
-                       "authorized identity itself didn't succeed (check --authorized-header/the URL)")
+        console.print("[green]no candidate[/green] -- token not observed leaking")
+
+
+@app.command(name="test-session-replay")
+def test_session_replay_cmd(
+    key: str,
+    url: str = typer.Option(..., "--url", help="An authenticated-only URL to replay the logged-out session against"),
+    header: list[str] = typer.Option(..., "--header", help="'Key: Value' header for the session you have ALREADY logged out of, repeatable"),
+    note: str | None = typer.Option(None, "--note", help="Optional context recorded on any finding"),
+):
+    """After you log out of a session out-of-band, replay it against an
+    authenticated-only URL (one GET, read-only). A non-denied 200 means
+    the server didn't invalidate the session server-side (broken session
+    management). Gated by `approve-active`. The logout is your action,
+    never this tool's -- it only observes whether the old session still
+    works."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+    if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
+        console.print(
+            f"[red]blocked[/red]: {key} does not permit active testing. "
+            "Run `bbhunter review-rules` then `bbhunter approve-active` if the policy actually allows it."
+        )
+        raise typer.Exit(1)
+    headers = _parse_headers(header)
+    console.print(f"[cyan]checking session replay[/cyan] on {url} for {key} (1 request)...")
+    new_findings = run_session_valid_check(program, url, headers, note=note)
+    for finding in new_findings:
+        upsert_finding(finding)
+    _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, len(new_findings), f"session-replay check on {url}")
+    if new_findings:
+        console.print("[red]candidate found[/red] -- logged-out session still works; verify before drafting a PoC")
+    else:
+        console.print("[green]no candidate[/green] -- session appears properly invalidated")
+
+
+@app.command(name="authlogic-plan")
+def authlogic_plan_cmd(
+    key: str,
+    out: str | None = typer.Option(None, "--out", help="Write the checklist to this file as well as printing it"),
+):
+    """Generate a prioritized manual auth/logic testing checklist from a
+    program's passive-recon output: BOLA/IDOR object-reference URLs,
+    BFLA privileged-endpoint candidates, and API hosts worth an
+    authenticated pass. No network -- pure analysis of what `recon`
+    already found, to steer the manual `test-idor`/`test-bfla` work you
+    do with your own accounts. Run `bbhunter recon` first."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+    recon_result = get_recon_result(key)
+    if not recon_result:
+        console.print(f"[yellow]no recon on file[/yellow] for {key} -- run `bbhunter recon {key}` first")
+        raise typer.Exit(1)
+    plan = build_plan(key, recon_result)
+    console.print(plan)
+    if out:
+        Path(out).write_text(plan)
+        console.print(f"[green]written[/green]: {out}")
 
 
 def _coerce_field_value(raw: str):

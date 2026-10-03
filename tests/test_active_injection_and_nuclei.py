@@ -48,7 +48,7 @@ def test_reflected_xss_canary_flagged_only_when_unescaped_in_response():
 
     client = MagicMock()
 
-    def fake_get(url, timeout=15, follow_redirects=True):
+    def fake_get(url, timeout=15, follow_redirects=True, **kwargs):
         value = dict(parse_qsl(urlsplit(url).query)).get("q", "")
         if value == "x":  # the baseline request (unmutated)
             return _FakeResponse("baseline page, nothing special")
@@ -78,7 +78,7 @@ def test_sql_error_signature_flagged_only_when_absent_from_baseline():
     client = MagicMock()
     call_count = {"n": 0}
 
-    def fake_get(url, timeout=15, follow_redirects=True):
+    def fake_get(url, timeout=15, follow_redirects=True, **kwargs):
         call_count["n"] += 1
         if call_count["n"] == 1:
             return _FakeResponse("normal search results page")
@@ -109,7 +109,7 @@ def test_sql_signature_already_present_in_baseline_is_not_flagged():
 def test_nosql_error_signature_flagged_only_when_absent_from_baseline():
     client = MagicMock()
 
-    def fake_get(url, timeout=15, follow_redirects=True):
+    def fake_get(url, timeout=15, follow_redirects=True, **kwargs):
         if "%27%7C%7C%27" in url or "'||'1'=='1" in url:
             return _FakeResponse("MongoError: unterminated string in JSON")
         return _FakeResponse("normal search results page")
@@ -134,7 +134,7 @@ def test_nosql_signature_already_present_in_baseline_is_not_flagged():
 def test_command_injection_flagged_when_marker_echoed_back():
     client = MagicMock()
 
-    def fake_get(url, timeout=15, follow_redirects=True):
+    def fake_get(url, timeout=15, follow_redirects=True, **kwargs):
         from urllib.parse import parse_qsl, urlsplit
         value = dict(parse_qsl(urlsplit(url).query)).get("q", "")
         if "BBHCMD" in value:
@@ -165,7 +165,7 @@ def test_crlf_header_injection_flagged_when_injected_header_appears():
     # Flag whenever the URL carries the CRLF probe's characteristic
     # '%0D%0AX-' sequence (case-insensitive), simulating a server that
     # actually turned it into a real response header.
-    def fake_get(url, timeout=15, follow_redirects=True):
+    def fake_get(url, timeout=15, follow_redirects=True, **kwargs):
         if "%0d%0ax-" in url.lower():
             marker = url.lower().split("%0d%0ax-", 1)[1].split(":", 1)[0].split("%3a", 1)[0]
             return _FakeResponse("normal page", headers={f"X-{marker}": "1"})

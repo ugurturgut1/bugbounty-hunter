@@ -419,6 +419,47 @@ def _landed_off_host(resp: httpx.Response, host: str) -> bool:
     return bool(landed) and landed != host
 
 
+_CORS_PROBE_ORIGIN = "https://bbhunter-cors-probe.example"
+
+
+def _check_cors(client: httpx.Client, host: str) -> dict | None:
+    """One GET to the root carrying a throwaway cross-origin `Origin`
+    header, to detect a reflecting CORS policy. A server that echoes an
+    arbitrary attacker origin back in `access-control-allow-origin` AND
+    sets `access-control-allow-credentials: true` lets any site read
+    authenticated responses cross-origin -- a real, commonly-bountied
+    misconfiguration. Read-only, single request; reflecting `*` without
+    credentials is browser-safe and deliberately NOT flagged."""
+    try:
+        resp = client.get(
+            f"https://{host}/",
+            headers={"Origin": _CORS_PROBE_ORIGIN},
+            timeout=15,
+            follow_redirects=True,
+        )
+    except httpx.HTTPError:
+        return None
+    if _landed_off_host(resp, host):
+        return None
+    acao = resp.headers.get("access-control-allow-origin", "")
+    acac = resp.headers.get("access-control-allow-credentials", "").lower() == "true"
+    reflects = acao == _CORS_PROBE_ORIGIN or acao == "null"
+    if reflects and acac:
+        return {
+            "path": "/",
+            "title": "CORS misconfiguration: reflects arbitrary Origin with credentials",
+            "severity": "high",
+            "status_code": resp.status_code,
+            "url": str(resp.url),
+            "detail": (
+                f"Access-Control-Allow-Origin reflected the probe value {acao!r} and "
+                "Access-Control-Allow-Credentials: true -- any origin can read authenticated "
+                "responses. Verify against a real authenticated endpoint before drafting a PoC."
+            ),
+        }
+    return None
+
+
 def _check_host(client: httpx.Client, host: str, fingerprint: dict | None = None) -> list[dict]:
     hits: list[dict] = []
     baseline = _baseline(client, host)
@@ -527,6 +568,11 @@ def _check_host(client: httpx.Client, host: str, fingerprint: dict | None = None
                     )
     except httpx.HTTPError:
         pass
+
+    time.sleep(REQUEST_DELAY_SECONDS)
+    cors_hit = _check_cors(client, host)
+    if cors_hit:
+        hits.append(cors_hit)
     time.sleep(REQUEST_DELAY_SECONDS)
 
     return hits
@@ -888,7 +934,10 @@ def run_active_checks(
                         title=hit["title"],
                         vuln_class="exposure" if hit["severity"] != "info" else "hardening",
                         test_type=TestType.ACTIVE_LOW_IMPACT,
-                        evidence=f"GET {hit['url']} -> HTTP {hit['status_code']}. Path: {hit['path']}.",
+                        evidence=(
+                            f"GET {hit['url']} -> HTTP {hit['status_code']}. Path: {hit['path']}."
+                            + (f" {hit['detail']}" if hit.get("detail") else "")
+                        ),
                         status=FindingStatus.CANDIDATE,
                         notes=f"severity guess: {hit['severity']} -- verify manually before drafting a PoC",
                     )
