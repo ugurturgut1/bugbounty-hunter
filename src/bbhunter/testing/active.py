@@ -67,6 +67,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 
 from bbhunter.models import AssetType, Finding, FindingStatus, Program, ReconResult, RulesOfEngagement, TestType
+from bbhunter.safety import assert_active_allowed
 from bbhunter.recon.passive import _extract_host, _request_headers, _tool_path
 from bbhunter.testing.cloud_storage import check_cloud_buckets_for_name
 
@@ -950,6 +951,7 @@ def run_active_checks(
     is a separate or higher permission tier, just a separate opt-in
     since each is a qualitatively different request shape worth a
     deliberate choice to include."""
+    assert_active_allowed()
     if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
         raise RuntimeError(
             f"{program.key}: active testing blocked by rules.permits() -- run `bbhunter review-rules` "

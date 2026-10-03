@@ -20,7 +20,12 @@ def _program(*, approved: bool = True) -> Program:
         handle="test",
         name="Test",
         url="https://hackerone.com/test",
-        in_scope=[ScopeAsset(identifier="example.com", asset_type=AssetType.URL, in_scope=True)],
+        in_scope=[
+            ScopeAsset(identifier="example.com", asset_type=AssetType.URL, in_scope=True),
+            # the check URLs in these tests use host "x"; keep it in scope so the
+            # Phase-5 scope guard (run_idor_check/run_bfla_check) lets them through
+            ScopeAsset(identifier="x", asset_type=AssetType.URL, in_scope=True),
+        ],
         rules=rules,
     )
 

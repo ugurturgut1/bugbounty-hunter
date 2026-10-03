@@ -22,6 +22,7 @@ import hashlib
 import httpx
 
 from bbhunter.models import Finding, FindingStatus, Program, TestType
+from bbhunter.safety import assert_active_allowed, is_in_scope
 
 # service label -> distinctive body substrings that mean "unclaimed here"
 TAKEOVER_FINGERPRINTS: dict[str, tuple[str, ...]] = {
@@ -66,11 +67,13 @@ def check_takeover(host: str, *, timeout: float = 15) -> dict | None:
 
 
 def run_takeover_check(program: Program, hosts: list[str], *, delay: float = 1.5) -> list[Finding]:
+    assert_active_allowed()
     if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
         raise RuntimeError(
             f"{program.key}: takeover check blocked by rules.permits() -- run `bbhunter review-rules` "
             "and `bbhunter approve-active` first if this program's policy actually allows it"
         )
+    hosts = [h for h in hosts if is_in_scope(program, h)]  # defense-in-depth: never probe off-scope
     import time
 
     findings: list[Finding] = []

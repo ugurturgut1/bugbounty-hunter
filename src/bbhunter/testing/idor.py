@@ -37,6 +37,7 @@ import time
 import httpx
 
 from bbhunter.models import Finding, FindingStatus, Program, TestType
+from bbhunter.safety import assert_active_allowed, assert_in_scope
 
 # Spacing between successive URLs in a batch run. A batch tests many
 # human-curated URLs in one go, so -- unlike a one-off single-URL check --
@@ -187,11 +188,13 @@ def run_idor_check(
     owner_note: str | None = None,
     request_delay: float = 0.0,
 ) -> list[Finding]:
+    assert_active_allowed()
     if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
         raise RuntimeError(
             f"{program.key}: IDOR check blocked by rules.permits() -- run `bbhunter review-rules` "
             "and `bbhunter approve-active` first if this program's policy actually allows it"
         )
+    assert_in_scope(program, url)
 
     hit = check_idor(url, owner_headers, other_headers, request_delay=request_delay)
     if not hit:
@@ -225,11 +228,13 @@ def run_bfla_check(
     authorized_note: str | None = None,
     request_delay: float = 0.0,
 ) -> list[Finding]:
+    assert_active_allowed()
     if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
         raise RuntimeError(
             f"{program.key}: BFLA check blocked by rules.permits() -- run `bbhunter review-rules` "
             "and `bbhunter approve-active` first if this program's policy actually allows it"
         )
+    assert_in_scope(program, url)
 
     hit = check_bfla(url, authorized_headers, other_headers, request_delay=request_delay)
     if not hit:

@@ -42,6 +42,13 @@ from bbhunter.testing.auth_logic import run_session_valid_check, run_token_leak_
 from bbhunter.testing.authlogic_plan import build_plan
 from bbhunter.testing.takeover import run_takeover_check
 from bbhunter.disclosures import add_disclosure, load_disclosures, match_disclosures
+from bbhunter.safety import (
+    KillSwitchEngaged,
+    assert_active_allowed,
+    is_in_scope,
+    killswitch_engaged,
+    set_killswitch,
+)
 from bbhunter.triage import flag_known_issues
 from bbhunter.testing.idor import run_bfla_batch, run_bfla_check, run_idor_batch, run_idor_check
 from bbhunter.testing.mass_assignment import run_mass_assignment_check
@@ -658,7 +665,11 @@ def test_active_cmd(
         name for name, flag in (("injection", injection), ("nuclei", nuclei), ("cloud-buckets", cloud_buckets)) if flag
     )
     console.print(f"[cyan]running active checks[/cyan] on {key}{f' (incl. {extras})' if extras else ''}...")
-    new_findings = run_active_checks(program, recon_result, injection=injection, nuclei=nuclei, cloud_buckets=cloud_buckets)
+    try:
+        new_findings = run_active_checks(program, recon_result, injection=injection, nuclei=nuclei, cloud_buckets=cloud_buckets)
+    except RuntimeError as e:
+        console.print(f"[red]blocked[/red]: {e}")
+        raise typer.Exit(1)
     for finding in new_findings:
         upsert_finding(finding)
     _log_test_run(
@@ -867,12 +878,16 @@ def test_idor_cmd(
     owner_headers = _parse_headers(owner_header)
     other_headers = _parse_headers(other_header)
 
-    if len(urls) == 1:
-        console.print(f"[cyan]checking IDOR[/cyan] on {urls[0]} for {key} (2 requests)...")
-        new_findings = run_idor_check(program, urls[0], owner_headers, other_headers, owner_note=owner_note)
-    else:
-        console.print(f"[cyan]checking IDOR[/cyan] on {len(urls)} URL(s) for {key} (2 requests each, paced <=1 RPS)...")
-        new_findings = run_idor_batch(program, urls, owner_headers, other_headers, owner_note=owner_note)
+    try:
+        if len(urls) == 1:
+            console.print(f"[cyan]checking IDOR[/cyan] on {urls[0]} for {key} (2 requests)...")
+            new_findings = run_idor_check(program, urls[0], owner_headers, other_headers, owner_note=owner_note)
+        else:
+            console.print(f"[cyan]checking IDOR[/cyan] on {len(urls)} URL(s) for {key} (2 requests each, paced <=1 RPS)...")
+            new_findings = run_idor_batch(program, urls, owner_headers, other_headers, owner_note=owner_note)
+    except RuntimeError as e:
+        console.print(f"[red]blocked[/red]: {e}")
+        raise typer.Exit(1)
     for finding in new_findings:
         upsert_finding(finding)
     _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, len(new_findings), f"IDOR check on {len(urls)} URL(s)")
@@ -926,12 +941,16 @@ def test_bfla_cmd(
     authorized_headers = _parse_headers(authorized_header)
     other_headers = _parse_headers(other_header)
 
-    if len(urls) == 1:
-        console.print(f"[cyan]checking BFLA[/cyan] on {urls[0]} for {key} (2 requests)...")
-        new_findings = run_bfla_check(program, urls[0], authorized_headers, other_headers, authorized_note=authorized_note)
-    else:
-        console.print(f"[cyan]checking BFLA[/cyan] on {len(urls)} URL(s) for {key} (2 requests each, paced <=1 RPS)...")
-        new_findings = run_bfla_batch(program, urls, authorized_headers, other_headers, authorized_note=authorized_note)
+    try:
+        if len(urls) == 1:
+            console.print(f"[cyan]checking BFLA[/cyan] on {urls[0]} for {key} (2 requests)...")
+            new_findings = run_bfla_check(program, urls[0], authorized_headers, other_headers, authorized_note=authorized_note)
+        else:
+            console.print(f"[cyan]checking BFLA[/cyan] on {len(urls)} URL(s) for {key} (2 requests each, paced <=1 RPS)...")
+            new_findings = run_bfla_batch(program, urls, authorized_headers, other_headers, authorized_note=authorized_note)
+    except RuntimeError as e:
+        console.print(f"[red]blocked[/red]: {e}")
+        raise typer.Exit(1)
     for finding in new_findings:
         upsert_finding(finding)
     _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, len(new_findings), f"BFLA check on {len(urls)} URL(s)")
@@ -967,7 +986,11 @@ def test_token_leak_cmd(
         raise typer.Exit(1)
     headers = _parse_headers(header)
     console.print(f"[cyan]checking token leak[/cyan] on {url} for {key} (1 request)...")
-    new_findings = run_token_leak_check(program, url, headers, token_value, note=note)
+    try:
+        new_findings = run_token_leak_check(program, url, headers, token_value, note=note)
+    except RuntimeError as e:
+        console.print(f"[red]blocked[/red]: {e}")
+        raise typer.Exit(1)
     for finding in new_findings:
         upsert_finding(finding)
     _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, len(new_findings), f"token-leak check on {url}")
@@ -1002,7 +1025,11 @@ def test_session_replay_cmd(
         raise typer.Exit(1)
     headers = _parse_headers(header)
     console.print(f"[cyan]checking session replay[/cyan] on {url} for {key} (1 request)...")
-    new_findings = run_session_valid_check(program, url, headers, note=note)
+    try:
+        new_findings = run_session_valid_check(program, url, headers, note=note)
+    except RuntimeError as e:
+        console.print(f"[red]blocked[/red]: {e}")
+        raise typer.Exit(1)
     for finding in new_findings:
         upsert_finding(finding)
     _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, len(new_findings), f"session-replay check on {url}")
@@ -1035,6 +1062,24 @@ def record_outcome_cmd(
         finding.bounty_amount = bounty
     upsert_finding(finding)
     console.print(f"[green]recorded[/green]: {finding_id} -> {status}" + (f", bounty {bounty:.0f}" if bounty else ""))
+
+
+@app.command(name="killswitch")
+def killswitch_cmd(action: str = typer.Argument("status", help="on | off | status")):
+    """Global stop for ALL active testing. `on` makes every active check
+    refuse immediately (no per-program un-approval needed); `off` clears
+    it; `status` reports. Also honored via the BBHUNTER_KILLSWITCH env var."""
+    if action == "on":
+        set_killswitch(True)
+        console.print("[red]kill switch ENGAGED[/red] -- all active testing halted")
+    elif action == "off":
+        set_killswitch(False)
+        console.print("[green]kill switch cleared[/green] -- active testing allowed (subject to approve-active)")
+    elif action == "status":
+        console.print("[red]ENGAGED[/red]" if killswitch_engaged() else "[green]off[/green]")
+    else:
+        console.print(f"[red]invalid action[/red]: {action!r}. Use on | off | status")
+        raise typer.Exit(1)
 
 
 @app.command(name="cvss")
@@ -1210,6 +1255,12 @@ def test_cve_confirm_cmd(
         )
         raise typer.Exit(1)
 
+    try:
+        assert_active_allowed()
+    except KillSwitchEngaged as e:
+        console.print(f"[red]blocked[/red]: {e}")
+        raise typer.Exit(1)
+
     by_host: dict[str, list[str]] = {}
     for f in list_findings():
         if f.program_key == key and f.test_type == TestType.VERSION_CVE_MATCH:
@@ -1282,7 +1333,11 @@ def test_takeover_cmd(
         console.print(f"[yellow]no hosts[/yellow] to check for {key} -- run `bbhunter recon {key}` first")
         raise typer.Exit(1)
     console.print(f"[cyan]checking takeover[/cyan] on {len(hosts)} host(s) for {key} (paced <=1 RPS)...")
-    new_findings = run_takeover_check(program, hosts)
+    try:
+        new_findings = run_takeover_check(program, hosts)
+    except RuntimeError as e:
+        console.print(f"[red]blocked[/red]: {e}")
+        raise typer.Exit(1)
     for finding in new_findings:
         upsert_finding(finding)
     _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, len(new_findings), f"takeover check on {len(hosts)} host(s)")
@@ -1321,6 +1376,15 @@ def authed_recon_cmd(
                         and (h := _host_of(a.identifier))})
     if not hosts:
         console.print(f"[yellow]no hosts[/yellow] to probe for {key} -- run `bbhunter recon {key}` first")
+        raise typer.Exit(1)
+    try:
+        assert_active_allowed()
+    except KillSwitchEngaged as e:
+        console.print(f"[red]blocked[/red]: {e}")
+        raise typer.Exit(1)
+    hosts = [h for h in hosts if is_in_scope(program, h)]  # defense-in-depth scope filter
+    if not hosts:
+        console.print(f"[yellow]no in-scope hosts[/yellow] to probe for {key}")
         raise typer.Exit(1)
     headers = _parse_headers(header)
     console.print(f"[cyan]authed recon[/cyan] on {len(hosts)} host(s) for {key} (paced <=1 RPS)...")

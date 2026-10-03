@@ -23,6 +23,7 @@ import hashlib
 import httpx
 
 from bbhunter.models import Finding, FindingStatus, Program, TestType
+from bbhunter.safety import assert_active_allowed, assert_in_scope
 
 # Reused denial heuristic -- a response that looks like a login wall or an
 # explicit deny is NOT the resource being served.
@@ -122,18 +123,21 @@ def _finding(program: Program, url: str, hit: dict, note: str | None) -> Finding
     )
 
 
-def _require_active(program: Program) -> None:
+def _require_active(program: Program, url: str | None = None) -> None:
+    assert_active_allowed()
     if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
         raise RuntimeError(
             f"{program.key}: blocked by rules.permits() -- run `bbhunter review-rules` and "
             "`bbhunter approve-active` first if this program's policy actually allows it"
         )
+    if url is not None:
+        assert_in_scope(program, url)
 
 
 def run_token_leak_check(
     program: Program, url: str, headers: dict[str, str], token_value: str, *, note: str | None = None
 ) -> list[Finding]:
-    _require_active(program)
+    _require_active(program, url)
     hit = check_token_leak(url, headers, token_value)
     return [_finding(program, url, hit, note)] if hit else []
 
@@ -141,6 +145,6 @@ def run_token_leak_check(
 def run_session_valid_check(
     program: Program, url: str, headers: dict[str, str], *, note: str | None = None
 ) -> list[Finding]:
-    _require_active(program)
+    _require_active(program, url)
     hit = check_session_valid(url, headers)
     return [_finding(program, url, hit, note)] if hit else []
