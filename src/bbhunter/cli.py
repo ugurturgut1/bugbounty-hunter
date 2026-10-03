@@ -55,6 +55,7 @@ from bbhunter.state import (
     fresh_program_keys,
     list_reconned_program_keys,
     program_outcome_stats,
+    recon_diff,
     list_test_runs,
     record_test_run,
     upsert_ai_endpoint,
@@ -1055,6 +1056,51 @@ def stats_cmd():
             table.add_row(key, str(s.get("submitted", 0)), str(s.get("resolved", 0)),
                           str(s.get("duplicate", 0)), str(s.get("informative", 0)), f"{s.get('bounty_total', 0):.0f}")
         console.print(table)
+
+
+@app.command(name="whatsnew")
+def whatsnew_cmd(
+    key: str | None = typer.Argument(None, help="Optional program key to focus on; omit for a global summary"),
+    fresh_days: int = typer.Option(14, "--fresh-days", help="Window for 'newly added' / 'scope expanded'"),
+):
+    """What changed recently -- where fresh bugs live. Global: newly-added
+    programs, recently scope-expanded programs, and any reconned program
+    whose hosts/subdomains changed since its previous recon. With a key:
+    the full host/subdomain diff for that program's last two recons."""
+    if key:
+        diff = recon_diff(key)
+        if not diff:
+            console.print(f"[yellow]no diff[/yellow] for {key} -- need at least two recon runs to compare")
+            return
+        console.print(f"[bold]{key}[/bold]  {diff['prev_run'][:19]} -> {diff['curr_run'][:19]}")
+        for label, items in (("new hosts", diff["new_hosts"]), ("new subdomains", diff["new_subdomains"]),
+                             ("removed hosts", diff["removed_hosts"]), ("removed subdomains", diff["removed_subdomains"])):
+            if items:
+                console.print(f"  [green]{label}[/green] ({len(items)}): " + ", ".join(items[:30]) + ("..." if len(items) > 30 else ""))
+        if not any([diff["new_hosts"], diff["new_subdomains"], diff["removed_hosts"], diff["removed_subdomains"]]):
+            console.print("  [dim]no change since last recon[/dim]")
+        return
+
+    fresh_keys, expanded_keys = fresh_program_keys(fresh_days)
+    if fresh_keys:
+        console.print(f"[green]Newly-added programs[/green] (last {fresh_days}d): {len(fresh_keys)}")
+        for k in sorted(fresh_keys)[:30]:
+            console.print(f"  - {k}")
+    if expanded_keys:
+        console.print(f"[green]Scope expanded[/green] (last {fresh_days}d): {len(expanded_keys)}")
+        for k in sorted(expanded_keys)[:30]:
+            console.print(f"  - {k}")
+    changed = []
+    for k in list_reconned_program_keys():
+        diff = recon_diff(k)
+        if diff and (diff["new_hosts"] or diff["new_subdomains"]):
+            changed.append((k, len(diff["new_hosts"]), len(diff["new_subdomains"])))
+    if changed:
+        console.print(f"[green]Recon changed since last run[/green]: {len(changed)}")
+        for k, nh, ns in changed:
+            console.print(f"  - {k}: +{nh} host(s), +{ns} subdomain(s)  (bbhunter whatsnew {k})")
+    if not fresh_keys and not expanded_keys and not changed:
+        console.print("[yellow]nothing new[/yellow] in the window")
 
 
 @app.command(name="triage")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -49,6 +50,14 @@ CREATE TABLE IF NOT EXISTS test_runs (
     ran_at TEXT NOT NULL,
     data TEXT NOT NULL,
     FOREIGN KEY (program_key) REFERENCES programs(key)
+);
+
+CREATE TABLE IF NOT EXISTS recon_snapshots (
+    program_key TEXT NOT NULL,
+    ran_at TEXT NOT NULL,
+    hosts TEXT NOT NULL,       -- JSON list of fingerprinted hosts at this run
+    subdomains TEXT NOT NULL,  -- JSON list of all discovered subdomains at this run
+    PRIMARY KEY (program_key, ran_at)
 );
 """
 
@@ -201,12 +210,44 @@ def list_findings(status: str | None = None, db_path: Path = DB_PATH) -> list[Fi
 
 
 def upsert_recon_result(result: ReconResult, db_path: Path = DB_PATH) -> None:
+    hosts = sorted(result.fingerprints.keys())
+    subs = sorted({s for subs in result.subdomains.values() for s in subs})
     with connect(db_path) as conn:
         conn.execute(
             "INSERT INTO recon_results (program_key, data, last_run) VALUES (?, ?, ?) "
             "ON CONFLICT(program_key) DO UPDATE SET data=excluded.data, last_run=excluded.last_run",
             (result.program_key, result.model_dump_json(), result.last_run.isoformat()),
         )
+        # Append an immutable snapshot each run, so `recon_diff` can show what
+        # changed since last time -- where fresh bugs tend to appear.
+        conn.execute(
+            "INSERT OR REPLACE INTO recon_snapshots (program_key, ran_at, hosts, subdomains) VALUES (?, ?, ?, ?)",
+            (result.program_key, result.last_run.isoformat(), json.dumps(hosts), json.dumps(subs)),
+        )
+
+
+def recon_diff(program_key: str, db_path: Path = DB_PATH) -> dict | None:
+    """Compare the two most recent recon snapshots for a program. Returns
+    {new_hosts, removed_hosts, new_subdomains, removed_subdomains, prev_run,
+    curr_run} or None if there aren't two snapshots yet to compare."""
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT ran_at, hosts, subdomains FROM recon_snapshots WHERE program_key=? ORDER BY ran_at DESC LIMIT 2",
+            (program_key,),
+        ).fetchall()
+    if len(rows) < 2:
+        return None
+    curr, prev = rows[0], rows[1]
+    curr_hosts, prev_hosts = set(json.loads(curr[1])), set(json.loads(prev[1]))
+    curr_subs, prev_subs = set(json.loads(curr[2])), set(json.loads(prev[2]))
+    return {
+        "prev_run": prev[0],
+        "curr_run": curr[0],
+        "new_hosts": sorted(curr_hosts - prev_hosts),
+        "removed_hosts": sorted(prev_hosts - curr_hosts),
+        "new_subdomains": sorted(curr_subs - prev_subs),
+        "removed_subdomains": sorted(prev_subs - curr_subs),
+    }
 
 
 def get_recon_result(program_key: str, db_path: Path = DB_PATH) -> ReconResult | None:
