@@ -1271,6 +1271,28 @@ def dedup_check_cmd(key: str):
         console.print(f"  - {f.title}  [dim]on {f.asset}[/dim] -- {reason}")
 
 
+@app.command(name="dismiss")
+def dismiss_cmd(
+    finding_id: str,
+    reason: str = typer.Option(..., "--reason", help="Why this candidate isn't real (recorded on the finding)"),
+):
+    """Dismiss a candidate finding you've confirmed is a false positive or
+    not worth pursuing, so it drops out of `findings`/`triage`/`dedup-check`.
+    Records the reason and moves it to poc_rejected (the 'didn't hold up'
+    state) -- reversible via the normal workflow, never deleted."""
+    finding = get_finding(finding_id)
+    if not finding:
+        console.print(f"[red]not found[/red]: {finding_id}")
+        raise typer.Exit(1)
+    if finding.status != FindingStatus.CANDIDATE:
+        console.print(f"[yellow]not a candidate[/yellow]: {finding_id} is {finding.status.value} -- nothing to dismiss")
+        raise typer.Exit(0)
+    finding.status = FindingStatus.POC_REJECTED
+    finding.notes = f"{finding.notes or ''}\ndismissed: {reason}".strip()
+    upsert_finding(finding)
+    console.print(f"[green]dismissed[/green]: {finding_id}")
+
+
 @app.command(name="triage")
 def triage_cmd(
     key: str,
