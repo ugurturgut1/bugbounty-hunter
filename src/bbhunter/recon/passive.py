@@ -97,6 +97,8 @@ import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+
+from bbhunter._time import utcnow
 from typing import Callable
 from urllib.parse import urlparse
 
@@ -620,7 +622,7 @@ def tls_findings(host: str, info: dict) -> list[dict]:
     if not_after:
         expiry = _parse_openssl_not_after(not_after)
         if expiry:
-            days_left = (expiry - datetime.utcnow()).total_seconds() / 86400
+            days_left = (expiry - utcnow()).total_seconds() / 86400
             if days_left < 0:
                 hits.append({
                     "kind": "tls-cert-expired",
@@ -1192,6 +1194,6 @@ def run_passive_recon(
         param_urls=param_urls_by_seed,
         seeds_total=len(recon_assets),
         seeds_processed=seeds_processed,
-        last_run=datetime.utcnow(),
+        last_run=utcnow(),
     )
     return result, findings

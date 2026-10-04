@@ -15,9 +15,9 @@ would need routing every request through one client.
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from pathlib import Path
 
+from bbhunter._time import utcnow
 from bbhunter.config import DATA_DIR
 
 AUDIT_FILE = DATA_DIR / "audit.jsonl"
@@ -27,7 +27,7 @@ def append_audit(program_key: str, test_type: str, detail: str) -> None:
     """Append one immutable audit record. Best-effort: a logging failure
     must never break the check that triggered it."""
     rec = {
-        "ts": datetime.utcnow().isoformat(),
+        "ts": utcnow().isoformat(),
         "program_key": program_key,
         "test_type": test_type,
         "detail": detail,

@@ -7,6 +7,8 @@ from pathlib import Path
 
 from datetime import datetime, timedelta
 
+from bbhunter._time import utcnow
+
 from bbhunter.config import DB_PATH
 from bbhunter.models import AIEndpointConfig, AssetType, Finding, Program, ReconResult, TestRun
 
@@ -159,7 +161,7 @@ def fresh_program_keys(within_days: int = 14, db_path: Path = DB_PATH) -> tuple[
     program); 'recently expanded' = scope_expanded_at inside the window
     (fresh attack surface on an existing program). Rows predating the
     freshness columns have NULLs and simply don't match -- never an error."""
-    cutoff = (datetime.utcnow() - timedelta(days=within_days)).isoformat()
+    cutoff = (utcnow() - timedelta(days=within_days)).isoformat()
     newly_seen: set[str] = set()
     expanded: set[str] = set()
     with connect(db_path) as conn:

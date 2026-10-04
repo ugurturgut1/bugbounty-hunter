@@ -4,6 +4,8 @@ import os
 import re
 import uuid
 from datetime import datetime
+
+from bbhunter._time import utcnow
 from pathlib import Path
 
 import typer
@@ -377,7 +379,7 @@ def approve_active_cmd(
 
     program.rules.human_reviewed = True
     program.rules.confidence = "high"
-    program.rules.reviewed_at = datetime.utcnow()
+    program.rules.reviewed_at = utcnow()
     program.rules.review_notes = note
     program.rules.allowed_test_types = program.rules.allowed_test_types | parsed_types
     if required_user_agent is not None:
@@ -1090,6 +1092,29 @@ def audit_cmd(
     for r in records[-200:]:
         table.add_row(r.get("ts", "")[:19], r.get("program_key", ""), r.get("test_type", ""), r.get("detail", ""))
     console.print(table)
+
+
+@app.command(name="doctor")
+def doctor_cmd():
+    """Environment check: which platform connectors have credentials, which
+    optional external tools are installed, where state lives, and the kill
+    switch state. Run it after setup to confirm everything's wired."""
+    from bbhunter.config import DB_PATH
+
+    console.print("[bold]Connectors[/bold]")
+    for connector_cls in ALL_CONNECTORS:
+        c = connector_cls()
+        ok = c.is_configured()
+        console.print(f"  {'[green]configured[/green]' if ok else '[yellow]no creds[/yellow]'}  {c.platform_name}")
+
+    console.print("[bold]External tools[/bold]")
+    for tool in ("subfinder", "assetfinder", "dnsx", "httpx", "nuclei", "ffuf", "sqlmap", "commix"):
+        path = _tool_path(tool)
+        console.print(f"  {'[green]' + path + '[/green]' if path else '[yellow]missing[/yellow]'}  {tool}")
+
+    console.print("[bold]State[/bold]")
+    console.print(f"  db: {DB_PATH} ({'exists' if DB_PATH.exists() else 'not created yet'})")
+    console.print(f"  kill switch: {'[red]ENGAGED[/red]' if killswitch_engaged() else '[green]off[/green]'}")
 
 
 @app.command(name="killswitch")

@@ -713,6 +713,45 @@ entry count and a request-count estimate before it starts; the
 unless the program's policy is explicit about welcoming exhaustive
 scanning.
 
+## Command reference (targeting, auth-logic, safety, reporting)
+
+Beyond the core discover -> recon -> test -> report flow, these commands
+support target selection, manual auth/logic testing, safety, and report
+quality. Everything that touches a target still requires `approve-active`
+and respects scope + the program's rate limit.
+
+**Targeting & learning**
+- `prioritize [--fresh-days N] [--fresh-only]` -- rank programs by
+  effort-vs-payoff, now weighted by freshness (newly-added / recently
+  scope-expanded) and by your recorded outcomes.
+- `whatsnew [<key>]` -- what changed recently: new programs, expanded
+  scope, and (per program) hosts/subdomains new since the last recon.
+- `record-outcome <finding-id> --status resolved|duplicate|informative|submitted [--bounty N]`
+  -- feed real results back into prioritize/stats.
+- `stats` -- per-program and per-check resolved/duplicate/informative + bounty totals.
+
+**Manual auth/logic testing** (you supply the sessions)
+- `test-idor` / `test-bfla` -- BOLA / BFLA, single `--url` or batch `--urls-file`.
+- `test-token-leak` / `test-session-replay` -- auth-token leakage; post-logout session replay.
+- `test-jwt --token <jwt>` -- offline JWT weakness analysis (no network, no gate).
+- `authed-recon --header ...` -- discover authenticated endpoints (OpenAPI/Swagger + GraphQL introspection).
+- `authlogic-plan` -- turn recon into a prioritized manual test checklist.
+
+**More automated checks** (via `recon` / `test-active`)
+- subdomain enumeration (subfinder/assetfinder/crt.sh/Certspotter/Wayback), CORS misconfig,
+  SSTI & open-redirect probes, `test-takeover` (subdomain takeover), `test-cve-confirm`
+  (nuclei, targeted to NVD-matched CVE IDs).
+
+**Report quality & hygiene**
+- `cvss <vector>` / `draft-report --cvss <vector>` -- defensible CVSS v3.1 severity.
+- `triage <key>` -- flag candidates the policy excludes (SPF/DMARC, headers, rate-limit, OOS assets).
+- `add-disclosure` / `dedup-check <key>` -- avoid submitting known public duplicates.
+
+**Safety & ops**
+- `killswitch on|off|status` -- global stop for all active testing (also `BBHUNTER_KILLSWITCH` env).
+- `audit [<key>] [--export FILE]` -- append-only record of every check run.
+- `doctor` -- environment check (connector creds, external tools, DB, kill switch).
+
 ## Full pipeline, one finding at a time
 
 ```bash
