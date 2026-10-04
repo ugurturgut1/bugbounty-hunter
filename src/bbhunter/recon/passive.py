@@ -138,6 +138,25 @@ SUBFINDER_TIMEOUT_SECONDS = 15  # trimmed from 30 2026-09-18 -- live-tested 2026
 # 2026-10-03). The old cap of SUBFINDER_TIMEOUT_SECONDS + 10 = 25s silently killed every slow run as a
 # "failure", dropping real subdomains. This is the real overall ceiling instead.
 SUBFINDER_SUBPROCESS_TIMEOUT_SECONDS = 90
+# subfinder is the slowest third-party source and runs once per seed; on a
+# many-seed program its 90s cap serialized across seeds dominates the whole
+# recon (measured live 2026-10-04: a 54-seed program had not finished after 69
+# minutes, subfinder the active process throughout). Cap the TOTAL subfinder
+# wall-time across the run and divide it across seeds, so a big scope trades
+# some per-seed subfinder depth for a bounded runtime -- crt.sh/Certspotter/
+# Wayback still run per seed regardless. Small scopes keep the full 90s.
+SUBFINDER_TOTAL_BUDGET_SECONDS = 600
+SUBFINDER_MIN_PER_SEED_SECONDS = 20
+
+
+def subfinder_budget_for(seeds_total: int) -> float:
+    """Per-seed subfinder overall timeout given the scope size: the full
+    90s for a handful of seeds, shrinking (floored at 20s) as seed count
+    grows so total subfinder time stays near SUBFINDER_TOTAL_BUDGET_SECONDS."""
+    if seeds_total <= 1:
+        return SUBFINDER_SUBPROCESS_TIMEOUT_SECONDS
+    per_seed = SUBFINDER_TOTAL_BUDGET_SECONDS / seeds_total
+    return max(SUBFINDER_MIN_PER_SEED_SECONDS, min(SUBFINDER_SUBPROCESS_TIMEOUT_SECONDS, per_seed))
                                  # instead of hours -- still returns whatever sources answered in time,
                                  # never treated as a hard failure unless nothing came back at all
 # CRTSH_DELAY_SECONDS/CERTSPOTTER_DELAY_SECONDS/WAYBACK_DELAY_SECONDS/DNS_DELAY_SECONDS were individual
@@ -261,14 +280,20 @@ def certspotter_subdomains(domain: str, *, timeout: float = 15) -> tuple[set[str
     return names, True
 
 
-def subfinder_subdomains(domain: str, *, timeout: float = SUBFINDER_TIMEOUT_SECONDS) -> tuple[set[str], bool]:
+def subfinder_subdomains(
+    domain: str, *, timeout: float = SUBFINDER_TIMEOUT_SECONDS,
+    overall_timeout: float = SUBFINDER_SUBPROCESS_TIMEOUT_SECONDS,
+) -> tuple[set[str], bool]:
     """Shells out to the `subfinder` binary in its default passive mode
     (no active flags like `-active`/DNS-bruteforce are ever passed) --
     every one of its ~30 sources is itself a third-party OSINT lookup,
     never a direct request to `domain`. Returns `(names, succeeded)` on
     the same contract as `crtsh_subdomains`: `succeeded=False` means the
     binary is missing or the run errored/timed out, not "found
-    nothing"."""
+    nothing". `overall_timeout` caps the whole subprocess -- the caller
+    shrinks it on large scopes (see `subfinder_budget_for`) so one slow
+    seed can't dominate a many-seed recon; a partial run still returns
+    whatever it printed."""
     binary = _tool_path("subfinder")
     if not binary:
         return set(), False
@@ -277,7 +302,7 @@ def subfinder_subdomains(domain: str, *, timeout: float = SUBFINDER_TIMEOUT_SECO
             [binary, "-d", domain, "-silent", "-timeout", str(int(timeout))],
             capture_output=True,
             text=True,
-            timeout=SUBFINDER_SUBPROCESS_TIMEOUT_SECONDS,
+            timeout=overall_timeout,
         )
     except (subprocess.SubprocessError, OSError):
         return set(), False
@@ -911,6 +936,7 @@ def run_passive_recon(
 
     recon_assets = [a for a in program.in_scope if a.asset_type in (AssetType.URL, AssetType.WILDCARD)]
     seeds_total = len(recon_assets)
+    subfinder_budget = subfinder_budget_for(seeds_total)  # shrink per-seed subfinder cap on large scopes
     seeds_processed = 0
     seed_durations: list[float] = []
 
@@ -935,7 +961,7 @@ def run_passive_recon(
             email_domain = host[4:] if host.lower().startswith("www.") else host
             crtsh_future = executor.submit(crtsh_subdomains, host)
             certspotter_future = executor.submit(certspotter_subdomains, host)
-            subfinder_future = executor.submit(subfinder_subdomains, host)
+            subfinder_future = executor.submit(subfinder_subdomains, host, overall_timeout=subfinder_budget)
             assetfinder_future = executor.submit(assetfinder_subdomains, host)
             wayback_future = executor.submit(wayback_subdomains, host)
             wayback_param_future = executor.submit(wayback_param_urls, host)

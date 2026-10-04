@@ -310,3 +310,15 @@ def test_crtsh_gives_up_after_two_failed_attempts():
     assert ok is False
     assert names == set()
     assert get.call_count == 2
+
+
+def test_subfinder_budget_scales_with_scope():
+    from bbhunter.recon.passive import (
+        SUBFINDER_SUBPROCESS_TIMEOUT_SECONDS,
+        SUBFINDER_MIN_PER_SEED_SECONDS,
+        subfinder_budget_for,
+    )
+    assert subfinder_budget_for(1) == SUBFINDER_SUBPROCESS_TIMEOUT_SECONDS   # small scope keeps full budget
+    assert subfinder_budget_for(3) == SUBFINDER_SUBPROCESS_TIMEOUT_SECONDS   # 600/3=200 -> capped at 90
+    assert subfinder_budget_for(10) == 60.0                                 # 600/10
+    assert subfinder_budget_for(54) == SUBFINDER_MIN_PER_SEED_SECONDS        # 600/54<20 -> floored
