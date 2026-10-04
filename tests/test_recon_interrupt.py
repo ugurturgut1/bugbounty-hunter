@@ -23,11 +23,13 @@ def _program_with_seeds(*hosts: str) -> Program:
 def test_interrupt_mid_loop_returns_partial_result_not_nothing():
     program = _program_with_seeds("first.example.com", "second.example.com", "third.example.com")
 
-    calls = {"n": 0}
-
+    # Raise on a specific seed's crt.sh rather than a call counter: the
+    # third-party enumeration now runs all seeds concurrently (Pass 1), so a
+    # call-order counter would race. Results are still COLLECTED in seed order,
+    # so raising on the second seed deterministically lands after the first is
+    # recorded and before the second.
     def fake_crtsh(domain, *, timeout=30):
-        calls["n"] += 1
-        if calls["n"] == 2:
+        if domain == "second.example.com":
             raise KeyboardInterrupt
         return set(), True
 
@@ -52,10 +54,13 @@ def test_interrupt_mid_loop_returns_partial_result_not_nothing():
         result, findings = run_passive_recon(program)
 
     assert result.seeds_total == 3
-    assert result.seeds_processed == 1  # first seed completed fully before the second raised
+    # Interrupt landed in the parallel enumeration pre-pass, before any
+    # target-touching seed completed -- but whatever was gathered is still
+    # returned as a valid partial result, not discarded.
+    assert result.seeds_processed == 0
     assert result.complete is False
-    assert "first.example.com" in result.subdomains  # first seed's data wasn't discarded
-    assert "second.example.com" not in result.subdomains
+    assert "first.example.com" in result.subdomains  # collected before the interrupt
+    assert "second.example.com" not in result.subdomains  # collection stopped here
     assert findings == []
 
 

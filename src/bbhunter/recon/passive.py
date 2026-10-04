@@ -946,62 +946,64 @@ def run_passive_recon(
     # interrupt-triggered shutdown doesn't itself block on still-running (target-untouched) futures.
     executor = ThreadPoolExecutor(max_workers=RECON_EXECUTOR_MAX_WORKERS)
     try:
-        for seed_index, asset in enumerate(recon_assets, start=1):
-            seed_start = time.monotonic()
-            host = _extract_host(asset.identifier)
-            if not host:
-                seeds_processed += 1
+        # Pass 1 -- third-party enumeration for ALL seeds concurrently. Every
+        # source here (crt.sh/Certspotter/subfinder/assetfinder/Wayback + DNS
+        # hygiene) is a third-party OSINT lookup that never touches the target,
+        # so running all seeds at once is rate-safe and removes the old
+        # per-seed-serialized subfinder cost (the large-scope bottleneck). The
+        # target-touching work stays sequential + paced in Pass 2 below.
+        _report(
+            f"gathering crt.sh/Certspotter/subfinder/assetfinder/Wayback subdomains + Wayback param URLs "
+            f"+ DNS hygiene (SPF/DMARC/DKIM) for {seeds_total} seed(s) in parallel "
+            "(third-party services only -- never the target itself)..."
+        )
+        enum_futures: dict[str, tuple[str, dict]] = {}
+        for asset in recon_assets:
+            h = _extract_host(asset.identifier)
+            if not h:
                 continue
-
-            _report(
-                f"[{seed_index}/{seeds_total}] {host}: gathering crt.sh/Certspotter/subfinder/"
-                "assetfinder/Wayback subdomains + Wayback param URLs + DNS hygiene (SPF/DMARC/DKIM) "
-                "(parallel, third-party services only -- never the target itself)..."
-            )
-            email_domain = host[4:] if host.lower().startswith("www.") else host
-            crtsh_future = executor.submit(crtsh_subdomains, host)
-            certspotter_future = executor.submit(certspotter_subdomains, host)
-            subfinder_future = executor.submit(subfinder_subdomains, host, overall_timeout=subfinder_budget)
-            assetfinder_future = executor.submit(assetfinder_subdomains, host)
-            wayback_future = executor.submit(wayback_subdomains, host)
-            wayback_param_future = executor.submit(wayback_param_urls, host)
-            spf_future = executor.submit(check_spf, email_domain)
-            dmarc_future = executor.submit(check_dmarc, email_domain)
-            dkim_future = executor.submit(check_dkim, email_domain)
-
-            discovered, crtsh_ok = crtsh_future.result()
+            ed = h[4:] if h.lower().startswith("www.") else h
+            enum_futures[h] = (ed, {
+                "crtsh": executor.submit(crtsh_subdomains, h),
+                "certspotter": executor.submit(certspotter_subdomains, h),
+                "subfinder": executor.submit(subfinder_subdomains, h, overall_timeout=subfinder_budget),
+                "assetfinder": executor.submit(assetfinder_subdomains, h),
+                "wayback": executor.submit(wayback_subdomains, h),
+                "wayback_param": executor.submit(wayback_param_urls, h),
+                "spf": executor.submit(check_spf, ed),
+                "dmarc": executor.submit(check_dmarc, ed),
+                "dkim": executor.submit(check_dkim, ed),
+            })
+        for h, (ed, futs) in enum_futures.items():
+            discovered, crtsh_ok = futs["crtsh"].result()
             if not crtsh_ok:
-                crtsh_failures.append(host)
-
-            certspotter_names, certspotter_ok = certspotter_future.result()
-            if not certspotter_ok:
-                certspotter_failures.append(host)
-            discovered |= certspotter_names
-
-            subfinder_names, subfinder_ok = subfinder_future.result()
-            if not subfinder_ok:
-                subfinder_failures.append(host)
-            discovered |= subfinder_names
-
-            assetfinder_names, assetfinder_ok = assetfinder_future.result()
-            if not assetfinder_ok:
-                assetfinder_failures.append(host)
-            discovered |= assetfinder_names
-
-            wayback_names, wayback_ok = wayback_future.result()
-            if not wayback_ok:
-                wayback_failures.append(host)
-            discovered |= wayback_names
-
-            subdomains_by_seed[host] = sorted(discovered)
-            _report(f"[{seed_index}/{seeds_total}] {host}: {len(discovered)} subdomain(s) found")
-
-            for hit in [*spf_future.result(), *dmarc_future.result(), *dkim_future.result()]:
+                crtsh_failures.append(h)
+            cs_names, cs_ok = futs["certspotter"].result()
+            if not cs_ok:
+                certspotter_failures.append(h)
+            discovered |= cs_names
+            sf_names, sf_ok = futs["subfinder"].result()
+            if not sf_ok:
+                subfinder_failures.append(h)
+            discovered |= sf_names
+            af_names, af_ok = futs["assetfinder"].result()
+            if not af_ok:
+                assetfinder_failures.append(h)
+            discovered |= af_names
+            wb_names, wb_ok = futs["wayback"].result()
+            if not wb_ok:
+                wayback_failures.append(h)
+            discovered |= wb_names
+            subdomains_by_seed[h] = sorted(discovered)
+            pu = futs["wayback_param"].result()
+            if pu:
+                param_urls_by_seed[h] = pu
+            for hit in [*futs["spf"].result(), *futs["dmarc"].result(), *futs["dkim"].result()]:
                 findings.append(
                     Finding(
-                        id=f"{program.key}:{email_domain}:{hit['kind']}",
+                        id=f"{program.key}:{ed}:{hit['kind']}",
                         program_key=program.key,
-                        asset=email_domain,
+                        asset=ed,
                         title=hit["kind"].replace("-", " "),
                         vuln_class=hit["kind"],
                         test_type=TestType.PASSIVE_RECON,
@@ -1011,9 +1013,19 @@ def run_passive_recon(
                     )
                 )
 
-            param_urls = wayback_param_future.result()
-            if param_urls:
-                param_urls_by_seed[host] = param_urls
+        # Pass 2 -- target-touching work, sequential and paced per host to
+        # respect the program's aggregate rate limit (never parallelized).
+        for seed_index, asset in enumerate(recon_assets, start=1):
+            seed_start = time.monotonic()
+            host = _extract_host(asset.identifier)
+            if not host:
+                seeds_processed += 1
+                continue
+
+            email_domain = host[4:] if host.lower().startswith("www.") else host
+            # Subdomains/param-URLs/DNS findings were gathered concurrently in
+            # Pass 1 above; just read them back here.
+            discovered = set(subdomains_by_seed.get(host, []))
 
             time.sleep(PARALLEL_OSINT_DELAY_SECONDS)
 
