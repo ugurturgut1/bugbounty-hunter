@@ -832,7 +832,7 @@ def _harvest_js_for_host(host: str, rules: RulesOfEngagement) -> list[dict]:
 
         map_url = find_source_map_url(js_url, js_text)
         if map_url:
-            map_hit = check_source_map_exposed(map_url)
+            map_hit = check_source_map_exposed(map_url, page_host=host)
             time.sleep(FINGERPRINT_DELAY_SECONDS)
             if map_hit:
                 hits.append(map_hit)
