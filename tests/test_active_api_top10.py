@@ -59,7 +59,7 @@ class _FakeResponse:
 def test_check_host_flags_excessive_data_exposure_on_root_json_response():
     client = MagicMock()
 
-    def fake_get(url, timeout=15, follow_redirects=True):
+    def fake_get(url, timeout=15, follow_redirects=True, **kwargs):
         if url.endswith("example.com/"):
             return _FakeResponse(
                 headers={"content-type": "application/json"},
@@ -79,7 +79,7 @@ def test_check_host_flags_excessive_data_exposure_on_root_json_response():
 def test_check_host_no_exposure_hit_for_clean_json():
     client = MagicMock()
 
-    def fake_get(url, timeout=15, follow_redirects=True):
+    def fake_get(url, timeout=15, follow_redirects=True, **kwargs):
         if url.endswith("example.com/"):
             return _FakeResponse(headers={"content-type": "application/json"}, json_data={"id": 1, "name": "test"})
         return _FakeResponse()
@@ -128,7 +128,7 @@ def test_check_host_requests_api_inventory_paths():
 def test_check_host_flags_exposed_swagger_spec():
     client = MagicMock()
 
-    def fake_get(url, timeout=15, follow_redirects=True):
+    def fake_get(url, timeout=15, follow_redirects=True, **kwargs):
         if "swagger.json" in url and "v1" not in url and "v2" not in url:
             return _FakeResponse(
                 status_code=200,

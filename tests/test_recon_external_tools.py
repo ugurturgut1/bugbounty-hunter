@@ -4,11 +4,14 @@ httpx tech-detect). All subprocess/HTTP calls are mocked -- no real
 binaries or network access required to run these."""
 from unittest.mock import MagicMock, patch
 
+import httpx
+
 from bbhunter.recon.passive import (
     _tech_banner_candidates,
     _tool_path,
     assetfinder_subdomains,
     certspotter_subdomains,
+    crtsh_subdomains,
     dnsx_resolve,
     fingerprint,
     httpx_tech_detect,
@@ -253,3 +256,69 @@ def test_fingerprint_falls_back_to_plain_get_when_httpx_binary_absent():
         result = fingerprint("example.com", rules)
     assert result == {"server": "Apache"}
     plain.assert_called_once()
+
+
+def test_subfinder_subprocess_timeout_outlasts_a_slow_multi_source_run():
+    """Regression for a real bug (found live 2026-10-03): the subprocess cap was
+    SUBFINDER_TIMEOUT_SECONDS + 10 = 25s, but subfinder's ~30 sources take 10-45s+
+    wall-clock, so every slow run was killed and counted as a failure, silently
+    dropping real subdomains. The overall cap must be the separate, larger budget."""
+    from bbhunter.recon.passive import (
+        SUBFINDER_SUBPROCESS_TIMEOUT_SECONDS,
+        SUBFINDER_TIMEOUT_SECONDS,
+    )
+
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        return MagicMock(returncode=0, stdout="api.example.com\n", stderr="")
+
+    with patch("bbhunter.recon.passive._tool_path", return_value="/fake/subfinder"), \
+         patch("bbhunter.recon.passive.subprocess.run", side_effect=fake_run):
+        subfinder_subdomains("example.com")
+
+    # the measured worst case was ~45s; the old 25s cap would reintroduce the bug
+    assert captured["timeout"] == SUBFINDER_SUBPROCESS_TIMEOUT_SECONDS
+    assert captured["timeout"] >= 60
+    assert captured["timeout"] > SUBFINDER_TIMEOUT_SECONDS + 10
+
+
+def test_crtsh_retries_once_on_a_transient_error_then_succeeds():
+    """crt.sh is flaky under load; one transient 5xx shouldn't drop the primary CT
+    source. First call raises, second returns good JSON -> overall success."""
+    good = MagicMock()
+    good.raise_for_status.return_value = None
+    good.json.return_value = [{"name_value": "api.example.com"}]
+
+    with patch("bbhunter.recon.passive.httpx.get",
+               side_effect=[httpx.ConnectError("boom"), good]) as get, \
+         patch("bbhunter.recon.passive.time.sleep"):
+        names, ok = crtsh_subdomains("example.com")
+
+    assert ok is True
+    assert names == {"api.example.com"}
+    assert get.call_count == 2
+
+
+def test_crtsh_gives_up_after_two_failed_attempts():
+    with patch("bbhunter.recon.passive.httpx.get",
+               side_effect=[httpx.ConnectError("boom"), httpx.ConnectError("boom")]) as get, \
+         patch("bbhunter.recon.passive.time.sleep"):
+        names, ok = crtsh_subdomains("example.com")
+
+    assert ok is False
+    assert names == set()
+    assert get.call_count == 2
+
+
+def test_subfinder_budget_scales_with_scope():
+    from bbhunter.recon.passive import (
+        SUBFINDER_SUBPROCESS_TIMEOUT_SECONDS,
+        SUBFINDER_MIN_PER_SEED_SECONDS,
+        subfinder_budget_for,
+    )
+    assert subfinder_budget_for(1) == SUBFINDER_SUBPROCESS_TIMEOUT_SECONDS   # small scope keeps full budget
+    assert subfinder_budget_for(3) == SUBFINDER_SUBPROCESS_TIMEOUT_SECONDS   # 600/3=200 -> capped at 90
+    assert subfinder_budget_for(10) == 60.0                                 # 600/10
+    assert subfinder_budget_for(54) == SUBFINDER_MIN_PER_SEED_SECONDS        # 600/54<20 -> floored

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import re
 import uuid
 from datetime import datetime
+
+from bbhunter._time import utcnow
 from pathlib import Path
 
 import typer
@@ -10,20 +13,23 @@ from rich.console import Console
 from rich.table import Table
 
 from bbhunter.discovery import ALL_CONNECTORS
-from bbhunter.models import AIEndpointConfig, AssetType, FindingStatus, TestRun, TestType
+from bbhunter.models import AIEndpointConfig, AssetType, Finding, FindingStatus, ReconResult, TestRun, TestType
 from bbhunter.prioritize import prioritize
 from bbhunter.recon import run_passive_recon
+from bbhunter.recon.authed import discover_authed_endpoints
+from bbhunter.recon.passive import _extract_host as _host_of
 from bbhunter.recon.passive import _tool_path
 from bbhunter.reporting import (
     ManualSubmissionRequired,
     draft_poc,
     draft_report,
+    score_and_rating,
     mark_submitted_manually,
     poc_has_unfilled_todos,
     submit_report,
 )
 from bbhunter.testing import run_active_checks
-from bbhunter.testing.active import _select_hosts
+from bbhunter.testing.active import _select_hosts, run_nuclei_cve_scan
 from bbhunter.testing.aggressive_discovery import (
     FFUF_RATE_PER_SECOND,
     MAX_DISCOVERY_HOSTS_PER_PROGRAM,
@@ -34,7 +40,21 @@ from bbhunter.testing.aggressive_discovery import (
 from bbhunter.testing.ai_safety import run_ai_safety_probes
 from bbhunter.testing.credential_testing import MAX_CREDENTIALS_PER_RUN, run_credential_test
 from bbhunter.testing.exploit_framework import run_exploit_framework_check
-from bbhunter.testing.idor import run_bfla_check, run_idor_check
+from bbhunter.testing.auth_logic import run_session_valid_check, run_token_leak_check
+from bbhunter.testing.authlogic_plan import build_plan
+from bbhunter.testing.jwt_check import analyze_jwt
+from bbhunter.testing.takeover import run_takeover_check
+from bbhunter.audit import append_audit, export_markdown, read_audit
+from bbhunter.disclosures import add_disclosure, load_disclosures, match_disclosures
+from bbhunter.safety import (
+    KillSwitchEngaged,
+    assert_active_allowed,
+    is_in_scope,
+    killswitch_engaged,
+    set_killswitch,
+)
+from bbhunter.triage import flag_known_issues
+from bbhunter.testing.idor import run_bfla_batch, run_bfla_check, run_idor_batch, run_idor_check
 from bbhunter.testing.mass_assignment import run_mass_assignment_check
 from bbhunter.testing.sqli_exploit import SQLMAP_DUMP_ROW_LIMIT, run_sqli_exploitation
 from bbhunter.state import (
@@ -44,7 +64,11 @@ from bbhunter.state import (
     get_recon_result,
     list_findings,
     list_programs,
+    check_outcome_stats,
+    fresh_program_keys,
     list_reconned_program_keys,
+    program_outcome_stats,
+    recon_diff,
     list_test_runs,
     record_test_run,
     upsert_ai_endpoint,
@@ -62,6 +86,8 @@ def _log_test_run(key: str, test_type: TestType, findings_created: int, detail: 
         findings_created=findings_created,
         detail=detail,
     ))
+    # Mirror to the append-only audit log (good-faith-conduct record).
+    append_audit(key, test_type.value, detail)
 
 app = typer.Typer(help="Personal bug-bounty discovery/recon/reporting pipeline")
 console = Console()
@@ -79,6 +105,28 @@ def _parse_headers(raw: list[str]) -> dict[str, str]:
         key, _, value = h.partition(":")
         headers[key.strip()] = value.strip()
     return headers
+
+
+def _resolve_urls(url: str | None, urls_file: str | None) -> list[str]:
+    """Return the URL list for an access-control check: exactly one of a
+    single --url or a --urls-file (one URL per line, blank lines and
+    '#' comments ignored). Exits with a clear error if neither or both
+    are given, or the file is empty/unreadable."""
+    if bool(url) == bool(urls_file):
+        console.print("[red]error[/red]: pass exactly one of --url or --urls-file")
+        raise typer.Exit(1)
+    if url:
+        return [url]
+    try:
+        lines = Path(urls_file).read_text().splitlines()
+    except OSError as e:
+        console.print(f"[red]error[/red]: can't read {urls_file}: {e}")
+        raise typer.Exit(1)
+    urls = [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
+    if not urls:
+        console.print(f"[red]error[/red]: no URLs in {urls_file}")
+        raise typer.Exit(1)
+    return urls
 
 
 @app.command()
@@ -140,6 +188,12 @@ def prioritize_cmd(
     sort_by: str = typer.Option(
         "score", "--sort", help="score (default, effort-vs-payoff) | time (fastest first) | seeds (largest scope first)"
     ),
+    fresh_days: int = typer.Option(
+        14, "--fresh-days", help="Treat programs first-seen/scope-expanded within this many days as 'fresh' (boosts their score)"
+    ),
+    fresh_only: bool = typer.Option(
+        False, "--fresh-only", help="Show only newly-added or recently-scope-expanded programs"
+    ),
 ):
     """Browse synced programs with an estimated recon time for each, e.g.
     to decide which of several newly-uncovered large scopes is actually
@@ -151,9 +205,13 @@ def prioritize_cmd(
     those numbers directly."""
     programs = list_programs()
     reconned = list_reconned_program_keys()
-    ranked = prioritize(programs, reconned)
+    fresh_keys, expanded_keys = fresh_program_keys(fresh_days)
+    ranked = prioritize(programs, reconned, fresh_keys=fresh_keys, expanded_keys=expanded_keys,
+                        outcome_stats=program_outcome_stats())
     if not show_reconned:
         ranked = [r for r in ranked if not r.already_reconned]
+    if fresh_only:
+        ranked = [r for r in ranked if r.is_fresh or r.recently_expanded]
     if search:
         needle = search.lower()
         ranked = [r for r in ranked if needle in r.program_key.lower() or needle in r.name.lower()]
@@ -321,7 +379,7 @@ def approve_active_cmd(
 
     program.rules.human_reviewed = True
     program.rules.confidence = "high"
-    program.rules.reviewed_at = datetime.utcnow()
+    program.rules.reviewed_at = utcnow()
     program.rules.review_notes = note
     program.rules.allowed_test_types = program.rules.allowed_test_types | parsed_types
     if required_user_agent is not None:
@@ -613,7 +671,11 @@ def test_active_cmd(
         name for name, flag in (("injection", injection), ("nuclei", nuclei), ("cloud-buckets", cloud_buckets)) if flag
     )
     console.print(f"[cyan]running active checks[/cyan] on {key}{f' (incl. {extras})' if extras else ''}...")
-    new_findings = run_active_checks(program, recon_result, injection=injection, nuclei=nuclei, cloud_buckets=cloud_buckets)
+    try:
+        new_findings = run_active_checks(program, recon_result, injection=injection, nuclei=nuclei, cloud_buckets=cloud_buckets)
+    except RuntimeError as e:
+        console.print(f"[red]blocked[/red]: {e}")
+        raise typer.Exit(1)
     for finding in new_findings:
         upsert_finding(finding)
     _log_test_run(
@@ -783,7 +845,10 @@ def test_ai_cmd(
 @app.command(name="test-idor")
 def test_idor_cmd(
     key: str,
-    url: str = typer.Option(..., "--url", help="A resource URL known to belong to the 'owner' identity, e.g. https://target/api/orders/12345"),
+    url: str | None = typer.Option(None, "--url", help="A resource URL known to belong to the 'owner' identity, e.g. https://target/api/orders/12345"),
+    urls_file: str | None = typer.Option(
+        None, "--urls-file", help="Path to a file of owner-URLs (one per line, # comments allowed) to batch-check instead of a single --url"
+    ),
     owner_header: list[str] = typer.Option(
         ..., "--owner-header", help="'Key: Value' auth header for the identity that owns the resource, repeatable"
     ),
@@ -794,11 +859,76 @@ def test_idor_cmd(
         None, "--owner-note", help="How you know this resource belongs to the owner identity, e.g. \"order 12345, created by test account A\""
     ),
 ):
-    """Check one resource URL for IDOR by fetching it once as its
-    confirmed owner and once as a second, unrelated identity -- exactly
-    two requests. Refuses unless `approve-active` has already recorded a
-    human decision permitting active testing (same gate as
-    `test-active`). Both identities' credentials must be real sessions
+    """Check resource URL(s) for IDOR by fetching each once as its
+    confirmed owner and once as a second, unrelated identity -- two
+    requests per URL. Pass --url for one, or --urls-file for a batch of
+    URLs you've curated (each is the same safe two-request diff, spaced
+    to stay under 1 RPS; no enumeration or ID guessing). Refuses unless
+    `approve-active` has already recorded a human decision permitting
+    active testing (same gate as `test-active`). Both identities'
+    credentials must be real sessions you (or the user directing this)
+    actually control -- never invented, guessed, or brute-forced."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+
+    if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
+        console.print(
+            f"[red]blocked[/red]: {key} does not permit active testing. "
+            "Run `bbhunter review-rules` then `bbhunter approve-active` if the policy actually allows it."
+        )
+        raise typer.Exit(1)
+
+    urls = _resolve_urls(url, urls_file)
+    owner_headers = _parse_headers(owner_header)
+    other_headers = _parse_headers(other_header)
+
+    try:
+        if len(urls) == 1:
+            console.print(f"[cyan]checking IDOR[/cyan] on {urls[0]} for {key} (2 requests)...")
+            new_findings = run_idor_check(program, urls[0], owner_headers, other_headers, owner_note=owner_note)
+        else:
+            console.print(f"[cyan]checking IDOR[/cyan] on {len(urls)} URL(s) for {key} (2 requests each, paced <=1 RPS)...")
+            new_findings = run_idor_batch(program, urls, owner_headers, other_headers, owner_note=owner_note)
+    except RuntimeError as e:
+        console.print(f"[red]blocked[/red]: {e}")
+        raise typer.Exit(1)
+    for finding in new_findings:
+        upsert_finding(finding)
+    _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, len(new_findings), f"IDOR check on {len(urls)} URL(s)")
+    if new_findings:
+        console.print(f"[red]{len(new_findings)} candidate(s) found[/red] -- see `bbhunter findings`, verify manually before drafting a PoC")
+    else:
+        console.print("[green]no candidate[/green] -- either properly denied, or the baseline request as the "
+                       "owner identity itself didn't succeed (check --owner-header/the URL)")
+
+
+@app.command(name="test-bfla")
+def test_bfla_cmd(
+    key: str,
+    url: str | None = typer.Option(None, "--url", help="An administrative/privileged function or endpoint URL, e.g. https://target/admin/users"),
+    urls_file: str | None = typer.Option(
+        None, "--urls-file", help="Path to a file of privileged-function URLs (one per line, # comments allowed) to batch-check instead of a single --url"
+    ),
+    authorized_header: list[str] = typer.Option(
+        ..., "--authorized-header", help="'Key: Value' auth header for an identity authorized to use this function, repeatable"
+    ),
+    other_header: list[str] = typer.Option(
+        ..., "--other-header", help="'Key: Value' auth header for a lower-privileged/unrelated identity, repeatable"
+    ),
+    authorized_note: str | None = typer.Option(
+        None, "--authorized-note", help="How you know this identity is authorized for this function, e.g. \"test account A has the admin role\""
+    ),
+):
+    """Check administrative/privileged function or endpoint URL(s) for
+    Broken Function Level Authorization (OWASP API5:2023) by fetching
+    each once as an authorized identity and once as a lower-privileged
+    one -- two requests per URL, same mechanism as `test-idor` pointed at
+    a function instead of a data object. Pass --url for one or
+    --urls-file for a batch (paced to stay under 1 RPS). Refuses unless
+    `approve-active` has already recorded a human decision permitting
+    active testing. Both identities' credentials must be real sessions
     you (or the user directing this) actually control -- never invented,
     guessed, or brute-forced."""
     program = get_program(key)
@@ -813,49 +943,403 @@ def test_idor_cmd(
         )
         raise typer.Exit(1)
 
-    owner_headers = _parse_headers(owner_header)
+    urls = _resolve_urls(url, urls_file)
+    authorized_headers = _parse_headers(authorized_header)
     other_headers = _parse_headers(other_header)
 
-    console.print(f"[cyan]checking IDOR[/cyan] on {url} for {key} (2 requests)...")
-    new_findings = run_idor_check(program, url, owner_headers, other_headers, owner_note=owner_note)
+    try:
+        if len(urls) == 1:
+            console.print(f"[cyan]checking BFLA[/cyan] on {urls[0]} for {key} (2 requests)...")
+            new_findings = run_bfla_check(program, urls[0], authorized_headers, other_headers, authorized_note=authorized_note)
+        else:
+            console.print(f"[cyan]checking BFLA[/cyan] on {len(urls)} URL(s) for {key} (2 requests each, paced <=1 RPS)...")
+            new_findings = run_bfla_batch(program, urls, authorized_headers, other_headers, authorized_note=authorized_note)
+    except RuntimeError as e:
+        console.print(f"[red]blocked[/red]: {e}")
+        raise typer.Exit(1)
     for finding in new_findings:
         upsert_finding(finding)
-    _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, len(new_findings), f"IDOR check on {url}")
+    _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, len(new_findings), f"BFLA check on {len(urls)} URL(s)")
     if new_findings:
-        console.print("[red]candidate found[/red] -- see `bbhunter findings`, verify manually before drafting a PoC")
+        console.print(f"[red]{len(new_findings)} candidate(s) found[/red] -- see `bbhunter findings`, verify manually before drafting a PoC")
     else:
         console.print("[green]no candidate[/green] -- either properly denied, or the baseline request as the "
-                       "owner identity itself didn't succeed (check --owner-header/the URL)")
+                       "authorized identity itself didn't succeed (check --authorized-header/the URL)")
 
 
-@app.command(name="test-bfla")
-def test_bfla_cmd(
+@app.command(name="test-token-leak")
+def test_token_leak_cmd(
     key: str,
-    url: str = typer.Option(..., "--url", help="An administrative/privileged function or endpoint URL, e.g. https://target/admin/users"),
-    authorized_header: list[str] = typer.Option(
-        ..., "--authorized-header", help="'Key: Value' auth header for an identity authorized to use this function, repeatable"
-    ),
-    other_header: list[str] = typer.Option(
-        ..., "--other-header", help="'Key: Value' auth header for a lower-privileged/unrelated identity, repeatable"
-    ),
-    authorized_note: str | None = typer.Option(
-        None, "--authorized-note", help="How you know this identity is authorized for this function, e.g. \"test account A has the admin role\""
-    ),
+    url: str = typer.Option(..., "--url", help="A URL to fetch with your own session, e.g. a page/endpoint reached after login"),
+    header: list[str] = typer.Option(..., "--header", help="'Key: Value' auth header for your own session, repeatable"),
+    token_value: str = typer.Option(..., "--token-value", help="The raw token/session value to look for leaking (your own, e.g. the cookie or bearer value)"),
+    note: str | None = typer.Option(None, "--note", help="Optional context recorded on any finding"),
 ):
-    """Check one administrative/privileged function or endpoint for
-    Broken Function Level Authorization (OWASP API5:2023) by fetching it
-    once as an authorized identity and once as a lower-privileged one --
-    exactly two requests, same mechanism as `test-idor` pointed at a
-    function instead of a data object. Refuses unless `approve-active`
-    has already recorded a human decision permitting active testing.
-    Both identities' credentials must be real sessions you (or the user
-    directing this) actually control -- never invented, guessed, or
-    brute-forced."""
+    """Check whether a resource leaks your own auth token into the final
+    URL, a redirect Location, or the response body (one GET, read-only).
+    Gated by `approve-active` like every active check. The token value is
+    your own session's -- this only looks for where it ends up, never
+    sends anything new."""
     program = get_program(key)
     if not program:
         console.print(f"[red]not found[/red]: {key}")
         raise typer.Exit(1)
+    if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
+        console.print(
+            f"[red]blocked[/red]: {key} does not permit active testing. "
+            "Run `bbhunter review-rules` then `bbhunter approve-active` if the policy actually allows it."
+        )
+        raise typer.Exit(1)
+    headers = _parse_headers(header)
+    console.print(f"[cyan]checking token leak[/cyan] on {url} for {key} (1 request)...")
+    try:
+        new_findings = run_token_leak_check(program, url, headers, token_value, note=note)
+    except RuntimeError as e:
+        console.print(f"[red]blocked[/red]: {e}")
+        raise typer.Exit(1)
+    for finding in new_findings:
+        upsert_finding(finding)
+    _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, len(new_findings), f"token-leak check on {url}")
+    if new_findings:
+        console.print("[red]candidate found[/red] -- see `bbhunter findings`, verify manually before drafting a PoC")
+    else:
+        console.print("[green]no candidate[/green] -- token not observed leaking")
 
+
+@app.command(name="test-session-replay")
+def test_session_replay_cmd(
+    key: str,
+    url: str = typer.Option(..., "--url", help="An authenticated-only URL to replay the logged-out session against"),
+    header: list[str] = typer.Option(..., "--header", help="'Key: Value' header for the session you have ALREADY logged out of, repeatable"),
+    note: str | None = typer.Option(None, "--note", help="Optional context recorded on any finding"),
+):
+    """After you log out of a session out-of-band, replay it against an
+    authenticated-only URL (one GET, read-only). A non-denied 200 means
+    the server didn't invalidate the session server-side (broken session
+    management). Gated by `approve-active`. The logout is your action,
+    never this tool's -- it only observes whether the old session still
+    works."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+    if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
+        console.print(
+            f"[red]blocked[/red]: {key} does not permit active testing. "
+            "Run `bbhunter review-rules` then `bbhunter approve-active` if the policy actually allows it."
+        )
+        raise typer.Exit(1)
+    headers = _parse_headers(header)
+    console.print(f"[cyan]checking session replay[/cyan] on {url} for {key} (1 request)...")
+    try:
+        new_findings = run_session_valid_check(program, url, headers, note=note)
+    except RuntimeError as e:
+        console.print(f"[red]blocked[/red]: {e}")
+        raise typer.Exit(1)
+    for finding in new_findings:
+        upsert_finding(finding)
+    _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, len(new_findings), f"session-replay check on {url}")
+    if new_findings:
+        console.print("[red]candidate found[/red] -- logged-out session still works; verify before drafting a PoC")
+    else:
+        console.print("[green]no candidate[/green] -- session appears properly invalidated")
+
+
+@app.command(name="record-outcome")
+def record_outcome_cmd(
+    finding_id: str,
+    status: str = typer.Option(..., "--status", help="submitted | resolved | duplicate | informative"),
+    bounty: float | None = typer.Option(None, "--bounty", help="Bounty amount paid, if any (feeds prioritize weighting)"),
+):
+    """Record what actually happened to a submitted finding. This is the
+    feedback loop: outcomes drive `prioritize` weighting (programs that
+    resolve/pay rank higher; dupe/informative-only rank lower) and the
+    per-check signal stats in `bbhunter stats`."""
+    valid = {"submitted", "resolved", "duplicate", "informative"}
+    if status not in valid:
+        console.print(f"[red]invalid --status[/red]: {status!r}. Valid: {', '.join(sorted(valid))}")
+        raise typer.Exit(1)
+    finding = get_finding(finding_id)
+    if not finding:
+        console.print(f"[red]not found[/red]: {finding_id}")
+        raise typer.Exit(1)
+    finding.status = FindingStatus(status)
+    if bounty is not None:
+        finding.bounty_amount = bounty
+    upsert_finding(finding)
+    console.print(f"[green]recorded[/green]: {finding_id} -> {status}" + (f", bounty {bounty:.0f}" if bounty else ""))
+
+
+@app.command(name="audit")
+def audit_cmd(
+    key: str | None = typer.Argument(None, help="Optional program key to filter to"),
+    export: str | None = typer.Option(None, "--export", help="Write the log as markdown to this path"),
+):
+    """Show (or export) the append-only audit log of every check run --
+    timestamp, program, check type, and what was targeted. A good-faith
+    record of your conduct to show a program if ever asked."""
+    records = read_audit(key)
+    if not records:
+        console.print("[yellow]no audit entries yet[/yellow]")
+        return
+    if export:
+        Path(export).write_text(export_markdown(key))
+        console.print(f"[green]exported[/green] {len(records)} entr(ies) -> {export}")
+        return
+    table = Table(title=f"Audit log{f' - {key}' if key else ''} ({len(records)})")
+    for col in ("Timestamp (UTC)", "Program", "Check", "Detail"):
+        table.add_column(col, no_wrap=(col != "Detail"))
+    for r in records[-200:]:
+        table.add_row(r.get("ts", "")[:19], r.get("program_key", ""), r.get("test_type", ""), r.get("detail", ""))
+    console.print(table)
+
+
+@app.command(name="doctor")
+def doctor_cmd():
+    """Environment check: which platform connectors have credentials, which
+    optional external tools are installed, where state lives, and the kill
+    switch state. Run it after setup to confirm everything's wired."""
+    from bbhunter.config import DB_PATH
+
+    console.print("[bold]Connectors[/bold]")
+    for connector_cls in ALL_CONNECTORS:
+        c = connector_cls()
+        ok = c.is_configured()
+        console.print(f"  {'[green]configured[/green]' if ok else '[yellow]no creds[/yellow]'}  {c.platform_name}")
+
+    console.print("[bold]External tools[/bold]")
+    for tool in ("subfinder", "assetfinder", "dnsx", "httpx", "nuclei", "ffuf", "sqlmap", "commix"):
+        path = _tool_path(tool)
+        console.print(f"  {'[green]' + path + '[/green]' if path else '[yellow]missing[/yellow]'}  {tool}")
+
+    console.print("[bold]State[/bold]")
+    console.print(f"  db: {DB_PATH} ({'exists' if DB_PATH.exists() else 'not created yet'})")
+    console.print(f"  kill switch: {'[red]ENGAGED[/red]' if killswitch_engaged() else '[green]off[/green]'}")
+
+
+@app.command(name="killswitch")
+def killswitch_cmd(action: str = typer.Argument("status", help="on | off | status")):
+    """Global stop for ALL active testing. `on` makes every active check
+    refuse immediately (no per-program un-approval needed); `off` clears
+    it; `status` reports. Also honored via the BBHUNTER_KILLSWITCH env var."""
+    if action == "on":
+        set_killswitch(True)
+        console.print("[red]kill switch ENGAGED[/red] -- all active testing halted")
+    elif action == "off":
+        set_killswitch(False)
+        console.print("[green]kill switch cleared[/green] -- active testing allowed (subject to approve-active)")
+    elif action == "status":
+        console.print("[red]ENGAGED[/red]" if killswitch_engaged() else "[green]off[/green]")
+    else:
+        console.print(f"[red]invalid action[/red]: {action!r}. Use on | off | status")
+        raise typer.Exit(1)
+
+
+@app.command(name="test-jwt")
+def test_jwt_cmd(token: str = typer.Option(..., "--token", help="A JWT you hold (your own session token) to analyze")):
+    """Offline structural analysis of a JWT you already hold: flags
+    alg=none, symmetric algs, missing expiry, and over-long lifetimes. No
+    network, no signature cracking -- so no approve-active needed."""
+    try:
+        issues = analyze_jwt(token)
+    except ValueError as e:
+        console.print(f"[red]invalid JWT[/red]: {e}")
+        raise typer.Exit(1)
+    if not issues:
+        console.print("[green]no structural weaknesses found[/green] (signature strength not checked here)")
+        return
+    for i in issues:
+        console.print(f"  [yellow]{i['severity']}[/yellow] {i['kind']}: {i['detail']}")
+
+
+@app.command(name="cvss")
+def cvss_cmd(vector: str = typer.Argument(..., help="CVSS v3.1 vector, e.g. AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")):
+    """Compute a CVSS v3.1 base score + severity rating from a vector --
+    a defensible severity for a report instead of a guess."""
+    try:
+        score, rating = score_and_rating(vector)
+    except ValueError as e:
+        console.print(f"[red]invalid vector[/red]: {e}")
+        raise typer.Exit(1)
+    console.print(f"[bold]{score}[/bold] ({rating})")
+
+
+@app.command(name="stats")
+def stats_cmd():
+    """Show the learned outcome signal: per-program and per-check-type
+    resolved/duplicate/informative counts and total bounty. This is what
+    `prioritize` now weights by -- use it to see which programs and which
+    check types are actually worth your time."""
+    prog = program_outcome_stats()
+    check = check_outcome_stats()
+    if not prog and not check:
+        console.print("[yellow]no outcomes recorded yet[/yellow] -- use `bbhunter record-outcome` after you submit")
+        return
+    for title, data in (("By program", prog), ("By check type", check)):
+        if not data:
+            continue
+        table = Table(title=title)
+        for col in ("Key", "Submitted", "Resolved", "Duplicate", "Informative", "Bounty"):
+            table.add_column(col)
+        for key, s in sorted(data.items(), key=lambda kv: (kv[1].get("resolved", 0), kv[1].get("bounty_total", 0)), reverse=True):
+            table.add_row(key, str(s.get("submitted", 0)), str(s.get("resolved", 0)),
+                          str(s.get("duplicate", 0)), str(s.get("informative", 0)), f"{s.get('bounty_total', 0):.0f}")
+        console.print(table)
+
+
+@app.command(name="whatsnew")
+def whatsnew_cmd(
+    key: str | None = typer.Argument(None, help="Optional program key to focus on; omit for a global summary"),
+    fresh_days: int = typer.Option(14, "--fresh-days", help="Window for 'newly added' / 'scope expanded'"),
+):
+    """What changed recently -- where fresh bugs live. Global: newly-added
+    programs, recently scope-expanded programs, and any reconned program
+    whose hosts/subdomains changed since its previous recon. With a key:
+    the full host/subdomain diff for that program's last two recons."""
+    if key:
+        diff = recon_diff(key)
+        if not diff:
+            console.print(f"[yellow]no diff[/yellow] for {key} -- need at least two recon runs to compare")
+            return
+        console.print(f"[bold]{key}[/bold]  {diff['prev_run'][:19]} -> {diff['curr_run'][:19]}")
+        for label, items in (("new hosts", diff["new_hosts"]), ("new subdomains", diff["new_subdomains"]),
+                             ("removed hosts", diff["removed_hosts"]), ("removed subdomains", diff["removed_subdomains"])):
+            if items:
+                console.print(f"  [green]{label}[/green] ({len(items)}): " + ", ".join(items[:30]) + ("..." if len(items) > 30 else ""))
+        if not any([diff["new_hosts"], diff["new_subdomains"], diff["removed_hosts"], diff["removed_subdomains"]]):
+            console.print("  [dim]no change since last recon[/dim]")
+        return
+
+    fresh_keys, expanded_keys = fresh_program_keys(fresh_days)
+    if fresh_keys:
+        console.print(f"[green]Newly-added programs[/green] (last {fresh_days}d): {len(fresh_keys)}")
+        for k in sorted(fresh_keys)[:30]:
+            console.print(f"  - {k}")
+    if expanded_keys:
+        console.print(f"[green]Scope expanded[/green] (last {fresh_days}d): {len(expanded_keys)}")
+        for k in sorted(expanded_keys)[:30]:
+            console.print(f"  - {k}")
+    changed = []
+    for k in list_reconned_program_keys():
+        diff = recon_diff(k)
+        if diff and (diff["new_hosts"] or diff["new_subdomains"]):
+            changed.append((k, len(diff["new_hosts"]), len(diff["new_subdomains"])))
+    if changed:
+        console.print(f"[green]Recon changed since last run[/green]: {len(changed)}")
+        for k, nh, ns in changed:
+            console.print(f"  - {k}: +{nh} host(s), +{ns} subdomain(s)  (bbhunter whatsnew {k})")
+    if not fresh_keys and not expanded_keys and not changed:
+        console.print("[yellow]nothing new[/yellow] in the window")
+
+
+@app.command(name="add-disclosure")
+def add_disclosure_cmd(
+    key: str,
+    title: str = typer.Option(..., "--title", help="Title of an already-public disclosed report for this program"),
+    vuln_class: str | None = typer.Option(None, "--vuln-class", help="Optional vuln class of that report"),
+):
+    """Record a program's already-public disclosed report (from its
+    Hacktivity/disclosure feed) so `dedup-check` can warn you before you
+    submit a likely duplicate."""
+    if not get_program(key):
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+    total = add_disclosure(key, title, vuln_class)
+    console.print(f"[green]added[/green] -- {total} disclosure(s) on file for {key}")
+
+
+@app.command(name="dedup-check")
+def dedup_check_cmd(key: str):
+    """Flag candidate findings that look like a program's already-public
+    disclosed reports (same vuln class, or high title overlap), so you
+    don't burn reputation submitting a known duplicate. Populate the
+    disclosure list first with `add-disclosure`."""
+    if not get_program(key):
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+    disclosures = load_disclosures(key)
+    if not disclosures:
+        console.print(f"[yellow]no disclosures on file[/yellow] for {key} -- add some with `add-disclosure`")
+        raise typer.Exit(0)
+    candidates = [f for f in list_findings(status="candidate") if f.program_key == key]
+    flagged = match_disclosures(candidates, disclosures)
+    if not flagged:
+        console.print(f"[green]no likely duplicates[/green] among {len(candidates)} candidate(s) vs {len(disclosures)} disclosure(s)")
+        return
+    console.print(f"[yellow]{len(flagged)} candidate(s) look like known public disclosures:[/yellow]")
+    for f, reason in flagged:
+        console.print(f"  - {f.title}  [dim]on {f.asset}[/dim] -- {reason}")
+
+
+@app.command(name="dismiss")
+def dismiss_cmd(
+    finding_id: str,
+    reason: str = typer.Option(..., "--reason", help="Why this candidate isn't real (recorded on the finding)"),
+):
+    """Dismiss a candidate finding you've confirmed is a false positive or
+    not worth pursuing, so it drops out of `findings`/`triage`/`dedup-check`.
+    Records the reason and moves it to poc_rejected (the 'didn't hold up'
+    state) -- reversible via the normal workflow, never deleted."""
+    finding = get_finding(finding_id)
+    if not finding:
+        console.print(f"[red]not found[/red]: {finding_id}")
+        raise typer.Exit(1)
+    if finding.status != FindingStatus.CANDIDATE:
+        console.print(f"[yellow]not a candidate[/yellow]: {finding_id} is {finding.status.value} -- nothing to dismiss")
+        raise typer.Exit(0)
+    finding.status = FindingStatus.POC_REJECTED
+    finding.notes = f"{finding.notes or ''}\ndismissed: {reason}".strip()
+    upsert_finding(finding)
+    console.print(f"[green]dismissed[/green]: {finding_id}")
+
+
+@app.command(name="triage")
+def triage_cmd(
+    key: str,
+):
+    """Flag candidate findings this program's own policy likely won't
+    accept -- out-of-scope assets, and low-value classes (SPF/DMARC,
+    missing security headers, rate-limit, source maps, ...) the policy
+    text names as excluded -- so you don't waste a report or burn
+    reputation on a known non-issue. Read-only; it labels, never deletes
+    or hides."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+    candidates = [f for f in list_findings(status="candidate") if f.program_key == key]
+    if not candidates:
+        console.print(f"[green]no candidates[/green] for {key}")
+        raise typer.Exit(0)
+    flagged = flag_known_issues(program, candidates)
+    flagged_ids = {f.id for f, _ in flagged}
+    worth = [f for f in candidates if f.id not in flagged_ids]
+    console.print(f"[bold]{len(candidates)} candidate(s)[/bold] for {key}: "
+                   f"{len(worth)} worth review, {len(flagged)} likely out-of-scope/noise")
+    if flagged:
+        console.print("\n[yellow]Likely out-of-scope / known non-issues (verify before reporting):[/yellow]")
+        for f, reason in flagged:
+            console.print(f"  - {f.title}  [dim]on {f.asset}[/dim] -- {reason}")
+    if worth:
+        console.print("\n[green]Worth a real look:[/green]")
+        for f in worth:
+            console.print(f"  - {f.title}  [dim]on {f.asset}[/dim]")
+
+
+@app.command(name="test-cve-confirm")
+def test_cve_confirm_cmd(
+    key: str,
+):
+    """Actively confirm the weak NVD keyword-CVE matches from passive
+    recon: for each host with VERSION_CVE_MATCH candidates, run nuclei
+    restricted to exactly those CVE template IDs. A nuclei hit turns a
+    'maybe affected' guess into an actually-fired finding (the real path
+    to a reportable CVE). Gated by `approve-active`; needs `nuclei`
+    installed; paced 1 req/s like every nuclei run here."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
     if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
         console.print(
             f"[red]blocked[/red]: {key} does not permit active testing. "
@@ -863,19 +1347,176 @@ def test_bfla_cmd(
         )
         raise typer.Exit(1)
 
-    authorized_headers = _parse_headers(authorized_header)
-    other_headers = _parse_headers(other_header)
+    try:
+        assert_active_allowed()
+    except KillSwitchEngaged as e:
+        console.print(f"[red]blocked[/red]: {e}")
+        raise typer.Exit(1)
 
-    console.print(f"[cyan]checking BFLA[/cyan] on {url} for {key} (2 requests)...")
-    new_findings = run_bfla_check(program, url, authorized_headers, other_headers, authorized_note=authorized_note)
+    by_host: dict[str, list[str]] = {}
+    for f in list_findings():
+        if f.program_key == key and f.test_type == TestType.VERSION_CVE_MATCH:
+            ids = re.findall(r"CVE-\d{4}-\d{4,7}", f"{f.id} {f.title}")
+            if ids:
+                by_host.setdefault(f.asset, []).extend(ids)
+    if not by_host:
+        console.print(f"[yellow]nothing to confirm[/yellow]: no VERSION_CVE_MATCH candidates for {key} -- run `bbhunter recon` first")
+        raise typer.Exit(0)
+
+    total = 0
+    for host, cve_ids in by_host.items():
+        console.print(f"[cyan]confirming[/cyan] {len(set(cve_ids))} CVE(s) on {host} via nuclei (1 req/s)...")
+        results = run_nuclei_cve_scan(host, cve_ids, program.rules)
+        if results is None:
+            console.print("[yellow]skip[/yellow]: nuclei not installed or run errored")
+            continue
+        for r in results:
+            tid = r.get("template-id", "cve")
+            finding = Finding(
+                id=f"{key}:cve-confirmed:{host}:{tid}",
+                program_key=key,
+                asset=host,
+                title=f"nuclei-confirmed {tid} on {host}",
+                vuln_class="confirmed-cve",
+                test_type=TestType.ACTIVE_LOW_IMPACT,
+                evidence=(
+                    f"nuclei template {tid} fired against https://{host} "
+                    f"({r.get('matched-at', host)}). Promotes the earlier NVD keyword match from a guess to "
+                    "an actually-fired check -- still verify the real impact manually before drafting a PoC."
+                ),
+                status=FindingStatus.CANDIDATE,
+                notes="severity guess: high -- nuclei-confirmed, verify impact before PoC",
+            )
+            upsert_finding(finding)
+            total += 1
+    _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, total, f"CVE confirmation across {len(by_host)} host(s)")
+    if total:
+        console.print(f"[red]{total} CVE(s) confirmed[/red] -- see `bbhunter findings`, verify impact before drafting a PoC")
+    else:
+        console.print("[green]none confirmed[/green] -- no targeted nuclei template fired")
+
+
+@app.command(name="test-takeover")
+def test_takeover_cmd(
+    key: str,
+):
+    """Check recon-discovered hosts for subdomain takeover: one GET per
+    host, flagging any that serve a known 'unclaimed resource' page
+    (GitHub Pages, S3, Heroku, ...). Complements the passive
+    dangling-CNAME check by catching the case where the CNAME target
+    resolves but is unclaimed. Gated by `approve-active`; read-only,
+    detection-only (never attempts to claim anything)."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+    if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
+        console.print(
+            f"[red]blocked[/red]: {key} does not permit active testing. "
+            "Run `bbhunter review-rules` then `bbhunter approve-active` if the policy actually allows it."
+        )
+        raise typer.Exit(1)
+    recon_result = get_recon_result(key)
+    if recon_result and recon_result.fingerprints:
+        hosts = sorted(recon_result.fingerprints.keys())
+    else:
+        hosts = sorted({h for a in program.in_scope if a.in_scope and (h := _host_of(a.identifier))})
+    if not hosts:
+        console.print(f"[yellow]no hosts[/yellow] to check for {key} -- run `bbhunter recon {key}` first")
+        raise typer.Exit(1)
+    console.print(f"[cyan]checking takeover[/cyan] on {len(hosts)} host(s) for {key} (paced <=1 RPS)...")
+    try:
+        new_findings = run_takeover_check(program, hosts)
+    except RuntimeError as e:
+        console.print(f"[red]blocked[/red]: {e}")
+        raise typer.Exit(1)
     for finding in new_findings:
         upsert_finding(finding)
-    _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, len(new_findings), f"BFLA check on {url}")
+    _log_test_run(key, TestType.ACTIVE_LOW_IMPACT, len(new_findings), f"takeover check on {len(hosts)} host(s)")
     if new_findings:
-        console.print("[red]candidate found[/red] -- see `bbhunter findings`, verify manually before drafting a PoC")
+        console.print(f"[red]{len(new_findings)} candidate(s) found[/red] -- see `bbhunter findings`, verify + claim-test manually")
     else:
-        console.print("[green]no candidate[/green] -- either properly denied, or the baseline request as the "
-                       "authorized identity itself didn't succeed (check --authorized-header/the URL)")
+        console.print("[green]no candidate[/green] -- no unclaimed-service fingerprints seen")
+
+
+@app.command(name="authed-recon")
+def authed_recon_cmd(
+    key: str,
+    header: list[str] = typer.Option(..., "--header", help="'Key: Value' auth header for your own session, repeatable"),
+):
+    """With your own session, discover authenticated endpoints on the
+    program's hosts: fetch any OpenAPI/Swagger schema and probe GraphQL
+    introspection, then merge the declared endpoints into the stored
+    recon result so `authlogic-plan` can point you at real authenticated
+    surface. Active (requests the target's own schema), so gated by
+    `approve-active`; read-only, and the session is your own."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+    if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
+        console.print(
+            f"[red]blocked[/red]: {key} does not permit active testing. "
+            "Run `bbhunter review-rules` then `bbhunter approve-active` if the policy actually allows it."
+        )
+        raise typer.Exit(1)
+    recon_result = get_recon_result(key)
+    if recon_result and recon_result.fingerprints:
+        hosts = sorted(recon_result.fingerprints.keys())  # already scope-selected during recon
+    else:
+        hosts = sorted({h for a in program.in_scope if a.in_scope
+                        and (h := _host_of(a.identifier))})
+    if not hosts:
+        console.print(f"[yellow]no hosts[/yellow] to probe for {key} -- run `bbhunter recon {key}` first")
+        raise typer.Exit(1)
+    try:
+        assert_active_allowed()
+    except KillSwitchEngaged as e:
+        console.print(f"[red]blocked[/red]: {e}")
+        raise typer.Exit(1)
+    hosts = [h for h in hosts if is_in_scope(program, h)]  # defense-in-depth scope filter
+    if not hosts:
+        console.print(f"[yellow]no in-scope hosts[/yellow] to probe for {key}")
+        raise typer.Exit(1)
+    headers = _parse_headers(header)
+    console.print(f"[cyan]authed recon[/cyan] on {len(hosts)} host(s) for {key} (paced <=1 RPS)...")
+    endpoints, notes = discover_authed_endpoints(hosts, headers)
+    for n in notes:
+        console.print(f"  {n}")
+    if recon_result is None:
+        console.print("[yellow]note[/yellow]: no prior recon on file -- storing endpoints under a fresh recon record")
+        recon_result = ReconResult(program_key=key)
+    merged = list(dict.fromkeys([*recon_result.authed_endpoints, *endpoints]))
+    recon_result.authed_endpoints = merged
+    upsert_recon_result(recon_result)
+    console.print(f"[green]done[/green] -- {len(endpoints)} endpoint(s) this run, {len(merged)} total on file. "
+                   f"Next: `bbhunter authlogic-plan {key}`")
+
+
+@app.command(name="authlogic-plan")
+def authlogic_plan_cmd(
+    key: str,
+    out: str | None = typer.Option(None, "--out", help="Write the checklist to this file as well as printing it"),
+):
+    """Generate a prioritized manual auth/logic testing checklist from a
+    program's passive-recon output: BOLA/IDOR object-reference URLs,
+    BFLA privileged-endpoint candidates, and API hosts worth an
+    authenticated pass. No network -- pure analysis of what `recon`
+    already found, to steer the manual `test-idor`/`test-bfla` work you
+    do with your own accounts. Run `bbhunter recon` first."""
+    program = get_program(key)
+    if not program:
+        console.print(f"[red]not found[/red]: {key}")
+        raise typer.Exit(1)
+    recon_result = get_recon_result(key)
+    if not recon_result:
+        console.print(f"[yellow]no recon on file[/yellow] for {key} -- run `bbhunter recon {key}` first")
+        raise typer.Exit(1)
+    plan = build_plan(key, recon_result)
+    console.print(plan)
+    if out:
+        Path(out).write_text(plan)
+        console.print(f"[green]written[/green]: {out}")
 
 
 def _coerce_field_value(raw: str):
@@ -1259,12 +1900,24 @@ def reject_poc_cmd(finding_id: str, note: str = typer.Option(..., "--note", help
 @app.command(name="draft-report")
 def draft_report_cmd(
     finding_id: str,
-    severity: str = typer.Option(..., "--severity", help="none|low|medium|high|critical"),
+    severity: str | None = typer.Option(None, "--severity", help="none|low|medium|high|critical (or derive it with --cvss)"),
+    cvss: str | None = typer.Option(None, "--cvss", help="CVSS v3.1 vector, e.g. AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H -- derives severity"),
 ):
     """Phase 4 step 2: draft a disclosure report from an approved PoC.
     Runs after `approve-poc`, or again after `reject-report` to redraft --
     pulls reproduction steps and impact straight from the approved PoC
-    file."""
+    file. Pass --severity directly, or --cvss to derive a defensible
+    severity from a CVSS v3.1 vector."""
+    if bool(severity) == bool(cvss):
+        console.print("[red]error[/red]: pass exactly one of --severity or --cvss")
+        raise typer.Exit(1)
+    if cvss:
+        try:
+            score, severity = score_and_rating(cvss)
+        except ValueError as e:
+            console.print(f"[red]invalid --cvss[/red]: {e}")
+            raise typer.Exit(1)
+        console.print(f"[cyan]CVSS[/cyan] {cvss} -> base {score} ({severity})")
     finding = get_finding(finding_id)
     if not finding:
         console.print(f"[red]not found[/red]: {finding_id}")

@@ -67,6 +67,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 
 from bbhunter.models import AssetType, Finding, FindingStatus, Program, ReconResult, RulesOfEngagement, TestType
+from bbhunter.safety import assert_active_allowed
 from bbhunter.recon.passive import _extract_host, _request_headers, _tool_path
 from bbhunter.testing.cloud_storage import check_cloud_buckets_for_name
 
@@ -406,6 +407,65 @@ def _baseline(client: httpx.Client, host: str) -> tuple[int, int] | None:
         return None
 
 
+def _landed_off_host(resp: httpx.Response, host: str) -> bool:
+    """True if `resp` ended up on a host other than `host` after following
+    redirects -- almost always an SSO/auth-gateway interstitial (Cloudflare
+    Access, Okta, Azure AD, ...). Its HTTP 200 is the *login page*, not the
+    requested resource, so treating it as an exposed file or reading its
+    headers is a false positive. Observed live 2026-10-03:
+    alertmanager.gener8ads.com sits behind Cloudflare Access, so every probed
+    path 200'd as the login portal on gener8.cloudflareaccess.com -- including
+    /.env.local, which the scanner then flagged 'high'."""
+    landed = urlsplit(str(resp.url)).hostname
+    return bool(landed) and landed != host
+
+
+_CORS_PROBE_ORIGIN = "https://bbhunter-cors-probe.example"
+# Parameter names that commonly carry a redirect target -- only these get the
+# open-redirect probe, so we never send an extra request to an unrelated param.
+_REDIRECT_PARAM_NAMES = {"next", "url", "redirect", "redirect_uri", "redirect_url", "return", "returnto",
+                         "return_to", "dest", "destination", "continue", "goto", "target", "redir", "u", "r"}
+_OPEN_REDIRECT_PROBE_HOST = "bbhunter-redirect-probe.example"
+
+
+def _check_cors(client: httpx.Client, host: str) -> dict | None:
+    """One GET to the root carrying a throwaway cross-origin `Origin`
+    header, to detect a reflecting CORS policy. A server that echoes an
+    arbitrary attacker origin back in `access-control-allow-origin` AND
+    sets `access-control-allow-credentials: true` lets any site read
+    authenticated responses cross-origin -- a real, commonly-bountied
+    misconfiguration. Read-only, single request; reflecting `*` without
+    credentials is browser-safe and deliberately NOT flagged."""
+    try:
+        resp = client.get(
+            f"https://{host}/",
+            headers={"Origin": _CORS_PROBE_ORIGIN},
+            timeout=15,
+            follow_redirects=True,
+        )
+    except httpx.HTTPError:
+        return None
+    if _landed_off_host(resp, host):
+        return None
+    acao = resp.headers.get("access-control-allow-origin", "")
+    acac = resp.headers.get("access-control-allow-credentials", "").lower() == "true"
+    reflects = acao == _CORS_PROBE_ORIGIN or acao == "null"
+    if reflects and acac:
+        return {
+            "path": "/",
+            "title": "CORS misconfiguration: reflects arbitrary Origin with credentials",
+            "severity": "high",
+            "status_code": resp.status_code,
+            "url": str(resp.url),
+            "detail": (
+                f"Access-Control-Allow-Origin reflected the probe value {acao!r} and "
+                "Access-Control-Allow-Credentials: true -- any origin can read authenticated "
+                "responses. Verify against a real authenticated endpoint before drafting a PoC."
+            ),
+        }
+    return None
+
+
 def _check_host(client: httpx.Client, host: str, fingerprint: dict | None = None) -> list[dict]:
     hits: list[dict] = []
     baseline = _baseline(client, host)
@@ -428,6 +488,8 @@ def _check_host(client: httpx.Client, host: str, fingerprint: dict | None = None
 
         if resp.status_code != 200:
             continue
+        if _landed_off_host(resp, host):
+            continue  # redirected to an auth gateway/other host -- not this host's own file
         if baseline and baseline[0] == 200 and abs(len(resp.content) - baseline[1]) < 32:
             continue  # looks like the same soft-404 page as the baseline probe
         body_lower = resp.text.lower()
@@ -446,6 +508,11 @@ def _check_host(client: httpx.Client, host: str, fingerprint: dict | None = None
 
     try:
         resp = client.get(f"https://{host}/", timeout=15, follow_redirects=True)
+        if _landed_off_host(resp, host):
+            # root redirected to an auth gateway -- these headers describe the
+            # gateway's login page, not the target, so every check below would
+            # be a false positive. We simply can't assess the target here.
+            return hits
         present = {k.lower() for k in resp.headers}
         missing = [h for h in _SECURITY_HEADERS if h not in present]
         if missing:
@@ -507,6 +574,11 @@ def _check_host(client: httpx.Client, host: str, fingerprint: dict | None = None
                     )
     except httpx.HTTPError:
         pass
+
+    time.sleep(REQUEST_DELAY_SECONDS)
+    cors_hit = _check_cors(client, host)
+    if cors_hit:
+        hits.append(cors_hit)
     time.sleep(REQUEST_DELAY_SECONDS)
 
     return hits
@@ -661,6 +733,60 @@ def _check_injection_signals(client: httpx.Client, url: str) -> list[dict]:
                 }
             )
 
+        # SSTI: a distinctive arithmetic canary. If the *product* shows up in the
+        # response but the literal expression doesn't, a template engine evaluated
+        # it. Random operands make the product unlikely to occur naturally.
+        a, b = secrets.randbelow(900) + 100, secrets.randbelow(900) + 100
+        product = str(a * b)
+        ssti_url = _replace_param(parts, params, i, f"{value}{{{{{a}*{b}}}}}")
+        try:
+            resp = client.get(ssti_url, timeout=15, follow_redirects=True)
+        except httpx.HTTPError:
+            resp = None
+        time.sleep(REQUEST_DELAY_SECONDS)
+        if resp is not None and product in resp.text and f"{a}*{b}" not in resp.text and product not in baseline_body:
+            hits.append(
+                {
+                    "kind": "ssti-candidate",
+                    "param": name,
+                    "url": str(resp.url),
+                    "severity": "high",
+                    "evidence": (
+                        f"GET {resp.url} -> parameter '{name}' with a '{{{{{a}*{b}}}}}' template probe "
+                        f"returned the evaluated product '{product}' (the literal expression did not come "
+                        "back), consistent with server-side template evaluation. Arithmetic-only probe, no "
+                        "payload beyond a multiplication -- verify the engine/context manually before "
+                        "treating as exploitable."
+                    ),
+                }
+            )
+
+        # Open redirect: only for redirect-looking params, to avoid an extra
+        # request on every parameter. Send an external canary and see if the
+        # server 3xx-redirects straight to it.
+        if name.lower() in _REDIRECT_PARAM_NAMES:
+            redir_url = _replace_param(parts, params, i, f"https://{_OPEN_REDIRECT_PROBE_HOST}/")
+            try:
+                resp = client.get(redir_url, timeout=15, follow_redirects=False)
+            except httpx.HTTPError:
+                resp = None
+            time.sleep(REQUEST_DELAY_SECONDS)
+            if resp is not None and getattr(resp, "is_redirect", False) and _OPEN_REDIRECT_PROBE_HOST in resp.headers.get("location", ""):
+                hits.append(
+                    {
+                        "kind": "open-redirect-candidate",
+                        "param": name,
+                        "url": str(resp.url),
+                        "severity": "medium",
+                        "evidence": (
+                            f"GET {resp.url} -> parameter '{name}' set to an external URL caused a redirect "
+                            f"(Location: {resp.headers.get('location','')}) to the attacker-controlled host "
+                            f"'{_OPEN_REDIRECT_PROBE_HOST}'. Detection-only -- verify the redirect actually "
+                            "reaches an external origin (not a same-site path) before treating as exploitable."
+                        ),
+                    }
+                )
+
     return hits
 
 
@@ -764,6 +890,51 @@ def run_nuclei_scan(
     return results
 
 
+def run_nuclei_cve_scan(
+    host: str, cve_ids: list[str], rules: RulesOfEngagement, *, timeout: float = NUCLEI_RUN_TIMEOUT_SECONDS
+) -> list[dict] | None:
+    """Run nuclei restricted to specific CVE template IDs against one
+    host, to actively confirm the weak NVD-keyword matches passive recon
+    produced. nuclei's CVE templates are keyed by the CVE id, so `-id
+    CVE-2021-44228,...` selects exactly those -- turning a 'maybe this
+    version is affected' keyword guess into an actually-fired check. Same
+    conservative 1 req/s, single-connection pacing as run_nuclei_scan.
+    Returns None if nuclei isn't installed or the run errors (="skip"),
+    an empty list for 'ran, nothing fired'."""
+    binary = _tool_path("nuclei")
+    if not binary or not cve_ids:
+        return None
+    headers = _request_headers(rules)
+    header_args = []
+    for key, value in headers.items():
+        header_args += ["-H", f"{key}: {value}"]
+    try:
+        proc = subprocess.run(
+            [
+                binary, "-jsonl", "-silent",
+                "-id", ",".join(sorted(set(cve_ids))),
+                "-rate-limit", str(NUCLEI_RATE_LIMIT_PER_SECOND),
+                "-bulk-size", "1", "-c", "1", "-timeout", "15",
+            ]
+            + header_args,
+            input=f"https://{host}",
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    results: list[dict] = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if line:
+            try:
+                results.append(json.loads(line))
+            except ValueError:
+                continue
+    return results
+
+
 def _select_hosts(program: Program, recon_result: ReconResult | None) -> list[str]:
     """Exact hosts from in-scope URL/WILDCARD assets, plus -- only for
     WILDCARD-type assets -- a capped slice of subdomains a prior recon
@@ -839,6 +1010,7 @@ def run_active_checks(
     is a separate or higher permission tier, just a separate opt-in
     since each is a qualitatively different request shape worth a
     deliberate choice to include."""
+    assert_active_allowed()
     if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
         raise RuntimeError(
             f"{program.key}: active testing blocked by rules.permits() -- run `bbhunter review-rules` "
@@ -868,7 +1040,10 @@ def run_active_checks(
                         title=hit["title"],
                         vuln_class="exposure" if hit["severity"] != "info" else "hardening",
                         test_type=TestType.ACTIVE_LOW_IMPACT,
-                        evidence=f"GET {hit['url']} -> HTTP {hit['status_code']}. Path: {hit['path']}.",
+                        evidence=(
+                            f"GET {hit['url']} -> HTTP {hit['status_code']}. Path: {hit['path']}."
+                            + (f" {hit['detail']}" if hit.get("detail") else "")
+                        ),
                         status=FindingStatus.CANDIDATE,
                         notes=f"severity guess: {hit['severity']} -- verify manually before drafting a PoC",
                     )

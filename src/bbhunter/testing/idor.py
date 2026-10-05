@@ -32,10 +32,23 @@ anything this tool invents, guesses, or brute-forces on its own.
 from __future__ import annotations
 
 import hashlib
+import time
 
 import httpx
 
 from bbhunter.models import Finding, FindingStatus, Program, TestType
+from bbhunter.safety import assert_active_allowed, assert_in_scope
+
+# Spacing between successive URLs in a batch run. A batch tests many
+# human-curated URLs in one go, so -- unlike a one-off single-URL check --
+# the aggregate request rate matters: paired with the per-check
+# inter-request delay below, this keeps a batch comfortably under a
+# 1-request/second program cap (the strictest we've seen, e.g. gener8).
+BATCH_URL_DELAY_SECONDS = 1.5
+# Spacing between the two requests of a single access-diff. Default 0.0
+# preserves the original single-URL behavior (and its tests); batch runs
+# pass 1.0 so no two requests ever land inside the same second.
+BATCH_INTER_REQUEST_DELAY_SECONDS = 1.0
 
 # Response signatures suggesting a request was actually denied/redirected
 # to a login page rather than genuinely served the resource -- checked on
@@ -72,6 +85,7 @@ def _check_access_diff(
     kind: str,
     subject_label: str,
     timeout: float = 15,
+    request_delay: float = 0.0,
 ) -> dict | None:
     """Exactly two GET requests: one as the confirmed owner/authorized
     identity (the baseline), one as a different, unrelated identity.
@@ -91,6 +105,8 @@ def _check_access_diff(
     if owner_resp.status_code != 200 or _looks_denied(owner_resp.status_code, owner_resp.text.lower()):
         return None  # can't establish "the owner/authorized identity can access this" -- baseline invalid
 
+    if request_delay:
+        time.sleep(request_delay)
     try:
         other_resp = httpx.get(url, headers=other_headers, timeout=timeout, follow_redirects=True)
     except httpx.HTTPError:
@@ -127,12 +143,14 @@ def check_idor(
     other_headers: dict[str, str],
     *,
     timeout: float = 15,
+    request_delay: float = 0.0,
 ) -> dict | None:
     """OWASP API1:2023 Broken Object Level Authorization (BOLA), the
     generalized/API-focused name for what's colloquially called IDOR.
     See `_check_access_diff` for the mechanism."""
     return _check_access_diff(
-        url, owner_headers, other_headers, kind="idor-candidate", subject_label="owner's data", timeout=timeout
+        url, owner_headers, other_headers, kind="idor-candidate", subject_label="owner's data",
+        timeout=timeout, request_delay=request_delay,
     )
 
 
@@ -142,6 +160,7 @@ def check_bfla(
     other_headers: dict[str, str],
     *,
     timeout: float = 15,
+    request_delay: float = 0.0,
 ) -> dict | None:
     """OWASP API5:2023 Broken Function Level Authorization: the same
     access-diffing technique as `check_idor`, pointed at an
@@ -156,6 +175,7 @@ def check_bfla(
         kind="bfla-candidate",
         subject_label="privileged function's output",
         timeout=timeout,
+        request_delay=request_delay,
     )
 
 
@@ -166,14 +186,17 @@ def run_idor_check(
     other_headers: dict[str, str],
     *,
     owner_note: str | None = None,
+    request_delay: float = 0.0,
 ) -> list[Finding]:
+    assert_active_allowed()
     if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
         raise RuntimeError(
             f"{program.key}: IDOR check blocked by rules.permits() -- run `bbhunter review-rules` "
             "and `bbhunter approve-active` first if this program's policy actually allows it"
         )
+    assert_in_scope(program, url)
 
-    hit = check_idor(url, owner_headers, other_headers)
+    hit = check_idor(url, owner_headers, other_headers, request_delay=request_delay)
     if not hit:
         return []
 
@@ -203,14 +226,17 @@ def run_bfla_check(
     other_headers: dict[str, str],
     *,
     authorized_note: str | None = None,
+    request_delay: float = 0.0,
 ) -> list[Finding]:
+    assert_active_allowed()
     if not program.rules.permits(TestType.ACTIVE_LOW_IMPACT):
         raise RuntimeError(
             f"{program.key}: BFLA check blocked by rules.permits() -- run `bbhunter review-rules` "
             "and `bbhunter approve-active` first if this program's policy actually allows it"
         )
+    assert_in_scope(program, url)
 
-    hit = check_bfla(url, authorized_headers, other_headers)
+    hit = check_bfla(url, authorized_headers, other_headers, request_delay=request_delay)
     if not hit:
         return []
 
@@ -231,3 +257,55 @@ def run_bfla_check(
             notes=f"severity guess: {hit['severity']} -- verify manually before drafting a PoC",
         )
     ]
+
+
+def run_idor_batch(
+    program: Program,
+    urls: list[str],
+    owner_headers: dict[str, str],
+    other_headers: dict[str, str],
+    *,
+    owner_note: str | None = None,
+) -> list[Finding]:
+    """Run the same two-request BOLA/IDOR access-diff across many
+    human-curated owner-URLs in one gated run. Each URL is still the
+    identical safe check (two requests, no enumeration, no ID guessing);
+    this only saves re-invoking the command per URL. Every request is
+    spaced >=1s from the next (BATCH_INTER_REQUEST_DELAY_SECONDS within a
+    pair, BATCH_URL_DELAY_SECONDS between URLs) so a whole batch stays
+    under a 1-RPS program cap. The caller supplies both sessions and the
+    URL list -- nothing here is discovered, invented, or enumerated."""
+    findings: list[Finding] = []
+    for i, url in enumerate(urls):
+        if i:
+            time.sleep(BATCH_URL_DELAY_SECONDS)
+        findings.extend(
+            run_idor_check(
+                program, url, owner_headers, other_headers,
+                owner_note=owner_note, request_delay=BATCH_INTER_REQUEST_DELAY_SECONDS,
+            )
+        )
+    return findings
+
+
+def run_bfla_batch(
+    program: Program,
+    urls: list[str],
+    authorized_headers: dict[str, str],
+    other_headers: dict[str, str],
+    *,
+    authorized_note: str | None = None,
+) -> list[Finding]:
+    """Batch sibling of `run_bfla_check` -- same mechanism and pacing as
+    `run_idor_batch`, pointed at privileged function/endpoint URLs."""
+    findings: list[Finding] = []
+    for i, url in enumerate(urls):
+        if i:
+            time.sleep(BATCH_URL_DELAY_SECONDS)
+        findings.extend(
+            run_bfla_check(
+                program, url, authorized_headers, other_headers,
+                authorized_note=authorized_note, request_delay=BATCH_INTER_REQUEST_DELAY_SECONDS,
+            )
+        )
+    return findings

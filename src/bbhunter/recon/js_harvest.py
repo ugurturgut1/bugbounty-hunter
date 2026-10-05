@@ -112,7 +112,24 @@ def find_source_map_url(js_url: str, js_text: str) -> str | None:
     return urljoin(js_url, match.group(1))
 
 
-def check_source_map_exposed(map_url: str, *, timeout: float = SOURCE_MAP_FETCH_TIMEOUT_SECONDS) -> dict | None:
+def _registrable(host: str) -> str:
+    # ponytail: last two labels, not a full PSL lookup -- good enough to tell
+    # "same org" from "third-party CDN"; upgrade to publicsuffix2 if a real
+    # multi-part-TLD (.co.uk) case ever matters here.
+    return ".".join((host or "").lower().rsplit(".", 2)[-2:])
+
+
+def check_source_map_exposed(
+    map_url: str, *, page_host: str | None = None, timeout: float = SOURCE_MAP_FETCH_TIMEOUT_SECONDS
+) -> dict | None:
+    # A source map served from a third-party CDN (jsdelivr, unpkg, cdn.*) is an
+    # open-source library's own published map, not the target leaking its source
+    # -- only flag maps on the target's own site (found live on
+    # portofantwerpbruges loading mermaid's map from cdn.jsdelivr.net).
+    if page_host is not None:
+        map_host = urlsplit(map_url).hostname or ""
+        if _registrable(map_host) != _registrable(page_host):
+            return None
     try:
         resp = httpx.get(map_url, timeout=timeout, follow_redirects=True)
     except httpx.HTTPError:

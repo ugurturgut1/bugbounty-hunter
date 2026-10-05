@@ -97,6 +97,8 @@ import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+
+from bbhunter._time import utcnow
 from typing import Callable
 from urllib.parse import urlparse
 
@@ -131,6 +133,30 @@ SUBFINDER_TIMEOUT_SECONDS = 15  # trimmed from 30 2026-09-18 -- live-tested 2026
                                  # sources with no API keys configured; 15s (vs. subfinder's own 60s
                                  # default) trades more source coverage for a multi-seed `bbhunter recon`
                                  # run staying in the tens-of-minutes range on a medium/large program
+# ^ that 15s is subfinder's *per-source* -timeout. The overall subprocess cap is separate: even with a
+# 15s per-source limit, subfinder's ~30 sources add up to 10-45s+ wall-clock on a real domain (measured
+# 2026-10-03). The old cap of SUBFINDER_TIMEOUT_SECONDS + 10 = 25s silently killed every slow run as a
+# "failure", dropping real subdomains. This is the real overall ceiling instead.
+SUBFINDER_SUBPROCESS_TIMEOUT_SECONDS = 90
+# subfinder is the slowest third-party source and runs once per seed; on a
+# many-seed program its 90s cap serialized across seeds dominates the whole
+# recon (measured live 2026-10-04: a 54-seed program had not finished after 69
+# minutes, subfinder the active process throughout). Cap the TOTAL subfinder
+# wall-time across the run and divide it across seeds, so a big scope trades
+# some per-seed subfinder depth for a bounded runtime -- crt.sh/Certspotter/
+# Wayback still run per seed regardless. Small scopes keep the full 90s.
+SUBFINDER_TOTAL_BUDGET_SECONDS = 600
+SUBFINDER_MIN_PER_SEED_SECONDS = 20
+
+
+def subfinder_budget_for(seeds_total: int) -> float:
+    """Per-seed subfinder overall timeout given the scope size: the full
+    90s for a handful of seeds, shrinking (floored at 20s) as seed count
+    grows so total subfinder time stays near SUBFINDER_TOTAL_BUDGET_SECONDS."""
+    if seeds_total <= 1:
+        return SUBFINDER_SUBPROCESS_TIMEOUT_SECONDS
+    per_seed = SUBFINDER_TOTAL_BUDGET_SECONDS / seeds_total
+    return max(SUBFINDER_MIN_PER_SEED_SECONDS, min(SUBFINDER_SUBPROCESS_TIMEOUT_SECONDS, per_seed))
                                  # instead of hours -- still returns whatever sources answered in time,
                                  # never treated as a hard failure unless nothing came back at all
 # CRTSH_DELAY_SECONDS/CERTSPOTTER_DELAY_SECONDS/WAYBACK_DELAY_SECONDS/DNS_DELAY_SECONDS were individual
@@ -194,17 +220,25 @@ def crtsh_subdomains(domain: str, *, timeout: float = 15) -> tuple[set[str], boo
     distinct from a successful query that legitimately found nothing, so
     callers can tell "no subdomains" apart from "we don't actually know"
     instead of silently treating both the same way."""
-    try:
-        resp = httpx.get(
-            CRTSH_URL,
-            params={"q": f"%.{domain}", "output": "json"},
-            timeout=timeout,
-            headers={"User-Agent": DEFAULT_USER_AGENT},
-        )
-        resp.raise_for_status()
-        entries = resp.json()
-    except (httpx.HTTPError, ValueError):
-        return set(), False
+    # crt.sh is notoriously flaky under load (502/503, truncated/non-JSON bodies). As the primary CT
+    # source, a single transient blip shouldn't silently drop it -- one retry recovers the common case.
+    entries = None
+    for attempt in range(2):
+        try:
+            resp = httpx.get(
+                CRTSH_URL,
+                params={"q": f"%.{domain}", "output": "json"},
+                timeout=timeout,
+                headers={"User-Agent": DEFAULT_USER_AGENT},
+            )
+            resp.raise_for_status()
+            entries = resp.json()
+            break
+        except (httpx.HTTPError, ValueError):
+            if attempt == 0:
+                time.sleep(2)  # ponytail: fixed 2s backoff, not exponential -- 2 attempts don't need it
+                continue
+            return set(), False
 
     names: set[str] = set()
     for entry in entries:
@@ -246,14 +280,20 @@ def certspotter_subdomains(domain: str, *, timeout: float = 15) -> tuple[set[str
     return names, True
 
 
-def subfinder_subdomains(domain: str, *, timeout: float = SUBFINDER_TIMEOUT_SECONDS) -> tuple[set[str], bool]:
+def subfinder_subdomains(
+    domain: str, *, timeout: float = SUBFINDER_TIMEOUT_SECONDS,
+    overall_timeout: float = SUBFINDER_SUBPROCESS_TIMEOUT_SECONDS,
+) -> tuple[set[str], bool]:
     """Shells out to the `subfinder` binary in its default passive mode
     (no active flags like `-active`/DNS-bruteforce are ever passed) --
     every one of its ~30 sources is itself a third-party OSINT lookup,
     never a direct request to `domain`. Returns `(names, succeeded)` on
     the same contract as `crtsh_subdomains`: `succeeded=False` means the
     binary is missing or the run errored/timed out, not "found
-    nothing"."""
+    nothing". `overall_timeout` caps the whole subprocess -- the caller
+    shrinks it on large scopes (see `subfinder_budget_for`) so one slow
+    seed can't dominate a many-seed recon; a partial run still returns
+    whatever it printed."""
     binary = _tool_path("subfinder")
     if not binary:
         return set(), False
@@ -262,7 +302,7 @@ def subfinder_subdomains(domain: str, *, timeout: float = SUBFINDER_TIMEOUT_SECO
             [binary, "-d", domain, "-silent", "-timeout", str(int(timeout))],
             capture_output=True,
             text=True,
-            timeout=timeout + 10,
+            timeout=overall_timeout,
         )
     except (subprocess.SubprocessError, OSError):
         return set(), False
@@ -275,7 +315,7 @@ def subfinder_subdomains(domain: str, *, timeout: float = SUBFINDER_TIMEOUT_SECO
     return {n for n in names if n.endswith(domain)}, True
 
 
-def assetfinder_subdomains(domain: str, *, timeout: float = 15) -> tuple[set[str], bool]:
+def assetfinder_subdomains(domain: str, *, timeout: float = 30) -> tuple[set[str], bool]:
     """Shells out to the `assetfinder` binary (tomnomnom) with
     `--subs-only` -- restricts output to actual subdomains of `domain`,
     never the unrelated "related root domains" assetfinder can also
@@ -607,7 +647,7 @@ def tls_findings(host: str, info: dict) -> list[dict]:
     if not_after:
         expiry = _parse_openssl_not_after(not_after)
         if expiry:
-            days_left = (expiry - datetime.utcnow()).total_seconds() / 86400
+            days_left = (expiry - utcnow()).total_seconds() / 86400
             if days_left < 0:
                 hits.append({
                     "kind": "tls-cert-expired",
@@ -817,7 +857,7 @@ def _harvest_js_for_host(host: str, rules: RulesOfEngagement) -> list[dict]:
 
         map_url = find_source_map_url(js_url, js_text)
         if map_url:
-            map_hit = check_source_map_exposed(map_url)
+            map_hit = check_source_map_exposed(map_url, page_host=host)
             time.sleep(FINGERPRINT_DELAY_SECONDS)
             if map_hit:
                 hits.append(map_hit)
@@ -896,6 +936,7 @@ def run_passive_recon(
 
     recon_assets = [a for a in program.in_scope if a.asset_type in (AssetType.URL, AssetType.WILDCARD)]
     seeds_total = len(recon_assets)
+    subfinder_budget = subfinder_budget_for(seeds_total)  # shrink per-seed subfinder cap on large scopes
     seeds_processed = 0
     seed_durations: list[float] = []
 
@@ -905,62 +946,64 @@ def run_passive_recon(
     # interrupt-triggered shutdown doesn't itself block on still-running (target-untouched) futures.
     executor = ThreadPoolExecutor(max_workers=RECON_EXECUTOR_MAX_WORKERS)
     try:
-        for seed_index, asset in enumerate(recon_assets, start=1):
-            seed_start = time.monotonic()
-            host = _extract_host(asset.identifier)
-            if not host:
-                seeds_processed += 1
+        # Pass 1 -- third-party enumeration for ALL seeds concurrently. Every
+        # source here (crt.sh/Certspotter/subfinder/assetfinder/Wayback + DNS
+        # hygiene) is a third-party OSINT lookup that never touches the target,
+        # so running all seeds at once is rate-safe and removes the old
+        # per-seed-serialized subfinder cost (the large-scope bottleneck). The
+        # target-touching work stays sequential + paced in Pass 2 below.
+        _report(
+            f"gathering crt.sh/Certspotter/subfinder/assetfinder/Wayback subdomains + Wayback param URLs "
+            f"+ DNS hygiene (SPF/DMARC/DKIM) for {seeds_total} seed(s) in parallel "
+            "(third-party services only -- never the target itself)..."
+        )
+        enum_futures: dict[str, tuple[str, dict]] = {}
+        for asset in recon_assets:
+            h = _extract_host(asset.identifier)
+            if not h:
                 continue
-
-            _report(
-                f"[{seed_index}/{seeds_total}] {host}: gathering crt.sh/Certspotter/subfinder/"
-                "assetfinder/Wayback subdomains + Wayback param URLs + DNS hygiene (SPF/DMARC/DKIM) "
-                "(parallel, third-party services only -- never the target itself)..."
-            )
-            email_domain = host[4:] if host.lower().startswith("www.") else host
-            crtsh_future = executor.submit(crtsh_subdomains, host)
-            certspotter_future = executor.submit(certspotter_subdomains, host)
-            subfinder_future = executor.submit(subfinder_subdomains, host)
-            assetfinder_future = executor.submit(assetfinder_subdomains, host)
-            wayback_future = executor.submit(wayback_subdomains, host)
-            wayback_param_future = executor.submit(wayback_param_urls, host)
-            spf_future = executor.submit(check_spf, email_domain)
-            dmarc_future = executor.submit(check_dmarc, email_domain)
-            dkim_future = executor.submit(check_dkim, email_domain)
-
-            discovered, crtsh_ok = crtsh_future.result()
+            ed = h[4:] if h.lower().startswith("www.") else h
+            enum_futures[h] = (ed, {
+                "crtsh": executor.submit(crtsh_subdomains, h),
+                "certspotter": executor.submit(certspotter_subdomains, h),
+                "subfinder": executor.submit(subfinder_subdomains, h, overall_timeout=subfinder_budget),
+                "assetfinder": executor.submit(assetfinder_subdomains, h),
+                "wayback": executor.submit(wayback_subdomains, h),
+                "wayback_param": executor.submit(wayback_param_urls, h),
+                "spf": executor.submit(check_spf, ed),
+                "dmarc": executor.submit(check_dmarc, ed),
+                "dkim": executor.submit(check_dkim, ed),
+            })
+        for h, (ed, futs) in enum_futures.items():
+            discovered, crtsh_ok = futs["crtsh"].result()
             if not crtsh_ok:
-                crtsh_failures.append(host)
-
-            certspotter_names, certspotter_ok = certspotter_future.result()
-            if not certspotter_ok:
-                certspotter_failures.append(host)
-            discovered |= certspotter_names
-
-            subfinder_names, subfinder_ok = subfinder_future.result()
-            if not subfinder_ok:
-                subfinder_failures.append(host)
-            discovered |= subfinder_names
-
-            assetfinder_names, assetfinder_ok = assetfinder_future.result()
-            if not assetfinder_ok:
-                assetfinder_failures.append(host)
-            discovered |= assetfinder_names
-
-            wayback_names, wayback_ok = wayback_future.result()
-            if not wayback_ok:
-                wayback_failures.append(host)
-            discovered |= wayback_names
-
-            subdomains_by_seed[host] = sorted(discovered)
-            _report(f"[{seed_index}/{seeds_total}] {host}: {len(discovered)} subdomain(s) found")
-
-            for hit in [*spf_future.result(), *dmarc_future.result(), *dkim_future.result()]:
+                crtsh_failures.append(h)
+            cs_names, cs_ok = futs["certspotter"].result()
+            if not cs_ok:
+                certspotter_failures.append(h)
+            discovered |= cs_names
+            sf_names, sf_ok = futs["subfinder"].result()
+            if not sf_ok:
+                subfinder_failures.append(h)
+            discovered |= sf_names
+            af_names, af_ok = futs["assetfinder"].result()
+            if not af_ok:
+                assetfinder_failures.append(h)
+            discovered |= af_names
+            wb_names, wb_ok = futs["wayback"].result()
+            if not wb_ok:
+                wayback_failures.append(h)
+            discovered |= wb_names
+            subdomains_by_seed[h] = sorted(discovered)
+            pu = futs["wayback_param"].result()
+            if pu:
+                param_urls_by_seed[h] = pu
+            for hit in [*futs["spf"].result(), *futs["dmarc"].result(), *futs["dkim"].result()]:
                 findings.append(
                     Finding(
-                        id=f"{program.key}:{email_domain}:{hit['kind']}",
+                        id=f"{program.key}:{ed}:{hit['kind']}",
                         program_key=program.key,
-                        asset=email_domain,
+                        asset=ed,
                         title=hit["kind"].replace("-", " "),
                         vuln_class=hit["kind"],
                         test_type=TestType.PASSIVE_RECON,
@@ -970,9 +1013,19 @@ def run_passive_recon(
                     )
                 )
 
-            param_urls = wayback_param_future.result()
-            if param_urls:
-                param_urls_by_seed[host] = param_urls
+        # Pass 2 -- target-touching work, sequential and paced per host to
+        # respect the program's aggregate rate limit (never parallelized).
+        for seed_index, asset in enumerate(recon_assets, start=1):
+            seed_start = time.monotonic()
+            host = _extract_host(asset.identifier)
+            if not host:
+                seeds_processed += 1
+                continue
+
+            email_domain = host[4:] if host.lower().startswith("www.") else host
+            # Subdomains/param-URLs/DNS findings were gathered concurrently in
+            # Pass 1 above; just read them back here.
+            discovered = set(subdomains_by_seed.get(host, []))
 
             time.sleep(PARALLEL_OSINT_DELAY_SECONDS)
 
@@ -1179,6 +1232,6 @@ def run_passive_recon(
         param_urls=param_urls_by_seed,
         seeds_total=len(recon_assets),
         seeds_processed=seeds_processed,
-        last_run=datetime.utcnow(),
+        last_run=utcnow(),
     )
     return result, findings
