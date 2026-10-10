@@ -19,10 +19,29 @@ from __future__ import annotations
 
 import hashlib
 
+import dns.resolver
 import httpx
 
 from bbhunter.models import Finding, FindingStatus, Program, TestType
 from bbhunter.safety import assert_active_allowed, is_in_scope
+
+# CNAME targets of Google-hosted custom-domain services (Blogger, Sites,
+# Workspace). A dangling CNAME here serving Google's "no site configured" 404
+# is stale DNS, but -- unlike the claimable services below -- it is generally
+# NOT takeoverable: Blogger needs a security CNAME and Workspace needs domain-
+# ownership verification an attacker can't satisfy (per can-i-take-over-xyz).
+# So this is flagged LOW/informational, for the human to verify, not a
+# high-severity takeover.
+_GOOGLE_GHS_TARGETS = ("ghs.google.com", "ghs.googlehosted.com")
+
+
+def _cname_target(host: str) -> str | None:
+    """Return the host's CNAME target (lowercased, no trailing dot), or None."""
+    try:
+        ans = dns.resolver.resolve(host, "CNAME")
+    except Exception:
+        return None
+    return str(ans[0].target).rstrip(".").lower() if ans else None
 
 # service label -> distinctive body substrings that mean "unclaimed here"
 TAKEOVER_FINGERPRINTS: dict[str, tuple[str, ...]] = {
@@ -44,7 +63,30 @@ TAKEOVER_FINGERPRINTS: dict[str, tuple[str, ...]] = {
 def check_takeover(host: str, *, timeout: float = 15) -> dict | None:
     """One GET. Returns a hit dict if the body matches a known unclaimed
     -service fingerprint, else None (including on any HTTP error -- that's
-    'inconclusive', not 'vulnerable')."""
+    'inconclusive', not 'vulnerable'). Also flags a dangling CNAME to a
+    Google-hosted service (ghs) separately, at low severity."""
+    # Google ghs dangling CNAME: check DNS first, since these hosts often serve
+    # no HTTPS at all (the unconfigured domain has no cert), so the https GET
+    # below would just error out and miss them.
+    cname = _cname_target(host)
+    if cname and any(cname == t or cname.endswith("." + t) for t in _GOOGLE_GHS_TARGETS):
+        for scheme in ("https", "http"):
+            try:
+                r = httpx.get(f"{scheme}://{host}/", timeout=timeout, follow_redirects=False)
+            except httpx.HTTPError:
+                continue
+            if r.status_code == 404:
+                return {
+                    "service": "Google (ghs)",
+                    "severity": "low",
+                    "evidence": (
+                        f"{host} is CNAME'd to {cname} (Google-hosted) and serves Google's "
+                        f"'no site configured' 404 ({scheme}). This is a dangling/stale DNS record. "
+                        "Per can-i-take-over-xyz, ghs/Blogger/Workspace mappings are generally NOT "
+                        "claimable without domain-ownership verification, so this is usually informational "
+                        "(a record to remove), not a takeover -- verify claimability before rating higher."
+                    ),
+                }
     try:
         resp = httpx.get(f"https://{host}/", timeout=timeout, follow_redirects=True)
     except httpx.HTTPError:
