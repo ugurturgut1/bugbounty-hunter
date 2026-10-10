@@ -407,6 +407,19 @@ def _baseline(client: httpx.Client, host: str) -> tuple[int, int] | None:
         return None
 
 
+def _redirected_to_other_path(resp: httpx.Response, requested_path: str) -> bool:
+    """True if the response reached a DIFFERENT path than requested via a
+    redirect -- the classic 'request /phpmyadmin/ -> 302 to /auth/login' case,
+    where the final 200 is a login page, not the requested file. A same-path
+    redirect (http->https, trailing-slash normalization) is not flagged.
+    Complements _landed_off_host, which only catches off-host redirects."""
+    history = getattr(resp, "history", None)
+    if not isinstance(history, (list, tuple)) or not history:
+        return False  # no redirect occurred (real httpx always sets a list here)
+    final_path = urlsplit(str(resp.url)).path
+    return final_path.rstrip("/") != requested_path.rstrip("/")
+
+
 def _landed_off_host(resp: httpx.Response, host: str) -> bool:
     """True if `resp` ended up on a host other than `host` after following
     redirects -- almost always an SSO/auth-gateway interstitial (Cloudflare
@@ -490,6 +503,9 @@ def _check_host(client: httpx.Client, host: str, fingerprint: dict | None = None
             continue
         if _landed_off_host(resp, host):
             continue  # redirected to an auth gateway/other host -- not this host's own file
+        if _redirected_to_other_path(resp, path):
+            continue  # same-host redirect to a different path (e.g. /phpmyadmin -> /auth/login)
+                      # -- the 200 is that other page (usually a login), not the requested file
         if baseline and baseline[0] == 200 and abs(len(resp.content) - baseline[1]) < 32:
             continue  # looks like the same soft-404 page as the baseline probe
         body_lower = resp.text.lower()
