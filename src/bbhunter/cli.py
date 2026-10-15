@@ -638,6 +638,13 @@ def test_active_cmd(
              "severity with an explicit ownership-verification caveat -- a same-named bucket can "
              "legitimately belong to an unrelated third party. Same gate as --injection/--nuclei.",
     ),
+    host: list[str] = typer.Option(
+        None, "--host",
+        help="Test only these host(s) instead of the default seed+wildcard selection (repeatable). Each "
+             "must be an exact in-scope URL seed or fall under a wildcard seed -- anything out of scope "
+             "(a third-party-hosted name, an unlisted sibling) is dropped. Use it to aim at specific "
+             "fingerprinted hosts the 5-per-wildcard default would skip.",
+    ),
 ):
     """Run Phase 3 active checks (exposed-file/misconfig scan, read-only)
     against a program -- refuses unless `approve-active` has already
@@ -667,12 +674,23 @@ def test_active_cmd(
             "[yellow]note[/yellow]: --nuclei requested but the `nuclei` binary isn't installed -- skipping "
             "that check class. See README.md Setup for `go install ...nuclei/v3/cmd/nuclei@latest`."
         )
+    hosts_override = None
+    if host:
+        from bbhunter.testing.active import host_in_scope
+        rejected = [h for h in host if not host_in_scope(program, h)]
+        if rejected:
+            console.print(f"[yellow]out of scope, dropped[/yellow]: {', '.join(rejected)}")
+        hosts_override = [h for h in host if host_in_scope(program, h)]
+        if not hosts_override:
+            console.print("[red]blocked[/red]: no requested --host is in scope")
+            raise typer.Exit(1)
+        console.print(f"[cyan]targeting {len(hosts_override)} host(s)[/cyan]: {', '.join(hosts_override)}")
     extras = ", ".join(
         name for name, flag in (("injection", injection), ("nuclei", nuclei), ("cloud-buckets", cloud_buckets)) if flag
     )
     console.print(f"[cyan]running active checks[/cyan] on {key}{f' (incl. {extras})' if extras else ''}...")
     try:
-        new_findings = run_active_checks(program, recon_result, injection=injection, nuclei=nuclei, cloud_buckets=cloud_buckets)
+        new_findings = run_active_checks(program, recon_result, injection=injection, nuclei=nuclei, cloud_buckets=cloud_buckets, hosts_override=hosts_override)
     except RuntimeError as e:
         console.print(f"[red]blocked[/red]: {e}")
         raise typer.Exit(1)

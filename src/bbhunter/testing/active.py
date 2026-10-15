@@ -977,6 +977,24 @@ def _select_hosts(program: Program, recon_result: ReconResult | None) -> list[st
     return hosts[:MAX_HOSTS_PER_PROGRAM]
 
 
+def host_in_scope(program: Program, host: str) -> bool:
+    """True if `host` is an exact in-scope URL seed, or falls under an
+    in-scope WILDCARD seed's parent domain. The scope gate for a
+    caller-supplied --host list, so a targeted run can never reach a host
+    the program didn't list (a sibling subdomain that merely resolves, a
+    third-party-hosted name, etc.)."""
+    host = host.lower().strip().rstrip(".")
+    for asset in program.in_scope:
+        parent = _extract_host(asset.identifier)
+        if not parent:
+            continue
+        if asset.asset_type == AssetType.URL and host == parent:
+            return True
+        if asset.asset_type == AssetType.WILDCARD and (host == parent or host.endswith("." + parent)):
+            return True
+    return False
+
+
 def _seed_base_names(program: Program) -> list[str]:
     """The organizational-ish label from each in-scope URL/WILDCARD
     seed (e.g. "example" from "example.com", "www.example.com", or
@@ -1007,6 +1025,7 @@ def run_active_checks(
     injection: bool = False,
     nuclei: bool = False,
     cloud_buckets: bool = False,
+    hosts_override: list[str] | None = None,
 ) -> list[Finding]:
     """`injection=True` additionally runs the reflected-XSS/SQL-error/
     NoSQL-error/command-injection/CRLF-header-injection signature checks
@@ -1034,7 +1053,15 @@ def run_active_checks(
         )
 
     headers = _request_headers(program.rules)
-    hosts = _select_hosts(program, recon_result)
+    if hosts_override:
+        hosts = [h for h in hosts_override if host_in_scope(program, h)]
+        if not hosts:
+            raise RuntimeError(
+                f"{program.key}: none of the requested --host values are in scope "
+                "(must be an exact URL seed or fall under a wildcard seed)."
+            )
+    else:
+        hosts = _select_hosts(program, recon_result)
     host_set = set(hosts)
 
     fingerprints = recon_result.fingerprints if recon_result else {}
